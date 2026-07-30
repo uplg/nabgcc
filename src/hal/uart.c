@@ -21,12 +21,24 @@
 uint8_t UART_BUFFER[UART_BUFFER_SIZE];  /**< @brief RX buffer */
 volatile uint8_t uart_buffer_pointer;   /**< @brief RX write index */
 
+#ifdef DIAG_RING
+/* Console mirror: the rabbit has no reachable serial port in its case, and
+ * attaching JTAG stops the WiFi module from booting, so every console byte is
+ * also kept here and shipped off-board later (see diag.c). */
+volatile uint32_t diag_ring_len;
+volatile uint8_t  diag_ring[DIAG_RING_SIZE];
+#endif
+
 /**
  * @brief Write a 8bits character to the serial port
  * @param [in]  c Character to send
  */
 void putch_uart(uint8_t c)
 {
+#ifdef DIAG_RING
+  if(diag_ring_len < DIAG_RING_SIZE)
+    diag_ring[diag_ring_len++] = c;
+#endif
   /* loop till transmit FIFO becomes empty */
   while ((get_value(UARTLSR0) & UARTLSR_THRE) != UARTLSR_THRE);
   /* write characters to UART Transmitter Holding register */

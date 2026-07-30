@@ -34,6 +34,7 @@ LDSCRIPT = sys/ml67q4051.ld
 LD_FLAGS =
 #~ LDFLAGS +=  -Wl,--gc-sections
 #~ LDFLAGS += -Wl,-s
+LDFLAGS += --specs=nosys.specs
 LDFLAGS += -Wl,-Map,obj/$(TARGET).map
 LDFLAGS += -nostartfiles
 LDFLAGS += -mcpu=arm7tdmi -T$(LDSCRIPT)
