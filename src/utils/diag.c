@@ -24,6 +24,7 @@
 #include "common.h"
 #include "utils/debug.h"
 #include "utils/delay.h"
+#include "hal/led.h"
 #include "hal/uart.h"
 #include "usb/hcdmem.h"
 #include "usb/hcd.h"
@@ -33,9 +34,14 @@
 #include "utils/diag.h"
 
 #define DIAG_SSID "Freebox-664E25"
+#define DIAG_AP_SSID "NabDiag"
+#define DIAG_AP_CHANNEL 6
 #define DIAG_PORT 9999
 #define DIAG_CHUNK 1024
-#define DIAG_MAX_SHIPS 40
+#define DIAG_MAX_SHIPS 4000
+/* How long the rabbit stays its own AP shipping the ring before it gives up
+ * and boots the VM normally. */
+#define DIAG_AP_MS 240000
 
 /* PMK = PBKDF2-SHA1("blabliblou", "Freebox-664E25", 4096, 32).
  * Note the 0x00 at offset 19: this is the network the strcpy bug ate. */
@@ -47,6 +53,10 @@ static const uint8_t diag_pmk[32] = {
 };
 
 static char diag_buf[128];
+
+/* Blink colour, so the LEDs narrate the phase: blue = waiting for the dongle,
+ * white = scanning, red = association attempt, green = shipping the ring. */
+static uint32_t diag_led_color = RGB_BLUE;
 
 static volatile uint8_t diag_scan_found;
 static volatile uint8_t diag_scan_count;
@@ -62,11 +72,25 @@ static void diag_scan_cb(struct rt2501_scan_result *r, void *userparam)
   }
 }
 
+/* The VM owns the LEDs, but it has not booted yet during the probe: drive
+ * them here so the rabbit visibly says "working" instead of looking dead
+ * through a minute of silent diagnostics. */
+static void diag_led(uint32_t color)
+{
+  uint8_t i;
+  /* set_led() indexes LEDs 0..4; the LED_RGB_* constants are the encoded
+   * form set_led_rgb() wants, not indices. */
+  for(i = 0; i < 5; i++)
+    set_led(i, color);
+}
+
 /* Same pump as the main loop, minus the VM: keep USB + 802.11 alive. */
 static void diag_pump(uint32_t ms)
 {
   uint32_t t0 = counter_timer;
   uint32_t last_timer = counter_timer;
+  uint32_t last_blink = counter_timer;
+  uint8_t on = 0;
 
   while((counter_timer - t0) < ms) {
     struct rt2501buffer *r;
@@ -80,6 +104,11 @@ static void diag_pump(uint32_t ms)
     if((counter_timer - last_timer) >= 100) {
       last_timer = counter_timer;
       rt2501_timer();
+    }
+    if((counter_timer - last_blink) >= 500) {
+      last_blink = counter_timer;
+      on = !on;
+      diag_led(on ? diag_led_color : RGB_BLACK);
     }
   }
 }
@@ -143,6 +172,7 @@ void diag_probe_target(void)
           (unsigned long)(counter_timer - t0));
   consolestr(diag_buf);
 
+  diag_led_color = RGB_WHITE;
   for(scan_try = 0; scan_try < 2 && !diag_scan_found; scan_try++) {
     diag_scan_count = 0;
     rt2501_scan((const uint8_t*)DIAG_SSID, diag_scan_cb, NULL);
@@ -165,6 +195,7 @@ void diag_probe_target(void)
           diag_scan_match.rateset, diag_scan_match.encryption);
   consolestr(diag_buf);
 
+  diag_led_color = RGB_RED;
   for(auth_try = 0; auth_try < 3; auth_try++) {
     /* First attempt: exactly what the VM would pass (the parsed scan
      * verdict). If the parser said UNSUPPORTED (or found nothing), force
@@ -273,6 +304,7 @@ void diag_ship_ring(void)
   static uint32_t total;
   static uint8_t seq, nchunks;
   uint32_t offset, clen;
+  uint8_t unicast;
 
   if(ieee80211_state != IEEE80211_S_RUN) return;
   if(rounds >= DIAG_MAX_SHIPS) return;
@@ -295,10 +327,44 @@ void diag_ship_ring(void)
   offset = (uint32_t)seq * DIAG_CHUNK;
   clen = total - offset;
   if(clen > DIAG_CHUNK) clen = DIAG_CHUNK;
+  /* On our own AP the Mac uses a per-SSID private MAC we cannot know, so
+   * unicast is only useful on the shared network. */
+  unicast = (ieee80211_mode != IEEE80211_M_MASTER) && (rounds & 1);
   if(diag_ship_chunk(offset, clen, total, seq, nchunks,
-                     (rounds & 1) ? mac_ip : ip_limited,
-                     (rounds & 1) ? mac_mac : NULL))
+                     unicast ? mac_ip : ip_limited,
+                     unicast ? mac_mac : NULL))
     seq++;
+}
+
+void diag_export_via_ap(void)
+{
+  uint32_t t0;
+
+  if(rt2501_state() == RT2501_S_BROKEN) {
+    consolestr("DIAG: no dongle, cannot export"EOL);
+    return;
+  }
+
+  /* Become an open AP and ship the ring over it. This depends on nothing but
+   * the radio: no Freebox, no hotspot, no DHCP, no VM, no HTTP server — the
+   * chain that has broken every export attempt so far. */
+  sprintf(diag_buf, "DIAG: exporting ring (%lu bytes) as AP \""DIAG_AP_SSID"\""EOL,
+          (unsigned long)diag_ring_len);
+  consolestr(diag_buf);
+
+  rt2501_setmode(IEEE80211_M_MASTER, (const uint8_t*)DIAG_AP_SSID,
+                 DIAG_AP_CHANNEL);
+
+  diag_led_color = RGB_GREEN;
+  t0 = counter_timer;
+  while((counter_timer - t0) < DIAG_AP_MS) {
+    diag_pump(150);
+    diag_ship_ring();
+  }
+
+  consolestr("DIAG: export window over, booting normally"EOL);
+  rt2501_setmode(IEEE80211_M_MANAGED, NULL, 0);
+  diag_led(RGB_BLACK);
 }
 
 #endif /* DIAG_RING */

@@ -41,4 +41,13 @@ void diag_probe_target(void);
  */
 void diag_ship_ring(void);
 
+/**
+ * @brief Become an open AP named "NabDiag" and ship the ring over it
+ *
+ * Depends on the radio alone — no Freebox, no hotspot, no DHCP, no VM, no
+ * HTTP server. Join the AP from a machine running scripts/diag-listen.py.
+ * Returns after DIAG_AP_MS so the rabbit still boots normally afterwards.
+ */
+void diag_export_via_ap(void);
+
 #endif /* _DIAG_H_ */

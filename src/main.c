@@ -60,6 +60,7 @@
 /*************/
 int main(void);                     /* main routine */
 static void reg_irq_handler(void);  /* registration of IRQ handler */
+uint8_t push_button_value(void);    /* head button, 1 while held */
 void init_io(void);
 void push_button_interrupt(void);
 void timer_handler(void);
@@ -304,10 +305,17 @@ int main(void)
   consolestr("Nabaztag firmware ("__DATE__" "__TIME__") ready."EOL);
 
 #ifdef DIAG_RING
-  /* Probe the WPA2/3 network natively while we still own the main loop;
-   * the VM then boots and joins the known-good network from the config
-   * sector, over which diag_ship_ring() exports what happened here. */
-  diag_probe_target();
+  /* Probe the WPA2/3 network natively while we still own the main loop, then
+   * export the log from our own AP. Holding the head button at power-on skips
+   * all of it, so the VM's config page — the only wireless reflash path —
+   * always stays reachable. */
+  if(!push_button_value())
+  {
+    diag_probe_target();
+    diag_export_via_ap();
+  }
+  else
+    consolestr("DIAG: head button held, skipping diagnostics"EOL);
 #endif
 
   consolestr("vmemInit"EOL);
