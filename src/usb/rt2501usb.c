@@ -987,8 +987,16 @@ int8_t rt2501_tx(void *buffer, uint32_t length)
   /* Moreover, it must not be a multiple of the USB packet size */
   if((length % RT2501_USB_PACKET_SIZE) == 0) length += 4;
 #ifdef DEBUG_WIFI
-  DBG_WIFI("Tx:"EOL);
-  dump(buffer,length);
+  /* Only hexdump short management frames. A full dump costs ~0.4 ms per byte
+   * of blocking UART with no CLR_WDT on this path, so dumping a kilobyte-sized
+   * data frame overruns the 2.09 s watchdog and resets the rabbit. */
+  if(length <= 128) {
+    DBG_WIFI("Tx:"EOL);
+    dump(buffer,length);
+  } else {
+    sprintf(dbg_buffer, "Tx: %lu bytes"EOL, length);
+    DBG_WIFI(dbg_buffer);
+  }
 #endif
   ret = usbh_bulk_transfer_async(rt2501_dev, 1, buffer, length);
 #ifdef DEBUG_WIFI

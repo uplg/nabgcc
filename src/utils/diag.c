@@ -35,7 +35,7 @@
 #define DIAG_SSID "Freebox-664E25"
 #define DIAG_PORT 9999
 #define DIAG_CHUNK 1024
-#define DIAG_MAX_SHIPS 15
+#define DIAG_MAX_SHIPS 40
 
 /* PMK = PBKDF2-SHA1("blabliblou", "Freebox-664E25", 4096, 32).
  * Note the 0x00 at offset 19: this is the network the strcpy bug ate. */
@@ -215,8 +215,9 @@ static uint16_t diag_ip_checksum(const uint8_t *hdr, uint32_t len)
  * send, so stale contents are harmless. */
 #define diag_pkt ((uint8_t *)DIAG_PKT_ADDR)
 
-static void diag_ship_chunk(uint32_t offset, uint32_t clen, uint32_t total,
-                            uint8_t seq, uint8_t nchunks, const uint8_t *dst_ip)
+static int32_t diag_ship_chunk(uint32_t offset, uint32_t clen, uint32_t total,
+                               uint8_t seq, uint8_t nchunks, const uint8_t *dst_ip,
+                               const uint8_t *dst_mac)
 {
   static const uint8_t bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
   uint8_t *ip  = diag_pkt+8;
@@ -257,34 +258,47 @@ static void diag_ship_chunk(uint32_t offset, uint32_t clen, uint32_t total,
   for(i = 0; i < clen; i++)
     hdr[16+i] = diag_ring[offset+i];
 
-  rt2501_send(diag_pkt, 8+ip_len, bcast_mac, 1, 1);
+  return rt2501_send(diag_pkt, 8+ip_len, dst_mac ? dst_mac : bcast_mac, 1, 0);
 }
 
 void diag_ship_ring(void)
 {
   static const uint8_t ip_limited[4] = {255,255,255,255};
-  static uint32_t ships;
-  static uint32_t last_ship;
-  uint32_t total, offset, clen;
-  uint8_t seq, nchunks;
+  /* The Mac running scripts/diag-listen.py: unicast survives AP setups that
+   * filter client-to-client broadcast (and gets L2 ACKs + retries). */
+  static const uint8_t mac_ip[4] = {10,143,57,51};
+  static const uint8_t mac_mac[6] = {0xba,0x1e,0x82,0x0b,0xfa,0xd4};
+  static uint32_t rounds;
+  static uint32_t last_send;
+  static uint32_t total;
+  static uint8_t seq, nchunks;
+  uint32_t offset, clen;
 
   if(ieee80211_state != IEEE80211_S_RUN) return;
-  if(ships >= DIAG_MAX_SHIPS) return;
-  if(ships && (counter_timer - last_ship) < 4000) return;
-  last_ship = counter_timer;
-  ships++;
+  if(rounds >= DIAG_MAX_SHIPS) return;
+  if((counter_timer - last_send) < 200) return;
+  last_send = counter_timer;
 
-  total = diag_ring_len;
-  if(total > DIAG_RING_SIZE) total = DIAG_RING_SIZE;
-  nchunks = (total + DIAG_CHUNK - 1) / DIAG_CHUNK;
-
-  seq = 0;
-  for(offset = 0; offset < total; offset += DIAG_CHUNK) {
-    clen = total - offset;
-    if(clen > DIAG_CHUNK) clen = DIAG_CHUNK;
-    diag_ship_chunk(offset, clen, total, seq, nchunks, ip_limited);
-    seq++;
+  if(nchunks == 0 || seq >= nchunks) {
+    if(nchunks != 0)
+      rounds++;
+    /* (Re)snapshot the ring for the next round. */
+    total = diag_ring_len;
+    if(total > DIAG_RING_SIZE) total = DIAG_RING_SIZE;
+    if(total == 0) return;
+    nchunks = (total + DIAG_CHUNK - 1) / DIAG_CHUNK;
+    seq = 0;
   }
+
+  /* One chunk per call (~200 ms apart): a couple of ms of work each time,
+   * instead of a multi-second burst that starves the VM and the watchdog. */
+  offset = (uint32_t)seq * DIAG_CHUNK;
+  clen = total - offset;
+  if(clen > DIAG_CHUNK) clen = DIAG_CHUNK;
+  if(diag_ship_chunk(offset, clen, total, seq, nchunks,
+                     (rounds & 1) ? mac_ip : ip_limited,
+                     (rounds & 1) ? mac_mac : NULL))
+    seq++;
 }
 
 #endif /* DIAG_RING */

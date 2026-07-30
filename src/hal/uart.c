@@ -39,6 +39,9 @@ void putch_uart(uint8_t c)
 #ifdef DIAG_RING
   if(diag_ring_len < DIAG_RING_SIZE)
     diag_ring[diag_ring_len++] = c;
+  /* Console output is blocking at 115200 baud and DEBUG_WIFI is chatty
+   * enough to overrun the 2.09 s watchdog on its own. */
+  CLR_WDT;
 #endif
   /* loop till transmit FIFO becomes empty */
   while ((get_value(UARTLSR0) & UARTLSR_THRE) != UARTLSR_THRE);
