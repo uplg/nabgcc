@@ -1894,7 +1894,11 @@ void rt2501_auth(const uint8_t *ssid, const uint8_t *mac,
 		case IEEE80211_CRYPT_WPA:
     case IEEE80211_CRYPT_WPA2:
 			ieee80211_authmode = IEEE80211_AUTH_OPEN;
-			strcpy((char *)ieee80211_key, (const char *)key);
+			/* The WPA/WPA2 key is a raw 32-byte PMK, not a string: strcpy
+			 * truncated it at the first 0x00 byte (~12% of SSID/passphrase
+			 * pairs), wrecking the EAPOL handshake for those networks.
+			 * Same fix as upstream 2c05b53 (ccarlo64). */
+			memcpy(ieee80211_key, key, IEEE80211_MAX_KEYLEN);
 			rt2501_set_key(0, NULL, NULL, NULL, RT2501_CIPHER_NONE);
 			eapol_init();
 			break;
