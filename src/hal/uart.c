@@ -39,9 +39,12 @@ void putch_uart(uint8_t c)
 #ifdef DIAG_RING
   if(diag_ring_len < DIAG_RING_SIZE)
     diag_ring[diag_ring_len++] = c;
-  /* Console output is blocking at 115200 baud and DEBUG_WIFI is chatty
-   * enough to overrun the 2.09 s watchdog on its own. */
-  CLR_WDT;
+  /* Stop here: an assembled rabbit has no reachable serial port, so the ring
+   * is the only consumer. Waiting on the 115200-baud FIFO costs ~87 us per
+   * character, and DEBUG_WIFI logs every beacon of every neighbouring
+   * network during a scan — enough to stall the firmware for minutes and
+   * make the RT2501 driver drop the dongle. */
+  return;
 #endif
   /* loop till transmit FIFO becomes empty */
   while ((get_value(UARTLSR0) & UARTLSR_THRE) != UARTLSR_THRE);

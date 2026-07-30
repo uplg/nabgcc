@@ -156,6 +156,7 @@ void diag_probe_target(void)
 {
   uint32_t t0;
   uint8_t scan_try, auth_try;
+  uint8_t scanned = 0;
   uint8_t enc;
 
   consolestr(EOL"DIAG: probe of \""DIAG_SSID"\" ("__DATE__" "__TIME__")"EOL);
@@ -177,10 +178,19 @@ void diag_probe_target(void)
     diag_scan_count = 0;
     rt2501_scan((const uint8_t*)DIAG_SSID, diag_scan_cb, NULL);
     diag_pump(500);
-    sprintf(diag_buf, "DIAG: scan %d: %d result(s), target %sfound"EOL,
-            scan_try+1, diag_scan_count, diag_scan_found ? "" : "NOT ");
-    consolestr(diag_buf);
+    scanned = diag_scan_count;
   }
+
+  /* Start the log over here. A scan logs every beacon of every neighbouring
+   * network, which would fill the ring long before the association verdict —
+   * the one line we are after — is even printed. Outside the scan state the
+   * 802.11 code is quiet, so what follows is the association attempt alone. */
+  diag_ring_len = 0;
+  sprintf(diag_buf,
+          EOL"DIAG: === association phase === (%d scan results, target %sfound)"EOL,
+          scanned, diag_scan_found ? "" : "NOT ");
+  consolestr(diag_buf);
+
   if(!diag_scan_found) {
     consolestr("DIAG: target absent, probe over"EOL);
     return;
@@ -340,10 +350,8 @@ void diag_export_via_ap(void)
 {
   uint32_t t0;
 
-  if(rt2501_state() == RT2501_S_BROKEN) {
-    consolestr("DIAG: no dongle, cannot export"EOL);
-    return;
-  }
+  if(rt2501_state() == RT2501_S_BROKEN)
+    consolestr("DIAG: driver reports no dongle, trying to export anyway"EOL);
 
   /* Become an open AP and ship the ring over it. This depends on nothing but
    * the radio: no Freebox, no hotspot, no DHCP, no VM, no HTTP server — the
