@@ -39,6 +39,8 @@
 #include "vm/vaudio.h"
 #include "vm/vlog.h"
 
+#include "utils/diag.h"
+
 
 #define MHz      (1000000L)
 #define TMRCYC   (10)             /* interval of timer interrupt (ms) */
@@ -300,6 +302,14 @@ int main(void)
   };
 
   consolestr("Nabaztag firmware ("__DATE__" "__TIME__") ready."EOL);
+
+#ifdef DIAG_RING
+  /* Probe the WPA2/3 network natively while we still own the main loop;
+   * the VM then boots and joins the known-good network from the config
+   * sector, over which diag_ship_ring() exports what happened here. */
+  diag_probe_target();
+#endif
+
   consolestr("vmemInit"EOL);
   vmemInit(0);
 
@@ -360,7 +370,11 @@ int main(void)
     if (!counttimer)
     {
       rt2501_timer();
+#ifdef DIAG_RING
+      diag_ship_ring();
+#else
       consolestr(".");
+#endif
     }
   }
 }

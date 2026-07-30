@@ -11,10 +11,19 @@
 
 #include <stdint.h>
 
-#define DIAG_RING_SIZE 4096
+/* 16K: DEBUG_WIFI narrates every beacon heard during the scan, which can
+ * easily exceed 4K before the association attempt even starts. */
+#define DIAG_RING_SIZE 16384
+
+/* The ring and the TX scratch buffer live in otherwise-unused external RAM
+ * (0xD0000000..0xD0007FFF; the hcd pool starts at 0xD0008000, the VM heap at
+ * 0xD0010000) because IntRAM is too small for them. ExtRAM contents survive
+ * resets, but diag_ring_len lives in IntRAM .bss (zeroed at boot) so stale
+ * bytes past the counter are never read. */
+#define diag_ring ((volatile uint8_t *)0xD0000000)
+#define DIAG_PKT_ADDR 0xD0004000
 
 extern volatile uint32_t diag_ring_len;
-extern volatile uint8_t  diag_ring[DIAG_RING_SIZE];
 
 /**
  * @brief Try to associate with the target network, logging everything
@@ -27,8 +36,8 @@ void diag_probe_target(void);
 /**
  * @brief Ship the console ring to DIAG_HOST_IP:DIAG_HOST_PORT over UDP
  *
- * Sent as broadcast-MAC / unicast-IP datagrams so no ARP is needed. Call once
- * the VM's association is up. Safe to call repeatedly; it only fires once.
+ * Sent as broadcast-MAC datagrams so no ARP is needed. Call from the main
+ * loop; no-op unless associated, self-limits to one ship every 4 s, 15 max.
  */
 void diag_ship_ring(void);
 

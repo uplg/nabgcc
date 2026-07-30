@@ -5,8 +5,9 @@ MTL_BOOT=boot.0.0.0.13
 
 # User options
 OPTIONS =
+OPTIONS += -DDIAG_RING
+OPTIONS += -DDEBUG_WIFI
 #OPTIONS += -DDEBUG
-#OPTIONS += -DDEBUG_WIFI
 #OPTIONS += -DDEBUG_USB
 
 # C Files to compile (take all)
