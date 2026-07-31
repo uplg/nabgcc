@@ -1105,7 +1105,10 @@ ifdef BOOT
 
 type Sock=[sockCnx sockInput sockSize sockOutput sockIndex sockCloseAfter sockCallback];;
 
-const http_header="HTTP/1.0 200 OK\13\10Server: MTL HTTP server\13\10Content-Type: text/html\13\10\13\10";;
+// Modern browsers want honest HTTP/1.0: an explicit close and a
+// Content-Length instead of a close-delimited body of unknown size.
+fun mkhttpheader len=
+	strcatlist "HTTP/1.0 200 OK\13\10Server: MTL HTTP server\13\10Content-Type: text/html; charset=utf-8\13\10Connection: close\13\10Content-Length: "::(itoa len)::"\13\10\13\10"::nil;;
 
 const http_sep="\13\n\13\n";;	// séparateur entre l'en-tête et le corps de la réponse à une requête
 var http_content_start="ontent-Length: ";;
@@ -1167,8 +1170,9 @@ Secho "u";// Secholn input;
 		(
 			set sock.sockInput=nil;
 			let call sock.sockCallback [str] -> res in
+			let if res==nil then "" else res -> body in
 			(
-				tcpsend sock strcat http_header res;
+				tcpsend sock strcat (mkhttpheader strlen body) body;
 				tcpcloseafter sock
 			)
 		)
