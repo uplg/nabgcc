@@ -13,9 +13,10 @@
  *  3. diag_ship_ring(): once that association is up, broadcast the ring as
  *     UDP datagrams on port DIAG_PORT (broadcast MAC, so no ARP needed).
  *
- * Compiled in only with -DDIAG_RING.
+ * Compiled in only with -DDIAG_RING (probe + ring export) and/or
+ * -DDIAG_COUNTERS (RX/EAPOL counters for the deafness campaign).
  */
-#ifdef DIAG_RING
+#if defined(DIAG_RING) || defined(DIAG_COUNTERS)
 
 #include <stdio.h>
 #include <string.h>
@@ -30,13 +31,30 @@
 #include "usb/hcd.h"
 #include "usb/usbh.h"
 #include "usb/rt2501usb.h"
+#include "usb/rt2501usb_io.h"
+#include "net/ieee80211.h"
+#include "net/eapol.h"
 #include "vm/vlog.h"
 #include "utils/diag.h"
+
+#define DIAG_PORT 9999
+
+static uint16_t diag_ip_checksum(const uint8_t *hdr, uint32_t len)
+{
+  uint32_t sum = 0;
+  uint32_t i;
+  for(i = 0; i+1 < len; i += 2)
+    sum += (hdr[i] << 8) | hdr[i+1];
+  while(sum >> 16)
+    sum = (sum & 0xffff) + (sum >> 16);
+  return (uint16_t)~sum;
+}
+
+#ifdef DIAG_RING
 
 #define DIAG_SSID "Freebox-664E25"
 #define DIAG_AP_SSID "NabDiag"
 #define DIAG_AP_CHANNEL 6
-#define DIAG_PORT 9999
 #define DIAG_CHUNK 1024
 #define DIAG_MAX_SHIPS 4000
 /* How long the rabbit stays its own AP shipping the ring before it gives up
@@ -240,17 +258,6 @@ void diag_probe_target(void)
   consolestr(diag_buf);
 }
 
-static uint16_t diag_ip_checksum(const uint8_t *hdr, uint32_t len)
-{
-  uint32_t sum = 0;
-  uint32_t i;
-  for(i = 0; i+1 < len; i += 2)
-    sum += (hdr[i] << 8) | hdr[i+1];
-  while(sum >> 16)
-    sum = (sum & 0xffff) + (sum >> 16);
-  return (uint16_t)~sum;
-}
-
 /* LLC/SNAP + IPv4 + UDP + 16-byte diag header + chunk, broadcast MAC.
  * Scratch buffer in ExtRAM (IntRAM is full); fully rewritten before each
  * send, so stale contents are harmless. */
@@ -376,3 +383,142 @@ void diag_export_via_ap(void)
 }
 
 #endif /* DIAG_RING */
+
+#ifdef DIAG_COUNTERS
+
+/*
+ * The deafness discriminator. Everything is counted at the lowest layer we
+ * can reach (the RXD the RT2573 prepends to every frame), so a wedge that
+ * starves ieee80211_input still shows up here — or provably does not.
+ */
+
+#define DIAG_CNT_PERIOD_MS 2000
+
+static volatile uint32_t cnt_rx_total;    /* complete frames, any state    */
+static volatile uint32_t cnt_rx_crc;      /* CRC error set by the hardware */
+static volatile uint32_t cnt_beacon;      /* beacons, any BSS              */
+static volatile uint32_t cnt_beacon_bss;  /* beacons the ASIC tagged MyBss */
+static volatile uint32_t cnt_data_enc_ok; /* encrypted data, decrypted OK  */
+static volatile uint32_t cnt_data_plain;  /* unencrypted data frames       */
+static volatile uint32_t cnt_ciph_err[4]; /* CipherErr: -, ICV, MIC, KEY   */
+static volatile uint32_t cnt_eapol[DIAG_EAPOL_NEVENTS];
+static volatile uint32_t cnt_eapol_last_ms; /* counter_timer, last event   */
+
+/* IRQ context (URB completion): increments only. */
+void diag_count_rx(const void *rxd_, const uint8_t *dot11)
+{
+  const RXD_STRUC *rxd = (const RXD_STRUC *)rxd_;
+  uint8_t type;
+
+  cnt_rx_total++;
+  if(rxd->Crc) {
+    cnt_rx_crc++;
+    return;                     /* the header bytes are not trustworthy */
+  }
+  if(rxd->CipherAlg != RT2501_CIPHER_NONE)
+    cnt_ciph_err[rxd->CipherErr & 3]++;
+
+  type = dot11[0] & IEEE80211_FC0_TYPE_MASK;
+  if(type == IEEE80211_FC0_TYPE_MGT) {
+    if((dot11[0] & IEEE80211_FC0_SUBTYPE_MASK) == IEEE80211_FC0_SUBTYPE_BEACON) {
+      cnt_beacon++;
+      if(rxd->MyBss)
+        cnt_beacon_bss++;
+    }
+  } else if(type == IEEE80211_FC0_TYPE_DATA) {
+    if(rxd->CipherAlg == RT2501_CIPHER_NONE)
+      cnt_data_plain++;
+    else if(rxd->CipherErr == 0)
+      cnt_data_enc_ok++;
+  }
+}
+
+void diag_count_eapol(uint8_t ev)
+{
+  if(ev < DIAG_EAPOL_NEVENTS)
+    cnt_eapol[ev]++;
+  cnt_eapol_last_ms = counter_timer;
+}
+
+/* One ASCII line, LLC/SNAP + IPv4 + UDP, broadcast MAC on DIAG_PORT: no
+ * ARP, no peer state, nothing the wedge can take away from the TX side.
+ * Scratch in ExtRAM (.extbss, never zeroed at boot): fully rewritten
+ * before each send, so stale contents are harmless. */
+static uint8_t diag_cnt_pkt[320] __attribute__((section(".extbss")));
+
+void diag_ship_counters(void)
+{
+  static uint32_t last_send;
+  static uint32_t seq;
+  static const uint8_t bcast_mac[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+  uint8_t *ip  = diag_cnt_pkt+8;
+  uint8_t *udp = diag_cnt_pkt+28;
+  char *payload = (char *)diag_cnt_pkt+36;
+  uint32_t csr0, csr1, csr2;
+  uint16_t plen, ip_len, udp_len;
+  uint16_t csum;
+
+  if(ieee80211_state != IEEE80211_S_RUN) return;
+  if(ieee80211_mode != IEEE80211_M_MANAGED) return;
+  if((counter_timer - last_send) < DIAG_CNT_PERIOD_MS) return;
+  last_send = counter_timer;
+
+  /* Key-table state straight from the RT2573: CSR0 = shared key valid
+   * bits, CSR1 = shared key ciphers, CSR2 = pairwise key valid bitmap.
+   * Control transfers from the main loop, same as rt2501_calibrate(). */
+  csr0 = rt2501_read(rt2501_dev, RT2501_SEC_CSR0);
+  csr1 = rt2501_read(rt2501_dev, RT2501_SEC_CSR1);
+  csr2 = rt2501_read(rt2501_dev, RT2501_SEC_CSR2);
+
+  /* bld identifies the image on the wire: no more guessing which build
+   * is in flash (the whole first night was lost to exactly that). */
+  plen = (uint16_t)sprintf(payload,
+    "NDC1 bld=" __TIME__ " seq=%lu up=%lu bcn=%lu/%lu denc=%lu dpl=%lu "
+    "cerr=%lu/%lu/%lu crc=%lu rx=%lu "
+    "e14=%lu e34=%lu eg=%lu edr=%lu emic=%lu gok=%lu gko=%lu eage=%ld "
+    "es=%d is=%ld csr0=%08lx csr1=%08lx csr2=%08lx",
+    (unsigned long)seq++,
+    (unsigned long)counter_timer,
+    (unsigned long)cnt_beacon, (unsigned long)cnt_beacon_bss,
+    (unsigned long)cnt_data_enc_ok, (unsigned long)cnt_data_plain,
+    (unsigned long)cnt_ciph_err[1], (unsigned long)cnt_ciph_err[2],
+    (unsigned long)cnt_ciph_err[3],
+    (unsigned long)cnt_rx_crc, (unsigned long)cnt_rx_total,
+    (unsigned long)cnt_eapol[DIAG_EAPOL_M1],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_M3],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_GROUP],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_DROP],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_MICFAIL],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_GTKOK],
+    (unsigned long)cnt_eapol[DIAG_EAPOL_GTKFAIL],
+    cnt_eapol_last_ms ? (long)(counter_timer - cnt_eapol_last_ms) : -1L,
+    (int)eapol_state, (long)ieee80211_state,
+    (unsigned long)csr0, (unsigned long)csr1, (unsigned long)csr2);
+
+  ip_len  = 20+8+plen;
+  udp_len = 8+plen;
+
+  memcpy(diag_cnt_pkt, "\xaa\xaa\x03\x00\x00\x00\x08\x00", 8);
+
+  ip[0] = 0x45; ip[1] = 0;
+  ip[2] = ip_len >> 8; ip[3] = ip_len & 0xff;
+  ip[4] = 0; ip[5] = seq & 0xff;      /* identification */
+  ip[6] = 0; ip[7] = 0;               /* no fragmentation */
+  ip[8] = 64; ip[9] = 17;             /* TTL, UDP */
+  ip[10] = 0; ip[11] = 0;             /* checksum, computed below */
+  ip[12] = 169; ip[13] = 254; ip[14] = 187; ip[15] = 1;  /* link-local src */
+  ip[16] = 255; ip[17] = 255; ip[18] = 255; ip[19] = 255;
+  csum = diag_ip_checksum(ip, 20);
+  ip[10] = csum >> 8; ip[11] = csum & 0xff;
+
+  udp[0] = DIAG_PORT >> 8; udp[1] = DIAG_PORT & 0xff;  /* sport */
+  udp[2] = DIAG_PORT >> 8; udp[3] = DIAG_PORT & 0xff;  /* dport */
+  udp[4] = udp_len >> 8; udp[5] = udp_len & 0xff;
+  udp[6] = 0; udp[7] = 0;             /* checksum optional over IPv4 */
+
+  rt2501_send(diag_cnt_pkt, 8+ip_len, bcast_mac, 1, 0);
+}
+
+#endif /* DIAG_COUNTERS */
+
+#endif /* DIAG_RING || DIAG_COUNTERS */

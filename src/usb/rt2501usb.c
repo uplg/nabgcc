@@ -30,6 +30,7 @@
 #include "usb/rt2501usb_firmware.h"
 #include "usb/rt2501usb_buffer.h"
 #include "usb/rt2501usb_io.h"
+#include "utils/diag.h"
 
 
 typedef struct _CHANNEL_TX_POWER {
@@ -801,6 +802,9 @@ static void rt2501_rx_callback(PURB urb)
   memcpy(rt2501_frame+rt2501_frame_position, urb->buffer, RT2501_USB_PACKET_SIZE);
   if(urb->status < RT2501_USB_PACKET_SIZE) {
     rxd = (PRXD_STRUC)rt2501_frame;
+#ifdef DIAG_COUNTERS
+    diag_count_rx((const void *)rxd, rt2501_frame+sizeof(RXD_STRUC));
+#endif
 #if 0
 //#ifdef DEBUG_WIFI
       sprintf(dbg_buffer, "RX Crc=%d, CipherErr=%d, KeyIndex=%d, CipherAlg=%d, MyBss=%d, Iv=%08lx, Eiv=%08lx"EOL,

@@ -8,6 +8,9 @@ OPTIONS =
 # Diagnostics: native WPA2/3 probe before the VM + ring exported over the
 # rabbit's own "NabDiag" AP. Off for normal use (see src/utils/diag.c).
 #OPTIONS += -DDIAG_RING
+# Deafness campaign: RX/EAPOL counters broadcast as one UDP datagram every
+# 2 s (port 9999, listen with scripts/diag-listen.py). Cheap, no boot delay.
+OPTIONS += -DDIAG_COUNTERS
 #OPTIONS += -DDEBUG_WIFI
 #OPTIONS += -DDEBUG
 #OPTIONS += -DDEBUG_USB

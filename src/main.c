@@ -380,7 +380,11 @@ int main(void)
       rt2501_timer();
 #ifdef DIAG_RING
       diag_ship_ring();
-#else
+#endif
+#ifdef DIAG_COUNTERS
+      diag_ship_counters();
+#endif
+#if !defined(DIAG_RING) && !defined(DIAG_COUNTERS)
       consolestr(".");
 #endif
     }

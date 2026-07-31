@@ -50,4 +50,49 @@ void diag_ship_ring(void);
  */
 void diag_export_via_ap(void);
 
+/*
+ * RX/EAPOL counters (-DDIAG_COUNTERS, independent of DIAG_RING): the
+ * instrument for the deafness campaign. TX survives the wedge, so a small
+ * broadcast UDP datagram every few seconds carries the counters out even
+ * once nothing comes in any more. Beacons are unencrypted management
+ * frames: if they keep counting while encrypted data stops, the fault is a
+ * key, not the radio.
+ */
+
+/* Event classes for diag_count_eapol(). */
+#define DIAG_EAPOL_M1      0  /* pairwise 1/4 */
+#define DIAG_EAPOL_M3      1  /* pairwise 3/4 */
+#define DIAG_EAPOL_GROUP   2  /* group key message 1 (every rekey) */
+#define DIAG_EAPOL_DROP    3  /* validation or dispatch drop */
+#define DIAG_EAPOL_MICFAIL 4  /* MIC (or ANonce) check failed in a handler */
+#define DIAG_EAPOL_GTKOK   5  /* GTK unwrapped and installed (E2 fix) */
+#define DIAG_EAPOL_GTKFAIL 6  /* GTK present but unwrap/parse/install failed */
+#define DIAG_EAPOL_NEVENTS 7
+
+#ifdef DIAG_COUNTERS
+/**
+ * @brief Count one received frame; IRQ context, increments only
+ *
+ * @param [in] rxd_   PRXD_STRUC of the frame (as void* to keep this header
+ *                    free of driver types)
+ * @param [in] dot11  Start of the 802.11 header, right after the RXD
+ */
+void diag_count_rx(const void *rxd_, const uint8_t *dot11);
+
+/** @brief Count one EAPOL event (DIAG_EAPOL_*); IRQ context */
+void diag_count_eapol(uint8_t ev);
+
+/**
+ * @brief Broadcast the counters as one ASCII UDP datagram on DIAG_PORT
+ *
+ * Call from the main loop; no-op unless associated, self-limits to one
+ * datagram every 2 s. Reads SEC_CSR0/1/2 from the RT2573 each time.
+ */
+void diag_ship_counters(void);
+
+#define DIAG_EAPOL_EV(ev) diag_count_eapol(ev)
+#else
+#define DIAG_EAPOL_EV(ev) ((void)0)
+#endif /* DIAG_COUNTERS */
+
 #endif /* _DIAG_H_ */
