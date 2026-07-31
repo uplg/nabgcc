@@ -4,6 +4,7 @@
 proto main 0;;
 
 //var SIMU;;
+//var PORTAL2006;;	// uncomment to build the 2006 config portal pages
 var BOOT;;
 
 var AUDIOLIB;;
@@ -1200,6 +1201,11 @@ fun starthttpsrv port cbrequest=
 //----------------------
 
 
+// The 2006 portal pages are kept below, buildable by defining
+// PORTAL2006; the else branch carries the modern portal (same fields,
+// same placeholders, same routes, only the UI differs).
+ifdef PORTAL2006
+{
 var page_a="<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">
 <html xmlns=\"http://www.w3.org/1999/xhtml\">
 <head>
@@ -1694,6 +1700,119 @@ a:hover {
 </div>
 </body></html>";;
 
+
+}
+else
+{
+var page_a="<!DOCTYPE html>
+<html lang=\"en\"><head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<title>Nabaztag setup</title>
+<style>
+:root{color-scheme:light dark}
+*{box-sizing:border-box}
+body{font-family:system-ui,sans-serif;margin:0 auto;padding:1rem;background:#f4f1ec;color:#222;max-width:26rem}
+h1{font-size:1.3rem;text-align:center}
+h1 span{display:block;font-size:.8rem;font-weight:normal;opacity:.6}
+.card{background:#fff;border:1px solid #ddd;border-radius:.6rem;padding:1rem;margin-bottom:1rem}
+label{display:block;font-size:.85rem;margin:.7rem 0 .2rem;opacity:.8}
+input,select{width:100%;padding:.5rem;font-size:1rem;border:1px solid #bbb;border-radius:.4rem;background:#fff;color:inherit}
+fieldset{border:0;padding:0;margin:.7rem 0 0}
+fieldset label{display:inline-block;margin:0 .8rem 0 0;font-size:1rem;opacity:1}
+fieldset input{width:auto}
+button{width:100%;padding:.7rem;font-size:1.05rem;border:0;border-radius:.4rem;background:#7a4dbb;color:#fff;font-weight:bold;margin-top:.5rem}
+details{margin-top:.8rem}
+summary{cursor:pointer;opacity:.7;font-size:.9rem}
+.foot{text-align:center;font-size:.8rem;opacity:.6}
+.foot a{color:inherit}
+.info{font-size:.8rem;opacity:.7;margin:.8rem 0 0}
+@media(prefers-color-scheme:dark){body{background:#1c1b1a;color:#eee}.card{background:#262422;border-color:#3a3733}input,select{background:#1c1b1a;border-color:#555}}
+</style></head><body>
+<h1>&#128048; Nabaztag setup<span>rabbit "::"<MAC>"::"</span></h1>
+<form method=\"GET\" action=\"b.htm\">
+<div class=\"card\">
+<label for=\"w\">Networks heard right now</label>
+<select name=\"w\" id=\"w\"><option value=\"-\">choose here or type below</option>"::"<SCAN>"::"</select>
+<label for=\"k\">Network name (if not in the list)</label>
+<input name=\"k\" id=\"k\" value=\""::"<SSID>"::"\" autocapitalize=\"off\" autocorrect=\"off\"/>
+<fieldset>
+<label><input type=\"radio\" name=\"m\" "::"<ENC-NONE>"::" value=\""::"<ENC-VNONE>"::"\"/> None</label>
+<label><input type=\"radio\" name=\"m\" "::"<ENC-WEP>"::" value=\""::"<ENC-VWEP>"::"\"/> WEP</label>
+<label><input type=\"radio\" name=\"m\" "::"<ENC-WPA>"::" value=\""::"<ENC-VWPA>"::"\"/> WPA</label>
+<label><input type=\"radio\" name=\"m\" "::"<ENC-WPA2>"::" value=\""::"<ENC-VWPA2>"::"\"/> WPA2</label>
+</fieldset>
+<label for=\"n\">Key</label>
+<input name=\"n\" id=\"n\" value=\""::"<KEY>"::"\" autocapitalize=\"off\" autocorrect=\"off\"/>
+</div>
+<div class=\"card\">
+<label for=\"a\">Server (Violet platform)</label>
+<input name=\"a\" id=\"a\" value=\""::"<SERVER>"::"\" autocapitalize=\"off\" autocorrect=\"off\"/>
+<details><summary>Advanced: authentication, static IP, proxy</summary>
+<label for=\"l\">WEP authentication</label>
+<select name=\"l\" id=\"l\">"::"<AUTH>"::"</select>
+<label for=\"f\">DHCP</label>
+<select name=\"f\" id=\"f\">"::"<DHCP>"::"</select>
+<label for=\"g\">IP address</label><input name=\"g\" id=\"g\" value=\""::"<NETIP>"::"\"/>
+<label for=\"h\">Netmask</label><input name=\"h\" id=\"h\" value=\""::"<NETMSK>"::"\"/>
+<label for=\"i\">Gateway</label><input name=\"i\" id=\"i\" value=\""::"<NETGW>"::"\"/>
+<label for=\"j\">DNS</label><input name=\"j\" id=\"j\" value=\""::"<NETDNS>"::"\"/>
+<label for=\"c\">Use a proxy</label>
+<select name=\"c\" id=\"c\">"::"<PROXY>"::"</select>
+<label for=\"d\">Proxy IP</label><input name=\"d\" id=\"d\" value=\""::"<PROXYIP>"::"\"/>
+<label for=\"e\">Proxy port</label><input name=\"e\" id=\"e\" value=\""::"<PROXYPORT>"::"\"/>
+<p class=\"info\">Violet account (set by the platform)<br/>
+Login: <code>"::"<LOGIN>"::"</code> &#183; Password: <code>"::"<PWD>"::"</code></p>
+</details>
+</div>
+<button name=\"z\" value=\"1\">Save and start</button>
+</form>
+<p class=\"foot\"><a href=\"u.htm\">update the firmware</a> &#183; <a href=\"d.htm\">reboot</a><br/>firmware "::"<FIRMWARE>"::"</p>
+</body></html>"::nil;;
+
+var page_done=
+"<!DOCTYPE html>
+<html lang=\"en\"><head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<title>Nabaztag setup</title>
+<style>:root{color-scheme:light dark}body{font-family:system-ui,sans-serif;margin:0 auto;padding:1rem;max-width:26rem;text-align:center}</style>
+</head><body>
+<h1>&#128048; Saved</h1>
+<p>The rabbit is rebooting onto your network: the four lights go from orange to green.</p>
+<p>You are now disconnected from the rabbit; rejoin your usual WiFi.</p>
+</body></html>";;
+
+var page_u=
+"<!DOCTYPE html>
+<html lang=\"en\"><head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<title>Firmware update</title>
+<style>:root{color-scheme:light dark}body{font-family:system-ui,sans-serif;margin:0 auto;padding:1rem;max-width:26rem}button{width:100%;padding:.7rem;font-size:1.05rem;border:0;border-radius:.4rem;background:#7a4dbb;color:#fff;font-weight:bold;margin-top:1rem}input{width:100%}</style>
+</head><body>
+<h1>&#128048; Firmware update</h1>
+<p>Prefer the <b>flash-nabaztag</b> tool from the clapier releases: it paces the upload and shows progress. This page works too, but it is blind and slow; do not close it or cut power while it runs.</p>
+<form method=\"POST\" action=\"c\" enctype=\"multipart/form-data\">
+<input type=\"file\" name=\"firmware\"/>
+<button>Upload and flash</button>
+</form>
+<p><a href=\"a.htm\">back to setup</a></p>
+</body></html>";;
+
+var page_error=
+"<!DOCTYPE html>
+<html lang=\"en\"><head>
+<meta charset=\"utf-8\"/>
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<title>Nabaztag setup</title>
+<style>:root{color-scheme:light dark}body{font-family:system-ui,sans-serif;margin:0 auto;padding:1rem;max-width:26rem;text-align:center}</style>
+</head><body>
+<h1>&#128048; Oops</h1>
+<p>Something went wrong.</p>
+<p><a href=\"a.htm\">Back to the setup page</a></p>
+</body></html>";;
+}
 
 fun filterweb val=
 	strreplace (strreplace val "\"" "&quot;") "<" "&lt;";;
