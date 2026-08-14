@@ -2,3 +2,6 @@
 	path = mtl/mtl_linux
 	url = ../mtl_linux.git
 	branch = mtl_linux
+[submodule "vendor/mtl_linux"]
+	path = vendor/mtl_linux
+	url = https://github.com/uplg/mtl_linux

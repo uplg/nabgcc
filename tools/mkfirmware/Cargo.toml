@@ -1,0 +1,7 @@
+[package]
+name = "mkfirmware"
+version = "0.1.0"
+edition = "2024"
+description = "Convert a raw ARM binary (.bin) to Nabaztag .sim firmware format"
+
+[dependencies]
