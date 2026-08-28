@@ -21,7 +21,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NABGCC_DIR="."
-MTL_DIR="vendor/mtl_linux"
+MTL_DIR="mtl/mtl_linux"
 SIM_OUTPUT_DIR="artifacts"
 DOCKER_IMAGE="debian:bullseye-slim"
 DOCKER_PLATFORM="linux/amd64"
