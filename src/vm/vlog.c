@@ -499,6 +499,16 @@ void sysReboot()
 
 void sysFlash(uint8_t* firmware,int32_t len)
 {
+  int32_t i;
+  /* The last line of defence before the flash erases itself: there is no
+   * bootloader, so an image that is not a firmware costs a JTAG session.
+   * It must fit below the config sector, and open on the reset, undef,
+   * swi and abort vectors every build of this firmware (and Violet's)
+   * carries: five "ldr pc, [pc, #n]". */
+  if ((len<0x1000)||(len>0x1F000)) return;
+  for(i=0;i<5;i++)
+    if ((firmware[4*i+3]!=0xE5)||(firmware[4*i+2]!=0x9F)||((firmware[4*i+1]&0xF0)!=0xF0))
+      return;
   __disable_interrupt();
   flash_uc((uint8_t*)firmware,len,buffer_temp);
 }

@@ -53,6 +53,11 @@ const IEEE80211_AUTH_OPEN=0;;
 const IEEE80211_AUTH_SHARED=1;;
 
 const FIRMWARE="\0\0\0\13";;
+// Which build of nabgcc this is: 8 characters, stamped by scripts/build.sh
+// (the commit, ending in m when the tree had changes). Shown by the
+// portal, sent to the server with the bytecode request, and handed to
+// the application at the tail of the env.
+const BUILD="dev00000";;
 
 
 // --------------- UTIL debut
@@ -1743,7 +1748,7 @@ summary{cursor:pointer;opacity:.7;font-size:.9rem}
 <label><input type=\"radio\" name=\"m\" "::"<ENC-WPA2>"::" value=\""::"<ENC-VWPA2>"::"\"/> WPA2</label>
 </fieldset>
 <label for=\"n\">Key</label>
-<input name=\"n\" id=\"n\" value=\""::"<KEY>"::"\" autocapitalize=\"off\" autocorrect=\"off\"/>
+<input name=\"n\" id=\"n\" value=\""::"<KEY>"::"\" placeholder=\"leave empty to keep the current key\" autocapitalize=\"off\" autocorrect=\"off\"/>
 </div>
 <div class=\"card\">
 <label for=\"a\">Server (Violet platform)</label>
@@ -1767,7 +1772,7 @@ Login: <code>"::"<LOGIN>"::"</code> &#183; Password: <code>"::"<PWD>"::"</code><
 </div>
 <button name=\"z\" value=\"1\">Save and start</button>
 </form>
-<p class=\"foot\"><a href=\"u.htm\">update the firmware</a> &#183; <a href=\"d.htm\">reboot</a><br/>firmware "::"<FIRMWARE>"::"</p>
+<p class=\"foot\"><a href=\"u.htm\">update the firmware</a> &#183; <a href=\"d.htm\">reboot</a><br/>firmware "::"<FIRMWARE>"::" &#183; build "::"<BUILD>"::"</p>
 </body></html>"::nil;;
 
 var page_done=
@@ -1900,8 +1905,9 @@ fun httpindex=
 			["<ENC-VWPA>" itoa IEEE80211_CRYPT_WPA]::
       ["<ENC-VWPA2>" itoa IEEE80211_CRYPT_WPA2]::
 			["<AUTH>" webSelectList auth [IEEE80211_AUTH_OPEN "OpenSystem"]::[IEEE80211_AUTH_SHARED "SharedKey"]::nil]::
-			["<KEY>" filterweb key]::
+			["<KEY>" ""]::
 			["<FIRMWARE>" webip FIRMWARE]::
+			["<BUILD>" BUILD]::
 
 			nil
 		page_a
@@ -1934,7 +1940,7 @@ fun useparam v val=
 	else if v=='w' then (if strcmp val "-" then confSetstr CONF_WIFISSID val 32)
 	else if v=='l' then confSet CONF_WIFIAUTH useparamcheck val 1
 	else if v=='m' then confSetbin CONF_WIFICRYPT ctoa atoi val 1
-	else if v=='n' then confSetstr CONF_WIFIKEY0 val 64
+	else if v=='n' then (if val!=nil && strlen val then confSetstr CONF_WIFIKEY0 val 64)
 	else if v=='o' then confSet CONF_LOGIN useparammac val 4
 	else if v=='p' then confSet CONF_PWD useparammac val 4
 	else if v=='z' then (set master=-40; nil)
@@ -2023,7 +2029,9 @@ fun getfirmware req=
 		setleds 0xff0000;
 		getbinary bin req 0 i0 len>>1;
 		uncrypt bin 0 nil 0x47 47;
-		bin
+		// Not everything wearing the -violet- frame is a firmware: it
+		// must fit below the config sector and open on an ARM vector.
+		if (strlen bin)<=0x1f000 && (strget bin 3)==0xe5 && (strget bin 2)==0x9f then bin
 	);;
 
 fun httpflash req=
@@ -2444,7 +2452,7 @@ fun scanunserialize s n i0=
 
 
 fun envmake =
-	strcatlist netip::netmask::netgateway::netdns::scanserialize wifiscans;;
+	strcat (strcatlist netip::netmask::netgateway::netdns::scanserialize wifiscans) (strcat "NABG" BUILD);;
 
 fun envrestore s =
 	if s!=nil then
@@ -2708,7 +2716,7 @@ fun _bootcbhttp httpreq res=
 
 
 fun boot_url url =
-	Secholn strcatlist url::"/bc.jsp?v="::(webip FIRMWARE)::"&m="::(webmac netMac)::"&l="::(webmac confGetLogin)::"&p="::(webmac confGetPwd)::"&h="::(itoa HARDWARE)::nil;;
+	Secholn strcatlist url::"/bc.jsp?v="::(webip FIRMWARE)::"&m="::(webmac netMac)::"&l="::(webmac confGetLogin)::"&p="::(webmac confGetPwd)::"&h="::(itoa HARDWARE)::"&b="::BUILD::nil;;
 
 fun boot_loop=
 	if wifitry!=nil && time-wifitry>BOOT_WIFITIMEOUT && httpboot==nil then	// essayer un autre réseau
