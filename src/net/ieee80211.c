@@ -50,15 +50,6 @@ uint32_t ieee80211_timeout;
 static rt2501_scan_callback ieee80211_scallback;
 static void *ieee80211_scallback_userparam;
 
-/* Ciphers each AP advertised during the last scan, so an association can use
- * them even when the caller only knows "WPA2" (see ieee80211_scanned_ciphers). */
-#define IEEE80211_SCAN_CACHE_SIZE 8
-static struct {
-	uint8_t bssid[IEEE80211_ADDR_LEN];
-	uint8_t encryption;
-} ieee80211_scan_cache[IEEE80211_SCAN_CACHE_SIZE];
-static uint8_t ieee80211_scan_cache_len;
-
 uint8_t ieee80211_assoc_mac[IEEE80211_ADDR_LEN];
 uint8_t ieee80211_assoc_bssid[IEEE80211_ADDR_LEN];
 uint8_t ieee80211_assoc_ssid[IEEE80211_SSID_MAXLEN+1];
@@ -1061,8 +1052,14 @@ static void ieee80211_input_mgt(uint8_t *frame, uint32_t length, int16_t rssi)
 				char ssid[IEEE80211_SSID_MAXLEN+1];
 
 				ssid_present = 0;
-				while(frame_current < frame_end) {
-					if(frame_current[0] == IEEE80211_ELEMID_SSID) {
+				ssid[0] = 0;
+				while((frame_current + 2) <= frame_end) {
+					/* The element length is the sender's word: anyone in
+					 * range can send a probe request, and ssid[] sits on
+					 * the stack. */
+					if((frame_current[0] == IEEE80211_ELEMID_SSID)
+					   && (frame_current[1] <= IEEE80211_SSID_MAXLEN)
+					   && ((frame_current + 2 + frame_current[1]) <= frame_end)) {
 						ssid_present = 1;
 						for(i=0;i<frame_current[1];i++)
 							ssid[i] = frame_current[i+2];
@@ -1226,7 +1223,12 @@ static void ieee80211_input_mgt(uint8_t *frame, uint32_t length, int16_t rssi)
 
                 scan_result.encryption |= IEEE80211_CRYPT_WPA2;
                 DBG_WIFI("WPA2 supported"EOL);
-                frame_current += frame_current[1];
+                /* No advance here: the end of the loop steps over this
+                 * element like any other. Stepping twice landed on the
+                 * element's last two bytes (the RSN capabilities) and read
+                 * them as an element of their own - harmless for 0x000c,
+                 * an empty SSID for 0x0000, a skip into the weeds when the
+                 * element ends on a group management suite. */
                 break;
               }
 							case IEEE80211_ELEMID_VENDOR:
@@ -1239,7 +1241,11 @@ static void ieee80211_input_mgt(uint8_t *frame, uint32_t length, int16_t rssi)
 								/* Minimal size of a WPA element */
 								if(frame_current[1] < 22) break;
 
-                if(scan_result.encryption == IEEE80211_CRYPT_WPA2)
+                /* An RSN element already settled it (its result carries
+                 * cipher bits, so compare the type alone): a mixed-mode AP
+                 * stays WPA2 with the ciphers it advertised. */
+                if((scan_result.encryption != IEEE80211_CRYPT_UNSUPPORTED) &&
+                   ((scan_result.encryption&0xF0) == IEEE80211_CRYPT_WPA2))
                   break;
 
 								/* Check RSN IE */
@@ -1305,20 +1311,6 @@ static void ieee80211_input_mgt(uint8_t *frame, uint32_t length, int16_t rssi)
 						frame_current += (frame_current[1] + 2);
 					}
 					if(scan_result.rateset == 0) scan_result.rateset = IEEE80211_RATEMASK_1;
-
-					/* Remember the ciphers this AP advertised: the caller of
-					 * rt2501_auth may only know the broad encryption type. */
-					if(ieee80211_scan_cache_len < IEEE80211_SCAN_CACHE_SIZE) {
-						uint8_t s;
-						for(s=0;s<ieee80211_scan_cache_len;s++)
-							if(memcmp(ieee80211_scan_cache[s].bssid,
-							          scan_result.bssid, IEEE80211_ADDR_LEN) == 0)
-								break;
-						memcpy(ieee80211_scan_cache[s].bssid, scan_result.bssid,
-						       IEEE80211_ADDR_LEN);
-						ieee80211_scan_cache[s].encryption = scan_result.encryption;
-						if(s == ieee80211_scan_cache_len) ieee80211_scan_cache_len++;
-					}
 
 					ieee80211_scallback(&scan_result, ieee80211_scallback_userparam);
 				}
@@ -1500,7 +1492,8 @@ static void ieee80211_input_ctl(uint8_t *frame, uint32_t length)
 	/* handled by the RT2501 ASIC */
 }
 
-static void ieee80211_input_data(uint8_t *frame, uint32_t length, int16_t rssi)
+static void ieee80211_input_data(uint8_t *frame, uint32_t length, int16_t rssi,
+				 uint8_t decrypted)
 {
 //#pragma pack(1)
 	struct {
@@ -1568,6 +1561,22 @@ static void ieee80211_input_data(uint8_t *frame, uint32_t length, int16_t rssi)
 
 	switch(fr->header.i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK) {
 	case IEEE80211_FC0_SUBTYPE_DATA:
+		/* On a WPA link the only data frame that may arrive in the clear is
+		 * EAPOL (the handshake, and an AP opening a rekey). Anything else
+		 * was not sent by someone holding the key: without this, a frame
+		 * forged with the AP's address walked straight up to the VM. A
+		 * frame the ASIC decrypted, or one still wearing its Protected bit
+		 * (a bad key never gets this far, see CipherErr), is genuine. */
+		if((ieee80211_mode == IEEE80211_M_MANAGED)
+		   && (((ieee80211_encryption&0xF0) == IEEE80211_CRYPT_WPA)
+		       || ((ieee80211_encryption&0xF0) == IEEE80211_CRYPT_WPA2))
+		   && !decrypted
+		   && !(fr->header.i_fc[1] & IEEE80211_FC1_PROTECTED)
+		   && ((length < sizeof(struct ieee80211_frame)+LLC_LENGTH)
+		       || (memcmp(fr->data, eapol_llc, LLC_LENGTH) != 0))) {
+			DBG_WIFI("Cleartext data frame on a WPA link, dropped"EOL);
+			break;
+		}
 		if(!rt2501buffer_new(fr->data,
 			length-sizeof(struct ieee80211_frame),
 			source_mac, dest_mac))
@@ -1588,7 +1597,8 @@ static void ieee80211_input_data(uint8_t *frame, uint32_t length, int16_t rssi)
 	}
 }
 
-void ieee80211_input(uint8_t *frame, uint32_t length, int16_t rssi)
+void ieee80211_input(uint8_t *frame, uint32_t length, int16_t rssi,
+		     uint8_t decrypted)
 {
 //#ifdef DEBUG_WIFI
 //  DBG_WIFI("Rxed:"EOL);
@@ -1609,7 +1619,7 @@ void ieee80211_input(uint8_t *frame, uint32_t length, int16_t rssi)
 			ieee80211_input_ctl(frame, length);
 			break;
 		case IEEE80211_FC0_TYPE_DATA:
-			ieee80211_input_data(frame, length, rssi);
+			ieee80211_input_data(frame, length, rssi, decrypted);
 			break;
     default:
       DBG_WIFI("Unhandled frame in ie80211_input"EOL);
@@ -1763,27 +1773,6 @@ void rt2501_setmode(int32_t mode, const uint8_t *ssid, uint8_t channel)
 	enable_ohci_irq();
 }
 
-/**
- * @brief Cipher bits (low nibble of an encryption byte) this AP advertised
- *
- * The RSN IE we send is built from those bits alone, so associating without
- * them advertises cipher suite 00-0F-AC-00 for both group and pairwise —
- * which lenient APs ignore but a WPA2/WPA3-transition AP rejects.
- */
-static uint8_t ieee80211_scanned_ciphers(const uint8_t *bssid)
-{
-	uint8_t i;
-
-	for(i=0;i<ieee80211_scan_cache_len;i++)
-		if(memcmp(ieee80211_scan_cache[i].bssid, bssid, IEEE80211_ADDR_LEN) == 0)
-			if(ieee80211_scan_cache[i].encryption & 0x0F)
-				return ieee80211_scan_cache[i].encryption & 0x0F;
-
-	/* Never scanned, or the AP advertised nothing we parsed: CCMP for both,
-	 * the one pair every WPA2 (and every transition-mode) AP must accept. */
-	return (IEEE80211_CIPHER_CCMP << 1) | (IEEE80211_CIPHER_CCMP >> 1);
-}
-
 void rt2501_scan(const uint8_t *ssid, rt2501_scan_callback callback, void *userparam)
 {
 //#pragma pack(1)
@@ -1798,8 +1787,6 @@ void rt2501_scan(const uint8_t *ssid, rt2501_scan_callback callback, void *userp
 	uint8_t channel, i, j;
 
 	if(ieee80211_mode != IEEE80211_M_MANAGED) return;
-
-	ieee80211_scan_cache_len = 0;
 
 	DBG_WIFI("Scanning..."EOL);
 
@@ -1957,20 +1944,16 @@ void rt2501_auth(const uint8_t *ssid, const uint8_t *mac,
 			break;
 		case IEEE80211_CRYPT_WPA:
     case IEEE80211_CRYPT_WPA2:
-			/* Callers that only know the broad encryption type — the VM passes
-			 * the config sector's crypt byte, plain WPA2 with no cipher bits —
-			 * would build an RSN IE advertising suite 00-0F-AC-00 for both
-			 * group and pairwise. Lenient APs let that through (which is why a
-			 * phone hotspot worked), a Freebox in WPA2/WPA3 transition mode
-			 * refuses the association. Fill the ciphers in from the beacon. */
-			if((ieee80211_encryption & 0x0F) == 0) {
-				ieee80211_encryption |= ieee80211_scanned_ciphers(bssid);
-#ifdef DEBUG_WIFI
-				sprintf(dbg_buffer, "No cipher requested, using scanned 0x%02x"EOL,
-					ieee80211_encryption);
-				DBG_WIFI(dbg_buffer);
-#endif
-			}
+			/* The ciphers travel with the scan result: the VM hands
+			 * netAuth the encryption byte its scan returned, RSN ciphers
+			 * packed in the low nibble, and ieee80211_associate builds the
+			 * RSN element from them. A WPA2 caller that names none would
+			 * advertise suite 00-0F-AC-00 twice, which a strict AP refuses:
+			 * CCMP for both is the pair every WPA2 AP accepts. WPA leaves
+			 * the nibble empty and takes its cipher from message 1/4. */
+			if(ieee80211_encryption == IEEE80211_CRYPT_WPA2)
+				ieee80211_encryption |= (IEEE80211_CIPHER_CCMP << 1)
+				                      | (IEEE80211_CIPHER_CCMP >> 1);
 			ieee80211_authmode = IEEE80211_AUTH_OPEN;
 			memcpy(ieee80211_key, key, IEEE80211_MAX_KEYLEN);
 			rt2501_set_key(0, NULL, NULL, NULL, RT2501_CIPHER_NONE);

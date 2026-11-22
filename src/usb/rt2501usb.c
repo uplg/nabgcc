@@ -817,7 +817,8 @@ static void rt2501_rx_callback(PURB urb)
     if(!rxd->Crc && ((rxd->CipherAlg == RT2501_CIPHER_NONE) || (rxd->CipherErr == 0))) {
       ieee80211_input(rt2501_frame+sizeof(RXD_STRUC),
           rxd->DataByteCnt,
-          rxd->PlcpRssi-rt2501_BbpRssiToDbmDelta);
+          rxd->PlcpRssi-rt2501_BbpRssiToDbmDelta,
+          rxd->CipherAlg != RT2501_CIPHER_NONE);
     }
     rt2501_frame_position = 0;
   } else {
@@ -898,8 +899,10 @@ void rt2501_make_tx_descriptor(
   /* fill encryption related information, if required */
   txd->CipherAlg = CipherAlg;
 
+#ifdef DEBUG_WIFI
   sprintf(dbg_buffer, "Cipher = %u, rate = %lu"EOL, CipherAlg, Rate);
   DBG_WIFI(dbg_buffer);
+#endif
 
   if(CipherAlg != RT2501_CIPHER_NONE) {
     txd->KeyTable    = KeyTable;

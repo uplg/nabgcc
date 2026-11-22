@@ -914,11 +914,17 @@ void interpGo()
             int32_t chn=VALTOINT(VFETCH(scan,4));
             int32_t rate=VALTOINT(VFETCH(scan,5));
             int32_t crypt=VALTOINT(VFETCH(scan,6));
-            /* FIXME: 20170822: Really necessary ?
-             * Check upper part of encrypt (config) and crypt (scan)
-             * before using crypt (which has the supported cipher infos
-            */
-            if ((mac!=NIL)&&(bssid!=NIL)&&(crypt&0xF0)==encrypt)
+            /* The scan result carries what the AP really advertises
+             * (type and ciphers); the caller's encrypt is what the
+             * person picked in the portal. They must agree on the type,
+             * except between WPA and WPA2: both run on the same PMK, so
+             * the beacon settles it and a wrong radio button no longer
+             * means a rabbit that silently never authenticates. */
+            int32_t wpa_family=
+              (((crypt&0xF0)==0x20)||((crypt&0xF0)==0x40))  /* IEEE80211_CRYPT_WPA, _WPA2 */
+              &&((encrypt==0x20)||(encrypt==0x40));
+            if ((mac!=NIL)&&(bssid!=NIL)&&(crypt!=0xFF)&&  /* _UNSUPPORTED */
+                (wpa_family||((crypt&0xF0)==encrypt)))
             {
               netAuth((ssid==NIL)?NULL:VSTARTBIN(ssid),VSTARTBIN(mac),
                 VSTARTBIN(bssid),chn,rate,authmode,

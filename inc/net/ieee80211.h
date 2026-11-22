@@ -363,6 +363,7 @@ enum {
 
 void ieee80211_init(void);
 void ieee80211_timer(void);
-void ieee80211_input(uint8_t *frame, uint32_t length, int16_t rssi);
+void ieee80211_input(uint8_t *frame, uint32_t length, int16_t rssi,
+                     uint8_t decrypted);
 
 #endif

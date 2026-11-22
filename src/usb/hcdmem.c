@@ -174,6 +174,7 @@ void *hcd_malloc(uint32_t Size, int8_t Bank,int32_t tag)
 
   if(NextBufferAddress + Area > Buffer->Address + Buffer->Size)
   {
+#ifdef DEBUG_USB
     DBG_USB("hcd_malloc: NextBufferAddress + Area > Buffer->Address + Buffer->Size"EOL);
     pNextMMDL = Buffer->MMDLs;
     while(pNextMMDL != NULL)
@@ -186,6 +187,7 @@ void *hcd_malloc(uint32_t Size, int8_t Bank,int32_t tag)
     }
     sprintf(dbg_buffer,"time=%ld"EOL,counter_timer);
     DBG_USB(dbg_buffer);
+#endif
     return NULL;
   }
 
