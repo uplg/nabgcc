@@ -40,7 +40,7 @@ LDSCRIPT = sys/ml67q4051.ld
 # Linker options
 LD_FLAGS =
 LDFLAGS += --specs=nosys.specs
-#~ LDFLAGS +=  -Wl,--gc-sections
+LDFLAGS += -Wl,--gc-sections -Wl,--print-gc-sections
 #~ LDFLAGS += -Wl,-s
 LDFLAGS += -Wl,-Map,obj/$(TARGET).map
 LDFLAGS += -nostartfiles

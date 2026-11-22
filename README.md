@@ -12,36 +12,30 @@ This a port of the Nabaztag's firmware sources for ARM GCC (and OSS tools).
 ## Howto
 ### Requirements
 
-    sudo apt install g++ gcc-arm-none-eabi gdb-arm-none-eabi php-cli g++-multilib 
+Docker (with linux/amd64 emulation on Apple Silicon) and a Rust toolchain.
 
 ### Get the sources
 
-    git clone https://github.com/RedoXyde/nabgcc.git
+    git clone https://github.com/uplg/nabgcc.git
     cd nabgcc
-    git checkout wpa2
     git submodule update --init
 
-### Compile
+### Build
 
-    cd nabgcc/
-    make mtl_boot
-    make -j2
+    scripts/build.sh --release
+
+The whole pipeline runs in a debian:trixie container: the Metal boot
+bytecode, the firmware (arm-none-eabi-gcc), then the `.sim` image in
+`artifacts/`. Every image carries the commit it was built from; the
+config page shows it. Without `--release` the UART debug output is on,
+which is too slow to associate: flash release images.
 
 ### Flash
-#### Using OpenOCD and GDB
 
-    # Shell 1
-    cd nabgcc/openocd/
-    ./openocd -f ./nabaztagv2.cfg
-    
-    # Shell 2
-    cd nabgcc/
-    make program
+Put the Nabaztag in config mode (head button held while powering on, blue
+leds), join its `NabaztagXX` access point, then either run clapier's
+`flash-nabaztag artifacts/Nab-wpa23-release.sim` or upload the file at
+http://192.168.0.1/u.htm.
 
-#### Using the configuration page
-
-    cd nabgcc/bin
-    ../utils/mkfirmware.php
-    
-    # Then, put your Nabaztag in config mode (Blue leds) and upload the firmware0.0.0.13.sim file
-    
+Flashing rewrites the whole firmware and there is no bootloader: keep the
+power steady. `docs/jtag-debrick.md` is the way back from a bad flash.

@@ -23,7 +23,8 @@ SECTIONS
   /* first section is .text which is used for code */
   .text :
   {
-    *(.intvec)
+    KEEP(*(.intvec))             /* nothing calls the vectors: without
+                                    KEEP, --gc-sections drops them */
     *(.startup.*)
     *(.text.*)                   /* remaining code */
     *(.glue_7t) *(.glue_7)
