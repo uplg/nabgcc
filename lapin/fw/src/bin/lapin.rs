@@ -51,6 +51,13 @@ extern "C" fn main() -> ! {
             uart::write(b"\n");
             Some(stick)
         }
+        Err(rt2573::Error::Radio(radio)) => {
+            // Not the radio chip this firmware knows how to tune.
+            uart::write(b"wifi: radio ");
+            uart::hex8(radio);
+            uart::write(b"\n");
+            None
+        }
         Err(_) => {
             uart::write(b"wifi: no stick\n");
             None

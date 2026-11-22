@@ -122,6 +122,24 @@ fn a_missing_wifi_stick_is_reported() {
     assert_eq!(m.events, []);
 }
 
+/// The rabbit's stick has an RT2528 radio and the firmware tunes no
+/// other: a stick that names another one is refused, by name, before
+/// anything is written to its radio.
+#[test]
+fn a_stick_with_another_radio_is_refused() {
+    let Some(image) = image("lapin") else { return };
+    let mut m = Machine::from_file(&image).0;
+    let (stick, _radio) = nabemu::rt2573::Rt2573::new([0x00, 0x19, 0xDB, 0, 0, 1]);
+    m.soc.ohci.device = Some(Box::new(stick.with_radio_chip(4)));
+    m.run_until_ms(6000);
+    assert!(
+        m.console()
+            .starts_with("lapin 0.1\nrun\nwifi: radio 04\n.."),
+        "{}",
+        m.console()
+    );
+}
+
 /// A firmware that stops feeding its watchdog is restarted by it.
 #[test]
 fn the_watchdog_restarts_a_hung_firmware() {

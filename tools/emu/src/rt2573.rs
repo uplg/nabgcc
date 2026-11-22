@@ -128,6 +128,14 @@ fn config_descriptor() -> Vec<u8> {
 }
 
 impl Rt2573 {
+    /// The same stick with another radio chip named in its calibration
+    /// data (1 RT5226, 2 RT2528, 3 RT5225, 4 RT2527). Only the name
+    /// changes: the model stays that of the RT2528.
+    pub fn with_radio_chip(mut self, chip: u8) -> Self {
+        self.eeprom[0x21] = (self.eeprom[0x21] & 0x07) | chip << 3;
+        self
+    }
+
     pub fn new(mac: [u8; 6]) -> (Self, SharedRadio) {
         let radio = Rc::new(RefCell::new(Radio::default()));
         let mut eeprom = [0xFFu8; 256];

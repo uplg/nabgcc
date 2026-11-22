@@ -95,11 +95,10 @@ const EEPROM_TX_POWER: u16 = 0x46;
 const EEPROM_TSSI: u16 = 0x54;
 const EEPROM_FREQUENCY: u16 = 0x5E;
 
-/// Radio chips the stick may carry.
-const RF_5226: u8 = 1;
+/// The radio chip of the rabbit's stick, as its calibration data names
+/// it: an RT2528, the 2.4 GHz companion of the RT2571W. The stick's
+/// other radios (RT2527, RT5225, RT5226) are not handled.
 const RF_2528: u8 = 2;
-const RF_5225: u8 = 3;
-const RF_2527: u8 = 4;
 
 const BBP_R94_DEFAULT: i8 = 6;
 /// What to take off the baseband's signal reading to get dBm.
@@ -112,6 +111,9 @@ pub enum Error {
     Usb(usb::Error),
     /// The baseband or the radio never reported ready.
     NotReady,
+    /// The stick carries a radio chip other than the rabbit's RT2528;
+    /// this is the type its calibration data gives.
+    Radio(u8),
 }
 
 impl From<usb::Error> for Error {
@@ -298,10 +300,6 @@ impl Stick {
         Ok(self.write(PHY_CSR4, value)?)
     }
 
-    fn rf_type(&self) -> u8 {
-        (self.antenna >> 11) as u8
-    }
-
     /// Load the stick's firmware, set it up, read its calibration data
     /// and address, tune to channel 1 and start receiving.
     pub fn start(device: usb::Device) -> Result<Stick, Error> {
@@ -364,9 +362,9 @@ impl Stick {
         self.eeprom(EEPROM_BBP, &mut bbp)?;
         self.antenna = u16::from_le_bytes([bbp[0], bbp[1]]);
         self.auto_power = self.antenna & (1 << 9) != 0;
-        if matches!(self.rf_type(), RF_5225 | RF_2527) {
-            let value = self.read(PHY_CSR1)?;
-            self.write(PHY_CSR1, value | 0x1_0000)?;
+        let radio = (self.antenna >> 11) as u8;
+        if radio != RF_2528 {
+            return Err(Error::Radio(radio));
         }
 
         let mut power = [0u8; 14];
@@ -426,22 +424,11 @@ impl Stick {
         let mut r4 = self.bbp_read(4)? & !0x23;
         let r77 = self.bbp_read(77)? & 0xFC;
         let frame_type_mask = !((((self.antenna >> 6) & 1) as u8) << 5);
-        r4 |= if self.rf_type() == RF_2528 || self.rf_type() == RF_2527 {
-            0x21
-        } else {
-            0x01
-        };
-        if self.rf_type() != RF_5225 {
-            r4 &= frame_type_mask;
-        }
-        if matches!(self.rf_type(), RF_5226 | RF_2528 | RF_5225 | RF_2527) {
-            self.bbp_write(77, r77)?;
-            self.bbp_write(3, r3)?;
-            self.bbp_write(4, r4)?;
-        } else {
-            self.bbp_write(3, r3)?;
-            self.bbp_write(4, self.bbp_read(4)? & !0x23)?;
-        }
+        r4 |= 0x21;
+        r4 &= frame_type_mask;
+        self.bbp_write(77, r77)?;
+        self.bbp_write(3, r3)?;
+        self.bbp_write(4, r4)?;
         Ok(())
     }
 
@@ -479,13 +466,9 @@ impl Stick {
         } else {
             power as u32
         };
-        // Synthesiser words: the two families of radio chips differ by
-        // a few fixed bits, the frequency is in the second and fourth.
-        let (r1, r2_base, r3_base, r4_base) = if matches!(self.rf_type(), RF_5225 | RF_2527) {
-            (0x9500_2CCC, 0x9500_4786, 0x9506_8455, 0x950F_FA00)
-        } else {
-            (0x9400_2C0C, 0x9400_0786, 0x9406_8255, 0x940F_EA00)
-        };
+        // Synthesiser words: the frequency is in the second and fourth.
+        let (r1, r2_base, r3_base, r4_base): (u32, u32, u32, u32) =
+            (0x9400_2C0C, 0x9400_0786, 0x9406_8255, 0x940F_EA00);
         let (r2, r4_low) = match channel {
             14 => (r2_base + 0x1C, 0x13),
             c => (
@@ -500,12 +483,7 @@ impl Stick {
             (r3_power << 9) | (r3_base & 0xFFFF_C1FF),
             (r4 & !0x0003_F000) | self.frequency_offset << 12,
         ];
-        let smart = self.bbp_read(3)?;
-        let smart = if matches!(self.rf_type(), RF_5225 | RF_2527) {
-            smart & 0xFE
-        } else {
-            smart | 1
-        };
+        let smart = self.bbp_read(3)? | 1;
         self.bbp_write(3, smart)?;
         if r94 != BBP_R94_DEFAULT {
             self.bbp_write(94, r94 as u8)?;
