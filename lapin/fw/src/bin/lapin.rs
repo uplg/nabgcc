@@ -48,6 +48,8 @@ extern "C" fn main() -> ! {
                 }
                 uart::hex8(*byte);
             }
+            uart::write(b" radio ");
+            uart::hex8(stick.radio());
             uart::write(b"\n");
             Some(stick)
         }

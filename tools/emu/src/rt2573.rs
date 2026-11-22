@@ -89,6 +89,11 @@ pub struct Radio {
     pub rx_dropped: u64,
     /// Protected frames received that failed to decrypt, by cause.
     pub rx_cipher_errors: [u64; 4],
+    /// The RF chip the stick carries, as its calibration data numbers
+    /// them: 2 an RT2528 (also what 0 stands for), 4 an RT2527. Each
+    /// tunes only on its own synthesiser words; the other two (1 an
+    /// RT5226, 3 an RT5225) are named to the firmware but not modelled.
+    pub rf_chip: u8,
 }
 
 pub type SharedRadio = Rc<RefCell<Radio>>;
@@ -128,14 +133,6 @@ fn config_descriptor() -> Vec<u8> {
 }
 
 impl Rt2573 {
-    /// The same stick with another radio chip named in its calibration
-    /// data (1 RT5226, 2 RT2528, 3 RT5225, 4 RT2527). Only the name
-    /// changes: the model stays that of the RT2528.
-    pub fn with_radio_chip(mut self, chip: u8) -> Self {
-        self.eeprom[0x21] = (self.eeprom[0x21] & 0x07) | chip << 3;
-        self
-    }
-
     pub fn new(mac: [u8; 6]) -> (Self, SharedRadio) {
         let radio = Rc::new(RefCell::new(Radio::default()));
         let mut eeprom = [0xFFu8; 256];
@@ -238,9 +235,21 @@ impl Rt2573 {
             _ => {}
         }
         self.mem[PHY_CSR4..PHY_CSR4 + 4].copy_from_slice(&(w & 0x7FFF_FFFF).to_le_bytes());
-        // Channel from the RT2528 synthesiser words (two channels share
-        // an R2 value, R4 tells them apart).
-        let step = ((self.rf_r2 & 0xFFFFC).wrapping_sub(0x784)) / 4;
+        // Channel from the synthesiser words (two channels share an R2
+        // value, R4 tells them apart). An RT2527 takes words of 21 bits
+        // with other fixed bits than the RT2528's 20: a chip sent the
+        // other's words tunes nowhere.
+        let (bits, r2_base) = match self.radio.borrow().rf_chip {
+            0 | 2 => (20, 0x0784),
+            4 => (21, 0x4784),
+            _ => (0, 0),
+        };
+        let fits = |w: u32| (w >> 24) & 0x1F == bits;
+        let step = if fits(self.rf_r2) && fits(self.rf_r4) {
+            ((self.rf_r2 & 0xFFFFC).wrapping_sub(r2_base)) / 4
+        } else {
+            u32::MAX
+        };
         let channel = match (step, self.rf_r4 & 0xFF) {
             (7, _) => 14,
             (0..=6, 0x1F) => step * 2 + 2,
@@ -262,7 +271,12 @@ impl Rt2573 {
             (0xC0, REQ_READ_MULTI_MAC) => self.read_mem(s),
             (0xC0, REQ_READ_EEPROM) => {
                 let start = s.index as usize;
-                self.eeprom
+                let mut eeprom = self.eeprom;
+                match self.radio.borrow().rf_chip {
+                    0 => {}
+                    chip => eeprom[0x21] = (eeprom[0x21] & 0x07) | chip << 3,
+                }
+                eeprom
                     .get(start..start + s.length as usize)
                     .map(|d| d.to_vec())
             }

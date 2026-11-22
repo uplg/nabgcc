@@ -34,7 +34,7 @@ fn the_firmware_boots_and_stays_up() {
     // channels, then one dot a second, counted by the timer interrupt.
     let console = m.console();
     assert!(
-        console.starts_with("lapin 0.1\nrun\nwifi 00:19:db:00:00:01\n...."),
+        console.starts_with("lapin 0.1\nrun\nwifi 00:19:db:00:00:01 radio 02\n...."),
         "{console}"
     );
     assert_eq!(console.matches('.').count(), 10, "{console}");
@@ -122,22 +122,45 @@ fn a_missing_wifi_stick_is_reported() {
     assert_eq!(m.events, []);
 }
 
-/// The rabbit's stick has an RT2528 radio and the firmware tunes no
-/// other: a stick that names another one is refused, by name, before
-/// anything is written to its radio.
+/// The firmware tunes the two radio chips that do 2.4 GHz only. A stick
+/// that names one of the others is refused, by name, before anything
+/// is written to its radio.
 #[test]
-fn a_stick_with_another_radio_is_refused() {
+fn a_stick_with_a_radio_it_cannot_tune_is_refused() {
     let Some(image) = image("lapin") else { return };
     let mut m = Machine::from_file(&image).0;
-    let (stick, _radio) = nabemu::rt2573::Rt2573::new([0x00, 0x19, 0xDB, 0, 0, 1]);
-    m.soc.ohci.device = Some(Box::new(stick.with_radio_chip(4)));
+    m.radio.borrow_mut().rf_chip = 3;
     m.run_until_ms(6000);
     assert!(
         m.console()
-            .starts_with("lapin 0.1\nrun\nwifi: radio 04\n.."),
+            .starts_with("lapin 0.1\nrun\nwifi: radio 03\n.."),
         "{}",
         m.console()
     );
+}
+
+/// A stick with the RT2527 radio is tuned with that chip's own words:
+/// the firmware still lands on every channel and hears the networks.
+#[test]
+fn a_stick_with_the_rt2527_radio_finds_the_networks_too() {
+    use nabemu::air::{AccessPoint, Security};
+
+    let Some(image) = image("lapin") else { return };
+    let mut m = Machine::from_file(&image).0;
+    m.radio.borrow_mut().rf_chip = 4;
+    m.air.push(AccessPoint::new(
+        "Garenne",
+        [2, 0, 0, 0, 0, 0xA2],
+        11,
+        Security::Open,
+    ));
+    m.run_until_ms(4000);
+    let console = m.console();
+    assert!(console.contains(" radio 04\n"), "{console}");
+    assert!(console.contains("answer Garenne channel 0b\n"), "{console}");
+    let radio = m.radio.borrow();
+    let channels: Vec<u8> = radio.tx.iter().map(|f| f.channel).collect();
+    assert_eq!(channels, (1..=13).collect::<Vec<u8>>());
 }
 
 /// A firmware that stops feeding its watchdog is restarted by it.

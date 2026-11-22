@@ -12,7 +12,7 @@ Nothing here has been on a real rabbit.
 
 ## Running it
 
-    cd tools/emu && cargo test --release          # 92 tests, about 40 s
+    cd tools/emu && cargo test --release          # 93 tests, about 40 s
     cd lapin && ./build.sh                        # needs the nightly toolchain
     cd tools/emu && cargo run --release -- --ap Terrier ../../lapin/target/thumbv4t-none-eabi/release/lapin
     cd tools/emu && web/build.sh && node web/test.mjs
@@ -67,11 +67,12 @@ fourth; the Rust firmware already sends it.
 **Unverified assumptions.** In the emulator: flash erase and program
 times (from a comment in the C code), ear speed, the stick's power-on
 beacon interval, what the stick reports for a frame it has no key for,
-no bus wait states. The stick's radio chip is taken to be an RT2528:
-teardowns name its other chip, an RT2571W, the rabbit is 802.11b/g
-only, and Ralink sold that pair as the RT2501USB; nobody has read the
-type from a rabbit's stick. The Rust driver tunes that radio only and
-prints `wifi: radio NN` for any other. Whether the watchdog can
+no bus wait states. Which radio chip a rabbit's stick carries has
+not been read from one: its other chip is an RT2571W, which Ralink sold
+with the RT2528, but Violet's driver knew two versions of the module.
+The Rust driver tunes the two 2.4 GHz chips (RT2528, RT2527, words as
+in Linux's rt73usb), prints the type at boot (`wifi <address> radio
+NN`) and refuses the two 5 GHz ones. Whether the watchdog can
 really be paused during a flash (the C code tries without the unlock
 sequence) is unknown; a full image takes 1.76 s by the modelled
 timings, against 2.09 s.
