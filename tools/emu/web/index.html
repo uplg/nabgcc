@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nabemu</title>
+<style>
+  :root { color-scheme: light dark; --ink: #2b2b33; --paper: #f4f2ee; --line: #c9c5bd; --shell: #fbfaf7; --off: #d9d6cf; }
+  @media (prefers-color-scheme: dark) { :root { --ink: #e8e6e1; --paper: #1b1b20; --line: #44434b; --shell: #ecebe6; --off: #cfccc5; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, sans-serif; color: var(--ink); background: var(--paper); }
+  main { max-width: 62rem; margin: 0 auto; padding: 1.2rem; display: grid; gap: 1.2rem; grid-template-columns: minmax(15rem, 20rem) 1fr; }
+  @media (max-width: 44rem) { main { grid-template-columns: 1fr; } }
+  h1 { font-size: 1.15rem; margin: 0 0 .2rem; }
+  p { margin: .3rem 0; }
+  .muted { opacity: .7; font-size: .88rem; }
+  svg { width: 100%; height: auto; touch-action: none; user-select: none; }
+  .ear { transition: transform .1s linear; transform-box: fill-box; transform-origin: 50% 92%; }
+  .led { transition: fill .08s linear; fill: var(--off); stroke: var(--line); stroke-width: .6; }
+  #head { cursor: pointer; }
+  fieldset { border: 1px solid var(--line); border-radius: .5rem; padding: .6rem .8rem; margin: 0 0 .8rem; }
+  legend { font-size: .82rem; opacity: .75; padding: 0 .3rem; }
+  label { display: block; margin: .35rem 0; }
+  select, input[type=file], input[type=range], button { font: inherit; max-width: 100%; }
+  button { padding: .35rem .8rem; border-radius: .4rem; border: 1px solid var(--line); background: transparent; color: inherit; cursor: pointer; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .1rem .8rem; margin: 0; font-variant-numeric: tabular-nums; }
+  dt { opacity: .7; }
+  dd { margin: 0; }
+  pre { margin: 0; padding: .7rem; height: 24rem; overflow: auto; border: 1px solid var(--line); border-radius: .5rem; font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <h1>nabemu</h1>
+    <p class="muted">The Nabaztag:tag firmware, running in this page. Press the head for its button.</p>
+    <svg viewBox="0 0 200 300" aria-label="The rabbit">
+      <g class="ear" id="ear-left"><rect x="62" y="6" width="22" height="112" rx="11" fill="var(--shell)" stroke="var(--line)"/></g>
+      <g class="ear" id="ear-right"><rect x="116" y="6" width="22" height="112" rx="11" fill="var(--shell)" stroke="var(--line)"/></g>
+      <path id="head" d="M40 290 C40 150 60 100 100 100 C140 100 160 150 160 290 Z" fill="var(--shell)" stroke="var(--line)"/>
+      <circle cx="84" cy="150" r="4" fill="#2b2b33"/><circle cx="116" cy="150" r="4" fill="#2b2b33"/>
+      <circle class="led" id="led-0" cx="100" cy="170" r="7"/>
+      <circle class="led" id="led-1" cx="74" cy="222" r="10"/>
+      <circle class="led" id="led-2" cx="100" cy="222" r="10"/>
+      <circle class="led" id="led-3" cx="126" cy="222" r="10"/>
+      <ellipse class="led" id="led-4" cx="100" cy="282" rx="52" ry="6"/>
+    </svg>
+    <dl>
+      <dt>Board time</dt><dd id="time">–</dd>
+      <dt>Speed</dt><dd id="speed">–</dd>
+      <dt>Wi-Fi</dt><dd id="link">–</dd>
+      <dt>Restarts</dt><dd id="resets">–</dd>
+      <dt>Audio</dt><dd id="audio">–</dd>
+    </dl>
+  </section>
+  <section>
+    <fieldset>
+      <legend>Rabbit</legend>
+      <label>Firmware (.sim, .bin or .elf) <input type="file" id="firmware"></label>
+      <p class="muted" id="firmware-name">Loading the released image…</p>
+      <button id="power">Unplug and plug back in</button>
+      <label>Volume wheel <input type="range" id="volume" min="0" max="255" value="128"></label>
+      <label><input type="checkbox" id="speaker"> Let me hear it</label>
+      <label><input type="checkbox" id="mic"> Let it hear me (uses this device's microphone)</label>
+      <label><input type="checkbox" id="tag"> Hold a tag at its nose</label>
+    </fieldset>
+    <fieldset>
+      <legend>Around it</legend>
+      <label>Network in range
+        <select id="network">
+          <option value="0">none</option>
+          <option value="1">"Terrier", open</option>
+          <option value="2" selected>"Terrier", WPA2</option>
+          <option value="5">"Terrier", WPA2/WPA3 transition</option>
+          <option value="3">"Terrier", WPA (TKIP)</option>
+          <option value="4">"Terrier", WEP</option>
+        </select>
+      </label>
+      <p class="muted">Choosing a network writes matching settings in the rabbit's flash and restarts it.</p>
+      <label>Bytecode the server hands out (bc.jsp content) <input type="file" id="bytecode"></label>
+    </fieldset>
+    <label class="muted"><input type="checkbox" id="dumps"> show memory dumps in the console</label>
+    <pre id="console" aria-label="Serial console"></pre>
+  </section>
+</main>
+<script type="module" src="page.mjs"></script>
+</body>
+</html>

@@ -1,0 +1,41 @@
+name: emulator
+
+on:
+  push:
+    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", ".github/workflows/emulator.yml"]
+  pull_request:
+    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", ".github/workflows/emulator.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/emu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the ARM7TDMI instruction test ROMs
+        run: |
+          mkdir -p tests/roms
+          curl -sSL --fail -o tests/roms/arm.gba https://github.com/jsmolka/gba-tests/raw/master/arm/arm.gba
+          curl -sSL --fail -o tests/roms/thumb.gba https://github.com/jsmolka/gba-tests/raw/master/thumb/thumb.gba
+          sha256sum -c <<'SUMS'
+          77ee88662552bdc885c1080c0172ff119d54db791bd73b21808cf1ff1fe5b40e  tests/roms/arm.gba
+          b5cb2291df4ab314b31c598acd9bff2ccfa0b38efff29daadfe97422ce369b67  tests/roms/thumb.gba
+          SUMS
+      - name: Build the Rust firmware and test its portable crates
+        working-directory: lapin
+        run: |
+          sudo apt-get update && sudo apt-get install -y binutils-arm-none-eabi
+          (cd p256 && cargo test)
+          (cd core && cargo test)
+          ./build.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+      - name: Build for the browser and test that build under Node
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
+          web/build.sh
+          node web/test.mjs

@@ -1,0 +1,3 @@
+target/
+tests/roms/
+web/nabemu.wasm

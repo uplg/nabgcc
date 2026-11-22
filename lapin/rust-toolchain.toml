@@ -1,0 +1,5 @@
+# The ARM7TDMI targets are tier 3: the core library is built from source,
+# which takes a nightly compiler.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]

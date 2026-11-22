@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["core", "fw", "p256"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+# The firmware has 124 KB of flash for everything: size first.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+overflow-checks = false
+
+# The curve arithmetic is where a WPA3 connection spends its time: it
+# alone is built for speed. Measured on the emulated rabbit, this takes
+# a scalar multiplication from 980 ms to a third of that.
+[profile.release.package.lapin-p256]
+opt-level = 2

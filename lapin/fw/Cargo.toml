@@ -1,0 +1,31 @@
+[package]
+name = "lapin-fw"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Firmware for the Nabaztag:tag"
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "lapin"
+path = "src/bin/lapin.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "selftest"
+path = "src/bin/selftest.rs"
+test = false
+bench = false
+
+[dependencies]
+lapin-core = { path = "../core" }
