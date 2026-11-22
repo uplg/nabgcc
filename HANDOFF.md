@@ -67,12 +67,14 @@ fourth; the Rust firmware already sends it.
 **Unverified assumptions.** In the emulator: flash erase and program
 times (from a comment in the C code), ear speed, the stick's power-on
 beacon interval, what the stick reports for a frame it has no key for,
-no bus wait states. Which radio chip a rabbit's stick carries has
-not been read from one: its other chip is an RT2571W, which Ralink sold
-with the RT2528, but Violet's driver knew two versions of the module.
-The Rust driver tunes the two 2.4 GHz chips (RT2528, RT2527, words as
-in Linux's rt73usb), prints the type at boot (`wifi <address> radio
-NN`) and refuses the two 5 GHz ones. Whether the watchdog can
+no bus wait states. The rabbit's Wi-Fi module is an MSI MS-6877
+(RT2571WF; USB id 0db0:6877), which exists as "VER:1.0, made in
+Taiwan" (the one in Léonard's rabbit) and "Ver:A, made in China". The
+FCC photos of an MS-6877 without its shield show an RT2528L radio. No
+type has been read from a rabbit's own stick yet: the Rust driver
+tunes the two 2.4 GHz chips (RT2528, RT2527, words as in Linux's
+rt73usb), prints the type at boot (`wifi <address> radio NN`) and
+refuses the two 5 GHz ones. Whether the watchdog can
 really be paused during a flash (the C code tries without the unlock
 sequence) is unknown; a full image takes 1.76 s by the modelled
 timings, against 2.09 s.
