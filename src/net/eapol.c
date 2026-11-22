@@ -12,6 +12,7 @@
 #include "ml674061.h"
 #include "common.h"
 #include "utils/mem.h"
+#include "utils/delay.h"
 #include "usb/hcdmem.h"
 #include "usb/hcd.h"
 #include "utils/debug.h"
@@ -33,6 +34,9 @@
 static void randbuffer(uint8_t *buffer, uint32_t length)
 {
   uint32_t i;
+  /* rand() is never seeded elsewhere, so every boot drew the same
+   * SNonces. The millisecond a frame arrives is not a boot constant. */
+  srand((uint32_t)rand() ^ counter_timer);
   for(i=0;i<length;i++)
     buffer[i] = rand() & 0xFF;
 }
@@ -301,6 +305,30 @@ static union
 uint8_t ptk_tsc[EAPOL_TSC_LENGTH];
 
 /**
+ * @brief Adopt a frame's replay counter as the newest seen
+ *
+ * Called once a frame has earned it (MIC verified, or a message 1/4 the
+ * handshake is waiting for), never on arrival: a forged frame with a huge
+ * counter would otherwise make every genuine rekey after it look replayed.
+ */
+static void eapol_replay_commit(struct eapol_frame *fr)
+{
+  memcpy(replay_counter, fr->key_frame.replay_counter, EAPOL_RPC_LENGTH);
+  replay_active = 1;
+}
+
+/**
+ * @brief Whether the EAPOL body the frame announces was really delivered
+ *
+ * body_length is the sender's word and sizes the MIC computation.
+ */
+static int32_t eapol_body_fits(struct eapol_frame *fr, uint32_t length)
+{
+  uint32_t body = (uint32_t)((fr->body_length[0] << 8) | fr->body_length[1]);
+  return (LLC_LENGTH + 4 + body) <= length;
+}
+
+/**
  * @brief Init EAPOL
  */
 void eapol_init(void)
@@ -357,6 +385,7 @@ static void eapol_input_msg1(uint8_t *frame, uint32_t length)
     return;
   }
   eapol_state = EAPOL_S_MSG1;
+  eapol_replay_commit(fr_in);
 
   if((ieee80211_encryption&0x0F) == 0x00)
   {
@@ -526,8 +555,6 @@ static void eapol_input_msg1(uint8_t *frame, uint32_t length)
  */
 static void eapol_input_msg3(uint8_t *frame, uint32_t length)
 {
-  // FIXME Check length before cast ?
-  (void)length;
   struct eapol_frame *fr_in = (struct eapol_frame *)frame;
   uint8_t old_mic[EAPOL_KEYMIC_LENGTH];
   struct {
@@ -553,6 +580,9 @@ static void eapol_input_msg3(uint8_t *frame, uint32_t length)
   }
 
   DBG_WIFI("ANonce OK"EOL);
+
+  if(!eapol_body_fits(fr_in, length))
+    return;
 
   /* Check MIC */
   memcpy(old_mic, fr_in->key_frame.key_mic, EAPOL_KEYMIC_LENGTH);
@@ -588,6 +618,7 @@ static void eapol_input_msg3(uint8_t *frame, uint32_t length)
     return;
   }
   DBG_WIFI("MIC OK"EOL);
+  eapol_replay_commit(fr_in);
 
   eapol_state = EAPOL_S_MSG3;
 
@@ -761,6 +792,9 @@ static void eapol_input_group_msg1(uint8_t *frame, uint32_t length)
     return;
   }
 
+  if(!eapol_body_fits(fr_in, length))
+    return;
+
   /* Check MIC */
   memcpy(old_mic, fr_in->key_frame.key_mic, EAPOL_KEYMIC_LENGTH);
   memset(fr_in->key_frame.key_mic, 0, EAPOL_KEYMIC_LENGTH);
@@ -793,6 +827,7 @@ static void eapol_input_group_msg1(uint8_t *frame, uint32_t length)
     return;
   }
   //DBG_WIFI("MIC OK"EOL);
+  eapol_replay_commit(fr_in);
 
   /* Make response frame */
   memcpy(fr_out.llc, eapol_llc, LLC_LENGTH);
@@ -975,9 +1010,8 @@ void eapol_input(uint8_t *frame, uint32_t length)
       return;
     }
   }
-  /* Update local replay counter */
-  memcpy(replay_counter, fr->key_frame.replay_counter, EAPOL_RPC_LENGTH);
-  replay_active = 1;
+  /* The counter is adopted by the handlers, once the frame is trusted
+   * (eapol_replay_commit). */
   DBG_WIFI("Replay counter OK"EOL);
 
 #ifdef DEBUG_WIFI
