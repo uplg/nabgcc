@@ -2,11 +2,10 @@
 //! holds the rabbit's settings; the rest is the firmware.
 //!
 //! While the flash erases or programs it cannot be read, so the code
-//! that does it cannot live there: it is written in assembly, linked
-//! into the initialised data and so copied to RAM at reset, and it
-//! runs with interrupts off since their handlers are in the flash too.
+//! that does it cannot live there: it is linked into the initialised
+//! data and so copied to RAM at reset, and it runs with interrupts off
+//! since their handlers are in the flash too.
 
-use core::arch::global_asm;
 use core::cell::UnsafeCell;
 
 use crate::{irq, watchdog};
@@ -16,152 +15,112 @@ pub const SECTOR: usize = 4096;
 /// Where the settings sector starts.
 pub const SETTINGS: usize = BASE + 0x1_F000;
 
-global_asm!(
-    r#"
-    .section .data.ramcode, "awx"
-    .arm
-    .global flash_sector_from_ram
-    /* r0: sector address in the flash; r1: 4096 bytes to put there,
-       word aligned, anywhere but the flash. Erases, then programs
-       every word that is not all ones. */
-flash_sector_from_ram:
-    stmfd sp!, {{r4-r10, lr}}
-    ldr r4, =0xB7000100         /* FLACON */
-    ldr r5, =0x08015554
-    ldr r6, =0x0800AAA8
-    mov r2, #0xAA
-    mov r3, #0x55
-    mov r7, #0x03
-    strb r7, [r4]               /* programming permitted */
-    strb r2, [r5]               /* sector erase command */
-    strb r3, [r6]
-    mov r9, #0x80
-    strb r9, [r5]
-    strb r2, [r5]
-    strb r3, [r6]
-    mov r9, #0x30
-    strb r9, [r0]
-    bl 2f
-    mov r8, #0
-1:  ldr r12, [r1, r8]
-    cmn r12, #1
-    beq 3f
-    strb r7, [r4]               /* clear the completion flag */
-    strb r2, [r5]               /* word program command */
-    strb r3, [r6]
-    mov r9, #0xA0
-    strb r9, [r5]
-    add r10, r0, r8
-    strb r12, [r10]
-    mov r9, r12, lsr #8
-    strb r9, [r10, #1]
-    mov r9, r12, lsr #16
-    strb r9, [r10, #2]
-    mov r9, r12, lsr #24
-    strb r9, [r10, #3]
-    bl 2f
-3:  add r8, r8, #4
-    cmp r8, #4096
-    blo 1b
-    mov r9, #0x02
-    strb r9, [r4]               /* programming forbidden again */
-    ldmfd sp!, {{r4-r10, lr}}
-    bx lr
-    /* Wait for the command to complete. */
-2:  ldrb r9, [r4]
-    and r9, r9, #0x0E
-    cmp r9, #0x02
-    bne 2b
-    bx lr
-    .ltorg
-"#
-);
+const FLACON: *mut u8 = 0xB700_0100 as *mut u8;
+const COMMAND_1: *mut u8 = 0x0801_5554 as *mut u8;
+const COMMAND_2: *mut u8 = 0x0800_AAA8 as *mut u8;
+const WDTCON: *mut u8 = 0xB7E0_0000 as *mut u8;
 
-global_asm!(
-    r#"
-    .section .data.ramcode, "awx"
-    .arm
-    .global flash_image_from_ram
-    /* r0: the new firmware, word aligned, outside the flash; r1: its
-       length. Rewrites the flash from its first sector, as many
-       sectors as the image needs (bytes past its end stay erased),
-       feeding the watchdog after every word, then stops feeding it
-       and waits: the watchdog restarts the board on the new image. */
-flash_image_from_ram:
-    ldr r4, =0xB7000100         /* FLACON */
-    ldr r5, =0x08015554
-    ldr r6, =0x0800AAA8
-    mov r2, #0xAA
-    mov r3, #0x55
-    mov r7, #0x03
-    mov r11, r1
-    mov r1, r0
-    mov r0, #0x08000000
-    mov r8, #0
-4:  cmp r8, r11
-    bhs 6f
-    strb r7, [r4]               /* sector erase */
-    strb r2, [r5]
-    strb r3, [r6]
-    mov r9, #0x80
-    strb r9, [r5]
-    strb r2, [r5]
-    strb r3, [r6]
-    mov r9, #0x30
-    add r10, r0, r8
-    strb r9, [r10]
-    bl 2f
-5:  mvn r12, #0
-    cmp r8, r11
-    bhs 3f
-    ldr r12, [r1, r8]
-    sub r9, r11, r8             /* bytes of the image left */
-    cmp r9, #4
-    bhs 1f
-    mov r9, r9, lsl #3          /* the rest of the word stays erased */
-    mvn r10, #0
-    orr r12, r12, r10, lsl r9
-1:  cmn r12, #1
-    beq 3f
-    strb r7, [r4]               /* word program */
-    strb r2, [r5]
-    strb r3, [r6]
-    mov r9, #0xA0
-    strb r9, [r5]
-    add r10, r0, r8
-    strb r12, [r10]
-    mov r9, r12, lsr #8
-    strb r9, [r10, #1]
-    mov r9, r12, lsr #16
-    strb r9, [r10, #2]
-    mov r9, r12, lsr #24
-    strb r9, [r10, #3]
-    bl 2f
-3:  ldr r9, =0xB7E00000         /* WDTCON: feed */
-    mov r10, #0xC3
-    strb r10, [r9]
-    mov r10, #0x3C
-    strb r10, [r9]
-    add r8, r8, #4
-    movs r9, r8, lsl #20        /* still inside the sector? */
-    bne 5b
-    b 4b
-6:  mov r9, #0x02
-    strb r9, [r4]               /* programming forbidden again */
-7:  b 7b
-    /* Wait for the command to complete. */
-2:  ldrb r9, [r4]
-    and r9, r9, #0x0E
-    cmp r9, #0x02
-    bne 2b
-    bx lr
-    .ltorg
-"#
-);
+// What follows runs from RAM while the flash is busy: it is placed in
+// the initialised data (copied to RAM at reset), and must reach nothing
+// in the flash, no call at all, not even a bounds check's panic or a
+// `memcpy`. Hence raw pointers, volatile accesses, and functions forced
+// inline into their two callers. `lapin/build.sh` checks the result:
+// no branch out of the RAM code.
 
-unsafe extern "C" {
-    fn flash_sector_from_ram(address: usize, data: *const u8);
-    fn flash_image_from_ram(image: *const u8, len: usize) -> !;
+/// Wait for the flash's command to complete.
+#[inline(always)]
+unsafe fn flash_wait() {
+    // SAFETY: a register of the processor.
+    while unsafe { FLACON.read_volatile() } & 0x0E != 0x02 {}
+}
+
+/// The unlock sequence of a flash command, then the command.
+#[inline(always)]
+unsafe fn flash_command(command: u8) {
+    // SAFETY: the command registers of the flash, the routine in RAM.
+    unsafe {
+        FLACON.write_volatile(0x03);
+        COMMAND_1.write_volatile(0xAA);
+        COMMAND_2.write_volatile(0x55);
+        COMMAND_1.write_volatile(command);
+    }
+}
+
+#[inline(always)]
+unsafe fn erase_sector(at: *mut u8) {
+    // SAFETY: as above; `at` is a sector of the flash.
+    unsafe {
+        flash_command(0x80);
+        COMMAND_1.write_volatile(0xAA);
+        COMMAND_2.write_volatile(0x55);
+        at.write_volatile(0x30);
+        flash_wait();
+    }
+}
+
+/// Program one word (skipped when all ones, the erased value).
+#[inline(always)]
+unsafe fn program_word(at: *mut u8, word: u32) {
+    if word == u32::MAX {
+        return;
+    }
+    // SAFETY: as above; `at` is word aligned in the flash.
+    unsafe {
+        flash_command(0xA0);
+        at.write_volatile(word as u8);
+        at.add(1).write_volatile((word >> 8) as u8);
+        at.add(2).write_volatile((word >> 16) as u8);
+        at.add(3).write_volatile((word >> 24) as u8);
+        flash_wait();
+    }
+}
+
+/// Erase the sector at `address` and program it with the 4096 bytes at
+/// `data` (word aligned, outside the flash).
+#[unsafe(link_section = ".data.ramcode")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
+    let at = address as *mut u8;
+    // SAFETY: interrupts are off (the caller's duty), this runs from RAM.
+    unsafe {
+        erase_sector(at);
+        let mut i = 0;
+        while i < SECTOR / 4 {
+            program_word(at.add(4 * i), data.add(i).read_volatile());
+            i += 1;
+        }
+        FLACON.write_volatile(0x02);
+    }
+}
+
+/// Rewrite the flash from its first sector with the `len` bytes at
+/// `image`, feeding the watchdog after every word; then stop feeding
+/// it and wait: the watchdog restarts the board on the new image.
+#[unsafe(link_section = ".data.ramcode")]
+#[unsafe(no_mangle)]
+#[inline(never)]
+unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize) -> ! {
+    // SAFETY: interrupts are off for good, this runs from RAM.
+    unsafe {
+        let mut offset = 0;
+        while offset < len {
+            if offset % SECTOR == 0 {
+                erase_sector((BASE + offset) as *mut u8);
+            }
+            let mut word = image.add(offset / 4).read_volatile();
+            if len - offset < 4 {
+                // The rest of the last word stays erased.
+                word |= u32::MAX << (8 * (len - offset));
+            }
+            program_word((BASE + offset) as *mut u8, word);
+            WDTCON.write_volatile(0xC3);
+            WDTCON.write_volatile(0x3C);
+            offset += 4;
+        }
+        FLACON.write_volatile(0x02);
+        loop {}
+    }
 }
 
 /// Replace the firmware with `image` and restart on it: the end of
@@ -173,7 +132,7 @@ pub fn write_firmware(image: &[u8]) -> ! {
     watchdog::feed();
     // SAFETY: interrupts are off for good, the routine runs from RAM
     // and never returns into the flash it rewrites.
-    unsafe { flash_image_from_ram(image.as_ptr(), len) }
+    unsafe { flash_image_from_ram(image.as_ptr().cast(), len) }
 }
 
 /// One sector's worth of scratch space, in the external RAM.
@@ -210,7 +169,7 @@ pub fn write_settings_at(offset: usize, data: &[u8]) {
             let scratch = SCRATCH.0.get().cast::<u8>();
             core::ptr::copy_nonoverlapping(SETTINGS as *const u8, scratch, SECTOR);
             core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.add(offset), len);
-            flash_sector_from_ram(SETTINGS, scratch);
+            flash_sector_from_ram(SETTINGS, scratch.cast());
         }
         watchdog::feed();
     });
