@@ -119,6 +119,9 @@ unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize) -> ! {
             offset += 4;
         }
         FLACON.write_volatile(0x02);
+        // Nothing else may run: anything (even a spin hint) could be a
+        // call into the flash just rewritten.
+        #[allow(clippy::empty_loop)]
         loop {}
     }
 }
