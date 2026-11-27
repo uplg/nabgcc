@@ -6,6 +6,11 @@
 //! spot of the whole WPA3 exchange: on the rabbit it is compiled as
 //! ARM code, the only instruction set of its processor that multiplies
 //! 32 bits by 32 into 64.
+//!
+//! The crate is built for speed, and its callers for size: what runs a
+//! few times per exchange (conversions, square roots, the checks of a
+//! point) is kept out of line, so that it is not copied into each
+//! caller, and the byte conversions are built small.
 
 #![no_std]
 
@@ -35,14 +40,22 @@ const B: Limbs = limbs(b"5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3
 const GX: Limbs = limbs(b"6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296");
 const GY: Limbs = limbs(b"4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
 
+#[inline(never)]
 pub fn from_bytes(bytes: &[u8; 32]) -> Limbs {
-    core::array::from_fn(|i| u32::from_be_bytes(bytes[28 - 4 * i..32 - 4 * i].try_into().unwrap()))
+    // A byte at a time: the processor has no instruction to swap them.
+    let mut out = [0u32; 8];
+    for (i, byte) in bytes.iter().enumerate() {
+        out[7 - i / 4] = out[7 - i / 4] << 8 | *byte as u32;
+    }
+    out
 }
 
+#[inline(never)]
+#[optimize(size)]
 pub fn to_bytes(n: &Limbs) -> [u8; 32] {
     let mut out = [0u8; 32];
-    for (i, limb) in n.iter().enumerate() {
-        out[28 - 4 * i..32 - 4 * i].copy_from_slice(&limb.to_be_bytes());
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = (n[7 - i / 4] >> (24 - 8 * (i % 4))) as u8;
     }
     out
 }
@@ -106,6 +119,7 @@ pub fn sub_mod(a: &Limbs, b: &Limbs, m: &Limbs) -> Limbs {
 
 /// Bring any 256-bit number below `m` (for the two moduli used here,
 /// both above 2^255, one subtraction is enough).
+#[inline(never)]
 pub fn reduce(a: &Limbs, m: &Limbs) -> Limbs {
     if less(a, m) { *a } else { sub_raw(a, m).0 }
 }
@@ -223,6 +237,7 @@ impl Fe {
     }
 
     /// From a plain number, reduced modulo p first.
+    #[inline(never)]
     pub fn new(n: &Limbs) -> Fe {
         Fe(mont_mul(&reduce(n, &P), &R2))
     }
@@ -302,6 +317,7 @@ impl Fe {
     }
 
     /// The inverse, or zero for zero (Fermat: `a^(p-2)`).
+    #[inline(never)]
     pub fn invert(&self) -> Fe {
         let mut e = P;
         e[0] -= 2;
@@ -319,6 +335,7 @@ impl Fe {
     }
 
     /// A square root, if there is one. p is 3 mod 4: `a^((p+1)/4)`.
+    #[inline(never)]
     pub fn sqrt(&self) -> Option<Fe> {
         // p + 1 still fits in 256 bits.
         let (p1, _) = add_raw(&P, &[1, 0, 0, 0, 0, 0, 0, 0]);
@@ -333,6 +350,7 @@ fn shift_right(a: &Limbs) -> Limbs {
 }
 
 /// `x^3 - 3x + b`, the right-hand side of the curve equation.
+#[inline(never)]
 pub fn curve_rhs(x: &Fe) -> Fe {
     let three = Fe::from_u32(3);
     x.square().mul(x).sub(&three.mul(x)).add(&Fe(B_MONT))
@@ -365,6 +383,7 @@ impl Point {
     }
 
     /// A point from affine coordinates; `None` if it is not on the curve.
+    #[inline(never)]
     pub fn from_affine(x: &Fe, y: &Fe) -> Option<Point> {
         (y.square() == curve_rhs(x)).then(|| Point {
             x: *x,
@@ -374,6 +393,8 @@ impl Point {
     }
 
     /// From 64 bytes, x then y, each big-endian and below p.
+    #[inline(never)]
+    #[optimize(size)]
     pub fn from_bytes(bytes: &[u8; 64]) -> Option<Point> {
         let mut half = [0u8; 32];
         half.copy_from_slice(&bytes[..32]);
@@ -391,6 +412,8 @@ impl Point {
     }
 
     /// Affine coordinates; `None` for infinity.
+    #[inline(never)]
+    #[optimize(size)]
     pub fn affine(&self) -> Option<(Fe, Fe)> {
         if self.is_infinity() {
             return None;
@@ -400,6 +423,8 @@ impl Point {
     }
 
     /// 64 bytes, x then y; `None` for infinity.
+    #[inline(never)]
+    #[optimize(size)]
     pub fn to_bytes(&self) -> Option<[u8; 64]> {
         let (x, y) = self.affine()?;
         let mut out = [0u8; 64];
