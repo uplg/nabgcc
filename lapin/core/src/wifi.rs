@@ -108,6 +108,11 @@ const STA_MAX_IDLE: u32 = 3000;
 /// (1.024 ms): access points ask for one second.
 const MAX_COMEBACK_TU: u32 = 10_000;
 const MAX_STATIONS: usize = 5;
+/// How long the key of a password exchange is kept for the next
+/// association: hostapd's and wpa_supplicant's default, twelve hours.
+/// (The clock wraps after 49 days: a key that old may pass for new, and
+/// the access point then refuses it, status 53.)
+const PMKSA_LIFETIME_MS: u32 = 12 * 3600 * 1000;
 const RSSI_SAMPLES: usize = 15;
 /// How long the scan listens on each channel: one beacon interval
 /// (102.4 ms) and the time to switch. The C driver stayed 350 ms, which
@@ -199,6 +204,56 @@ struct Offer {
     wpa: Option<(u8, u8)>,
     /// SAE by hash to element offered (RSNX element, bit 5).
     h2e: bool,
+    /// SHA-256 of the RSN element and the RSN extension element (or of
+    /// the WPA element, without RSN), as the network announced them:
+    /// message 3 has to bring the same.
+    digest: [u8; 32],
+}
+
+impl Offer {
+    /// The offer in a list of elements: a beacon's, a probe response's,
+    /// or message 3's key data.
+    fn from_elements(bssid: Mac, ies: &[u8]) -> Offer {
+        let mut o = Offer {
+            bssid,
+            ..Offer::default()
+        };
+        let (mut rsne, mut rsnxe, mut wpa) = (None, None, None);
+        for (id, e) in elements(ies) {
+            match id {
+                48 if rsne.is_none() => {
+                    o.rsn = suites(e, [0x00, 0x0F, 0xAC]);
+                    rsne = Some(e);
+                }
+                221 if wpa.is_none() && e.len() >= 6 && e[..4] == [0x00, 0x50, 0xF2, 0x01] => {
+                    o.wpa = suites(&e[4..], [0x00, 0x50, 0xF2]).map(|(g, p, _, _)| (g, p));
+                    wpa = Some(e);
+                }
+                244 if rsnxe.is_none() && !e.is_empty() => {
+                    o.h2e = e[0] & 0x20 != 0;
+                    rsnxe = Some(e);
+                }
+                _ => {}
+            }
+        }
+        let mut h = sha256::Sha256::new();
+        let mut add = |id: u8, e: &[u8]| {
+            h.update(&[id, e.len() as u8]);
+            h.update(e);
+        };
+        match (rsne, wpa) {
+            (Some(r), _) => {
+                add(48, r);
+                if let Some(x) = rsnxe {
+                    add(244, x);
+                }
+            }
+            (None, Some(w)) => add(221, w),
+            (None, None) => {}
+        }
+        o.digest = h.finish();
+        o
+    }
 }
 
 const OFFERS: usize = 16;
@@ -287,13 +342,32 @@ pub struct Station {
     /// running link: the current key stays in use until message 4.
     next_ptk: Option<[u8; 64]>,
     /// The key of the last password exchange, for the network it was
-    /// made with (BSSID, PMK, PMKID): joining it again needs no SAE.
-    pmksa: Option<(Mac, [u8; 32], [u8; 16])>,
+    /// made with (BSSID, PMK, PMKID, when it was made): joining it again
+    /// within its lifetime needs no SAE.
+    pmksa: Option<(Mac, [u8; 32], [u8; 16], u32)>,
     /// The current attempt uses that cached key.
     cached: bool,
     peers: [Peer; MAX_STATIONS],
     offers: [Offer; OFFERS],
     next_offer: usize,
+    /// The offer of the network being joined, as known when joining
+    /// (`bss_known`: the scan saw it); and the one an authenticated
+    /// message 3 showed, which beats the scan's for that network.
+    bss: Offer,
+    bss_known: bool,
+    learned: Option<Offer>,
+    /// The replay counter of the message 1 being answered: not the
+    /// last one checked (`replay`), message 1 carries no integrity code.
+    msg1_replay: [u8; 8],
+    /// Our nonce, kept for every message 1 of a handshake.
+    snonce: [u8; 32],
+    renew_snonce: bool,
+    /// The access point has shown it holds the pairwise key (a frame
+    /// from it opened with it): from then on nothing comes in clear,
+    /// handshake messages included.
+    ap_keyed: bool,
+    /// The cached key led to a checked message 3.
+    pmksa_proven: bool,
     tx: [u8; 2400],
 }
 
@@ -487,7 +561,22 @@ impl Station {
                 rsn: None,
                 wpa: None,
                 h2e: false,
+                digest: [0; 32],
             }; OFFERS],
+            bss: Offer {
+                bssid: [0; 6],
+                rsn: None,
+                wpa: None,
+                h2e: false,
+                digest: [0; 32],
+            },
+            bss_known: false,
+            learned: None,
+            msg1_replay: [0; 8],
+            snonce: [0; 32],
+            renew_snonce: true,
+            ap_keyed: false,
+            pmksa_proven: false,
             next_offer: 0,
             tx: [0; 2400],
         }
@@ -566,8 +655,11 @@ impl Station {
     }
 
     /// The RSN (or WPA) element we offer, the same in the association
-    /// request and in message 2: the access point compares them.
-    fn own_element(&self, out: &mut [u8; 40]) -> usize {
+    /// request and in message 2: the access point compares them. After
+    /// a hash-to-element exchange the RSN extension element follows,
+    /// which says so (802.11-2020 12.4.2): without it, the access point
+    /// cannot tell a downgrade to hunting and pecking.
+    fn own_element(&self, out: &mut [u8; 48]) -> usize {
         const WPA: [u8; 24] = [
             0xDD, 22, 0x00, 0x50, 0xF2, 0x01, 0x01, 0x00, 0x00, 0x50, 0xF2, 0, 1, 0, 0x00, 0x50,
             0xF2, 0, 1, 0, 0x00, 0x50, 0xF2, 2,
@@ -600,18 +692,23 @@ impl Station {
                 out[13] = pairwise.unwrap_or(Cipher::Ccmp) as u8;
                 22
             }
-            Security::Sae { .. } => {
+            Security::Sae { h2e } => {
                 out[..22].copy_from_slice(&SAE);
-                match self.pmksa.filter(|_| self.cached) {
+                let n = match self.pmksa.filter(|_| self.cached) {
                     // The cached exchange, named by its PMKID.
-                    Some((_, _, pmkid)) => {
+                    Some((_, _, pmkid, _)) => {
                         out[1] = 38;
                         out[22..24].copy_from_slice(&[1, 0]);
                         out[24..40].copy_from_slice(&pmkid);
                         40
                     }
                     None => 22,
+                };
+                if !h2e {
+                    return n;
                 }
+                out[n..n + 3].copy_from_slice(&[244, 1, 0x20]);
+                n + 3
             }
             _ => 0,
         }
@@ -625,7 +722,7 @@ impl Station {
         let at = put(&mut self.tx, at, &[0x01, 0x00, 0x64, 0x00]);
         let at = put_element(&mut self.tx, at, 0, &self.ssid[..self.ssid_len]);
         let at = put(&mut self.tx, at, &RATES);
-        let mut e = [0u8; 40];
+        let mut e = [0u8; 48];
         let n = self.own_element(&mut e);
         let at = put(&mut self.tx, at, &e[..n]);
         if !self.send_management(link, at, false) {
@@ -777,10 +874,7 @@ impl Station {
                 CRYPT_NONE
             },
         };
-        let mut offer = Offer {
-            bssid: r.bssid,
-            ..Offer::default()
-        };
+        let offer = Offer::from_elements(r.bssid, &body[12..]);
         for (id, e) in elements(&body[12..]) {
             match id {
                 0 if e.len() <= 32 => {
@@ -793,11 +887,6 @@ impl Station {
                         r.rateset |= rate_to_mask(rate & 0x7F);
                     }
                 }
-                48 => offer.rsn = suites(e, [0x00, 0x0F, 0xAC]),
-                221 if e.len() >= 6 && e[..4] == [0x00, 0x50, 0xF2, 0x01] => {
-                    offer.wpa = suites(&e[4..], [0x00, 0x50, 0xF2]).map(|(g, p, _, _)| (g, p));
-                }
-                244 if !e.is_empty() => offer.h2e = e[0] & 0x20 != 0,
                 _ => {}
             }
         }
@@ -866,6 +955,18 @@ impl Station {
         if self.mode != Mode::Managed {
             return;
         }
+        // The cached key of the last attempt never led to a checked
+        // message 3: the access point does not hold it (any more).
+        if self.cached && !self.pmksa_proven {
+            self.pmksa = None;
+        }
+        if let Some((.., made)) = self.pmksa
+            && link.millis().wrapping_sub(made) >= PMKSA_LIFETIME_MS
+        {
+            self.pmksa = None;
+        }
+        self.pmksa_proven = false;
+        self.renew_snonce = true;
         self.state = State::Idle;
         self.ap = *mac;
         self.bssid = *bssid;
@@ -876,7 +977,17 @@ impl Station {
         self.soft = None;
         self.sae = None;
         self.retry_assoc_at = None;
-        let offer = self.offers.iter().find(|o| same(&o.bssid, bssid)).copied();
+        // What an authenticated message 3 showed of this network beats
+        // what a scan heard, which anyone can forge or crowd out.
+        let offer = self
+            .learned
+            .filter(|o| same(&o.bssid, bssid))
+            .or_else(|| self.offers.iter().find(|o| same(&o.bssid, bssid)).copied());
+        self.bss_known = offer.is_some();
+        self.bss = offer.unwrap_or(Offer {
+            bssid: *bssid,
+            ..Offer::default()
+        });
         let none = [0u8; 8];
         // Every key of the last network goes, the group keys too: one
         // left in its slot would open the next network's broadcasts.
@@ -973,10 +1084,10 @@ impl Station {
         self.timeout = AUTH_TIMEOUT;
         self.cached = false;
         if let Security::Sae { h2e } = self.security {
-            match self.pmksa.filter(|(b, _, _)| b == bssid) {
+            match self.pmksa.filter(|(b, ..)| b == bssid) {
                 // A key from an earlier exchange with this network: open
                 // authentication, and the PMKID in the association.
-                Some((_, pmk, _)) => {
+                Some((_, pmk, ..)) => {
                     self.cached = true;
                     self.pmk = pmk;
                     self.send_auth(link, &mac.clone(), 0, 1, 0);
@@ -1034,7 +1145,8 @@ impl Station {
 
     /// `netSend`: an Ethernet payload from its LLC header on, to
     /// `destination`; an empty one sends a null frame. False if it
-    /// could not go.
+    /// could not go: on a WPA link, until the handshake has put the
+    /// keys in place (the C sent the bytecode's frames in clear then).
     #[inline(never)]
     pub fn send(
         &mut self,
@@ -1042,6 +1154,24 @@ impl Station {
         data: &[u8],
         destination: &Mac,
         low_rate: bool,
+    ) -> bool {
+        let keyed = matches!(self.security, Security::Psk { .. } | Security::Sae { .. });
+        let handshake = matches!(self.keys, KeyState::Msg1 | KeyState::Msg3);
+        if keyed && handshake && !data.is_empty() {
+            return false;
+        }
+        self.transmit_data(link, data, destination, low_rate, false)
+    }
+
+    /// A data frame; in clear if `clear` (handshake messages to an
+    /// access point that holds no key yet).
+    fn transmit_data(
+        &mut self,
+        link: &mut impl Link,
+        data: &[u8],
+        destination: &Mac,
+        low_rate: bool,
+        clear: bool,
     ) -> bool {
         if self.state != State::Eapol && self.state != State::Run {
             return false;
@@ -1052,8 +1182,8 @@ impl Station {
         let own = link.mac();
         let managed = self.mode == Mode::Managed;
         let multicast = destination[0] & 1 != 0;
-        // Handshake frames go in clear (and so does the null frame).
-        let handshake = matches!(self.keys, KeyState::Msg1 | KeyState::Msg3);
+        // Handshake frames may go in clear, and so does the null frame.
+        let handshake = clear;
         let cipher = match self.security {
             _ if data.is_empty() => HwCipher::None,
             Security::Open | Security::Sae { .. } => HwCipher::None,
@@ -1331,6 +1461,8 @@ impl Station {
                     self.state = State::Eapol;
                     self.timeout = EAPOL_TIMEOUT;
                     self.keys = KeyState::Msg1;
+                    self.ap_keyed = false;
+                    self.replay_active = false;
                 } else {
                     self.state = State::Run;
                     self.timeout = RUN_TIMEOUT;
@@ -1583,6 +1715,7 @@ impl Station {
             if !self.fresh(group, key_id, pn) {
                 return None;
             }
+            self.ap_keyed |= !group;
             len = n;
             decrypted = true;
         } else if decrypted
@@ -1606,6 +1739,7 @@ impl Station {
             if !self.fresh(group, (iv >> 30) as u8, pn) {
                 return None;
             }
+            self.ap_keyed |= !group;
         }
         if frame[1] & 0x40 != 0 && !decrypted {
             // Still sealed: the stick had no key for it (it hands such
@@ -1627,20 +1761,18 @@ impl Station {
                     // In clear on a keyed link: not from the key holder.
                     return None;
                 }
-                if self.soft.is_some()
-                    && self.keys == KeyState::Run
-                    && !decrypted
-                    && frame[1] & 0x40 == 0
-                {
-                    // WPA3, keys in place: nothing comes in clear, not
-                    // even the handshake.
+                if self.ap_keyed && !decrypted {
+                    // The access point uses the pairwise key: nothing
+                    // comes in clear from it any more, not even the
+                    // handshake. (Until then a message 3 sent again in
+                    // clear, message 4 lost, is let in and answered.)
                     return None;
                 }
                 if eapol && self.mode == Mode::Managed {
                     let mut copy = [0u8; 400];
                     let n = (len - 24).min(copy.len());
                     copy[..n].copy_from_slice(&frame[24..24 + n]);
-                    self.input_eapol(link, &mut copy[..n]);
+                    self.input_eapol(link, &mut copy[..n], decrypted);
                     return None;
                 }
                 Some(Delivery {
@@ -1721,32 +1853,44 @@ impl Station {
         }
     }
 
-    /// Build, sign and send an EAPOL-Key frame.
+    /// Build, sign and send an EAPOL-Key frame with replay counter
+    /// `counter`; in clear if `clear` (the access point has no key yet).
+    #[allow(clippy::too_many_arguments)]
     #[inline(never)]
-    fn send_key(&mut self, link: &mut impl Link, info: u16, nonce: &[u8; 32], data: &[u8]) {
-        let mut e = [0u8; 99 + 40];
+    fn send_key(
+        &mut self,
+        link: &mut impl Link,
+        info: u16,
+        counter: &[u8; 8],
+        nonce: &[u8; 32],
+        data: &[u8],
+        clear: bool,
+    ) {
+        let mut e = [0u8; 99 + 48];
         let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
         e[0] = 1;
         e[1] = 3;
         e[2..4].copy_from_slice(&((95 + data.len()) as u16).to_be_bytes());
         e[4] = if wpa1 { 0xFE } else { 0x02 };
         e[5..7].copy_from_slice(&(info | self.version()).to_be_bytes());
-        e[9..17].copy_from_slice(&self.replay);
+        e[9..17].copy_from_slice(counter);
         e[17..49].copy_from_slice(nonce);
         e[97..99].copy_from_slice(&(data.len() as u16).to_be_bytes());
         e[99..99 + data.len()].copy_from_slice(data);
         let n = 99 + data.len();
         let mic = self.mic(&e[..n]);
         e[81..97].copy_from_slice(&mic);
-        let mut body = [0u8; 8 + 99 + 40];
+        let mut body = [0u8; 8 + 99 + 48];
         body[..8].copy_from_slice(&LLC_EAPOL);
         body[8..8 + n].copy_from_slice(&e[..n]);
         let ap = self.ap;
-        self.send(link, &body[..8 + n], &ap, true);
+        self.transmit_data(link, &body[..8 + n], &ap, true, clear);
     }
 
+    /// An EAPOL-Key frame from the access point; `sealed` if it came
+    /// under the pairwise key.
     #[inline(never)]
-    fn input_eapol(&mut self, link: &mut impl Link, body: &mut [u8]) {
+    fn input_eapol(&mut self, link: &mut impl Link, body: &mut [u8], sealed: bool) {
         let f = &mut body[8..];
         if f.len() < 99 || (f[0] != 1 && f[0] != 2) || f[1] != 3 || (f[4] != 0xFE && f[4] != 0x02) {
             return;
@@ -1777,9 +1921,9 @@ impl Station {
         if pairwise && index == 0 && !mic && !secure {
             self.message_1(link, f, info);
         } else if pairwise && index == 0 && mic {
-            self.message_3(link, f);
+            self.message_3(link, f, sealed);
         } else if !pairwise && mic && secure {
-            self.group_message(link, f, info);
+            self.group_message(link, f, info, sealed);
         }
     }
 
@@ -1800,13 +1944,11 @@ impl Station {
             self.next_ptk = None;
         }
         // Message 2 answers with this counter. Message 1 carries no
-        // integrity code: on a running link, its counter is not adopted
-        // (a forged one, huge, would make every genuine frame after it
-        // look replayed); it is during the handshake, which waits for
-        // it, as in the C.
-        let earned = self.replay;
-        self.replay.copy_from_slice(&f[9..17]);
-        self.replay_active = true;
+        // integrity code: its counter is not taken as the last one
+        // seen (a forged one, huge, would make every genuine frame
+        // after it look replayed, the access point's own message 1
+        // retransmitted included); only a checked frame moves that.
+        self.msg1_replay.copy_from_slice(&f[9..17]);
         if let Security::Psk {
             wpa2: false,
             pairwise: ref mut p @ None,
@@ -1820,24 +1962,33 @@ impl Station {
             });
         }
         self.anonce.copy_from_slice(&f[17..49]);
-        let mut snonce = [0u8; 32];
-        link.random(&mut snonce);
+        // One nonce for the whole handshake, whatever the number of
+        // messages 1 (as wpa_supplicant): a new one is drawn once a
+        // message 3 has been answered.
+        if self.renew_snonce {
+            let mut snonce = [0u8; 32];
+            link.random(&mut snonce);
+            self.snonce = snonce;
+            self.renew_snonce = false;
+        }
+        let snonce = self.snonce;
         let ptk = self.derive_ptk(&link.mac(), &snonce);
         if rekey {
             self.next_ptk = Some(ptk);
         } else {
             self.ptk = ptk;
         }
-        let mut e = [0u8; 40];
+        let mut e = [0u8; 48];
         let n = self.own_element(&mut e);
-        self.send_key(link, 0x0008 | 0x0100, &snonce, &e[..n]);
+        let counter = self.msg1_replay;
+        self.send_key(link, 0x0008 | 0x0100, &counter, &snonce, &e[..n], !rekey);
         if rekey {
-            self.replay = earned;
             return;
         }
         // The pairwise key goes in now, as the C driver did: message 4
-        // still leaves in clear (handshake state), what follows does not.
+        // still leaves in clear, what follows does not.
         self.install_pairwise(link, false);
+        self.ap_keyed = false;
         self.keys = KeyState::Msg3;
     }
 
@@ -1939,62 +2090,157 @@ impl Station {
         }
     }
 
+    /// The key data of message 3, in clear in `out`: WPA's carries the
+    /// access point's element as is, the others are encrypted.
+    fn message_3_data(&self, f: &[u8], out: &mut [u8; 256]) -> Option<usize> {
+        if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
+            return self.key_data(f, out);
+        }
+        let n = be16(f, 97) as usize;
+        let data = f.get(99..99 + n)?;
+        out.get_mut(..n)?.copy_from_slice(data);
+        Some(n)
+    }
+
+    /// Whether message 3's key data brings everything the link needs:
+    /// the group key (WPA2 and WPA3), whole for its cipher, and with
+    /// WPA3 the integrity group key. Checked before message 4 goes:
+    /// after it, the access point takes the station for ready.
+    fn group_keys_present(&self, plain: &[u8]) -> bool {
+        if matches!(self.security, Security::Psk { wpa2: false, .. }) {
+            return true;
+        }
+        let tkip = matches!(
+            self.security,
+            Security::Psk {
+                group: Cipher::Tkip,
+                ..
+            }
+        );
+        let gtk_len = if tkip { 32 } else { 16 };
+        let kde = |kind: u8, len: usize| {
+            elements(plain)
+                .any(|(id, e)| id == 0xDD && e.len() >= len && e[..4] == [0x00, 0x0F, 0xAC, kind])
+        };
+        let gtk = elements(plain).any(|(id, e)| {
+            id == 0xDD && e.len() >= 6 + gtk_len && e[..4] == [0x00, 0x0F, 0xAC, 1] && e[4] & 3 != 0
+        });
+        gtk && (!self.is_wpa3() || kde(9, 28))
+    }
+
+    /// Whether the elements of message 3 are those the network
+    /// announced (802.11-2020 12.7.6.4): its RSN element, and RSN
+    /// extension element, byte for byte (or WPA's element). An attacker
+    /// can change a beacon, not message 3: a network that offered WPA3
+    /// and was made to look as if it did not shows here. When they
+    /// differ, or nothing was known of the network, what message 3 says
+    /// is kept for the next attempt (see `auth`).
+    fn same_offer(&mut self, plain: &[u8]) -> bool {
+        let offer = Offer::from_elements(self.bssid, plain);
+        if self.bss_known && offer.digest == self.bss.digest {
+            return true;
+        }
+        self.learned = Some(offer);
+        false
+    }
+
     #[inline(never)]
-    fn message_3(&mut self, link: &mut impl Link, f: &mut [u8]) {
+    fn message_3(&mut self, link: &mut impl Link, f: &mut [u8], sealed: bool) {
         if self.next_ptk.is_some() && matches!(self.keys, KeyState::Group | KeyState::Run) {
             return self.rekey_message_3(link, f);
         }
-        if self.keys != KeyState::Msg3 && self.keys != KeyState::Group {
+        // Msg3: the first. Group or Run: the same one again (message 4
+        // was lost, the access point sends message 3 again), to be
+        // answered, nothing installed again.
+        if self.keys == KeyState::Msg1 {
             return;
         }
         if f[17..49] != self.anonce || !self.check_mic(f) {
             return;
         }
+        let mut plain = [0u8; 256];
+        let Some(n) = self.message_3_data(f, &mut plain) else {
+            return;
+        };
+        let plain = &plain[..n];
+        if !self.same_offer(plain) {
+            // Not the network the scan saw: no further with it.
+            self.state = State::Idle;
+            return;
+        }
+        if !self.group_keys_present(plain) {
+            return;
+        }
+        let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
         self.replay.copy_from_slice(&f[9..17]);
         self.replay_active = true;
-        let secure = if matches!(self.security, Security::Psk { wpa2: false, .. }) {
-            0
-        } else {
-            0x200
-        };
-        self.send_key(link, 0x0008 | 0x0100 | secure, &[0; 32], &[]);
-        self.keys = KeyState::Group;
+        let secure = if wpa1 { 0 } else { 0x200 };
+        // Message 4 goes as message 3 came: in clear while the access
+        // point holds no key (it would drop it otherwise).
+        let counter = self.replay;
+        self.send_key(
+            link,
+            0x0008 | 0x0100 | secure,
+            &counter,
+            &[0; 32],
+            &[],
+            !sealed,
+        );
+        self.renew_snonce = true;
+        self.pmksa_proven = true;
         self.state = State::Run;
         self.timeout = RUN_TIMEOUT;
-        if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
-            let mut plain = [0u8; 160];
-            if let Some(n) = self.key_data(f, &mut plain) {
-                self.install_group_keys(link, &plain[..n], Self::key_rsc(f));
+        if wpa1 {
+            // The group key follows in its own handshake.
+            if self.keys == KeyState::Msg3 {
+                self.keys = KeyState::Group;
             }
-            if self.is_wpa3() {
-                self.keys = KeyState::Run;
-            }
+            return;
         }
+        self.install_group_keys(link, plain, Self::key_rsc(f));
+        self.keys = KeyState::Run;
     }
 
-    /// Message 3 of a rekey: message 4 leaves under the current key,
-    /// then the new one takes over.
+    /// Message 3 of a rekey: checked whole, message 4 leaves under the
+    /// current key, then the new one takes over.
     fn rekey_message_3(&mut self, link: &mut impl Link, f: &mut [u8]) {
         if f[17..49] != self.anonce || !self.check_mic(f) {
             return;
         }
+        let mut plain = [0u8; 256];
+        let Some(n) = self.message_3_data(f, &mut plain) else {
+            return;
+        };
+        let plain = &plain[..n];
+        if !self.same_offer(plain) {
+            self.state = State::Idle;
+            return;
+        }
+        if !self.group_keys_present(plain) {
+            return;
+        }
         self.replay.copy_from_slice(&f[9..17]);
         let secure = if matches!(self.security, Security::Psk { wpa2: false, .. }) {
             0
         } else {
             0x200
         };
-        self.send_key(link, 0x0008 | 0x0100 | secure, &[0; 32], &[]);
-        let mut plain = [0u8; 160];
-        let groups = self.key_data(f, &mut plain);
+        let counter = self.replay;
+        self.send_key(
+            link,
+            0x0008 | 0x0100 | secure,
+            &counter,
+            &[0; 32],
+            &[],
+            false,
+        );
+        self.renew_snonce = true;
         if let Some(ptk) = self.next_ptk.take() {
             self.ptk = ptk;
         }
         self.install_pairwise(link, true);
-        if let Some(n) =
-            groups.filter(|_| !matches!(self.security, Security::Psk { wpa2: false, .. }))
-        {
-            self.install_group_keys(link, &plain[..n], Self::key_rsc(f));
+        if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
+            self.install_group_keys(link, plain, Self::key_rsc(f));
         }
         self.timeout = RUN_TIMEOUT;
     }
@@ -2093,13 +2339,19 @@ impl Station {
     /// A group message is signed with the keys in use: a rekey under
     /// way (perhaps begun by a forged message 1) has not replaced them.
     #[inline(never)]
-    fn group_message(&mut self, link: &mut impl Link, f: &mut [u8], info: u16) {
+    fn group_message(&mut self, link: &mut impl Link, f: &mut [u8], info: u16, sealed: bool) {
         let pending = self.next_ptk.take();
-        self.group_message_current(link, f, info);
+        self.group_message_current(link, f, info, sealed);
         self.next_ptk = pending;
     }
 
-    fn group_message_current(&mut self, link: &mut impl Link, f: &mut [u8], info: u16) {
+    fn group_message_current(
+        &mut self,
+        link: &mut impl Link,
+        f: &mut [u8],
+        info: u16,
+        sealed: bool,
+    ) {
         if self.keys != KeyState::Group && self.keys != KeyState::Run {
             return;
         }
@@ -2109,24 +2361,38 @@ impl Station {
         self.replay.copy_from_slice(&f[9..17]);
         self.replay_active = true;
         let index = (info >> 4) & 3;
-        self.send_key(link, (index << 4) | 0x0100 | 0x0200, &[0; 32], &[]);
-        let mut plain = [0u8; 160];
+        let mut plain = [0u8; 256];
         let n = self.key_data(f, &mut plain);
+        let rsc = Self::key_rsc(f);
+        // The key goes in before the answer: an access point told the
+        // key is in place while it is not would leave the rabbit deaf
+        // to every broadcast.
         let ok = match (n, self.security) {
             (Some(n), Security::Psk { wpa2: false, .. }) => {
                 // WPA: the bare key, in the slot the key information names.
-                index != 0 && self.install_gtk(link, index as u8, &plain[..n], Self::key_rsc(f))
+                index != 0 && self.install_gtk(link, index as u8, &plain[..n], rsc)
             }
-            (Some(n), _) => self.install_group_keys(link, &plain[..n], Self::key_rsc(f)),
+            (Some(n), _) => {
+                self.group_keys_present(&plain[..n])
+                    && self.install_group_keys(link, &plain[..n], rsc)
+            }
             (None, _) => false,
         };
         if !ok {
-            // A stale group key would leave the rabbit deaf to every
-            // broadcast: better start over.
+            // Better start over.
             self.keys = KeyState::Msg1;
             self.state = State::Idle;
             return;
         }
+        let counter = self.replay;
+        self.send_key(
+            link,
+            (index << 4) | 0x0100 | 0x0200,
+            &counter,
+            &[0; 32],
+            &[],
+            !sealed,
+        );
         self.keys = KeyState::Run;
         self.state = State::Run;
         self.timeout = RUN_TIMEOUT;
@@ -2283,7 +2549,12 @@ impl Station {
                     return;
                 }
                 self.pmk = run.session.pmk;
-                self.pmksa = Some((self.bssid, run.session.pmk, run.session.pmkid));
+                self.pmksa = Some((
+                    self.bssid,
+                    run.session.pmk,
+                    run.session.pmkid,
+                    link.millis(),
+                ));
                 self.sae = None;
                 self.associate(link);
             }
@@ -2311,6 +2582,8 @@ mod tests {
         keys: Vec<(u8, Vec<u8>)>,
         /// The packet number of the last frame handed in.
         pn: u64,
+        /// Random numbers drawn.
+        drawn: u8,
     }
 
     impl Link for Air {
@@ -2336,7 +2609,10 @@ mod tests {
         fn set_answer_rates(&mut self, _: u16) {}
         fn pause(&mut self) {}
         fn random(&mut self, out: &mut [u8]) {
+            // Never twice the same.
+            self.drawn += 1;
             out.fill(0x33);
+            out[0] = self.drawn;
         }
     }
 
@@ -2556,9 +2832,9 @@ mod tests {
         let f = group_message(&s, 1, &[0xAB; 8]);
         let mut air = Air::default();
         assert_eq!(input(&mut s, &mut air, &f, true), None);
-        // Answered (message 2 of the group handshake), not installed:
-        // the link starts over.
-        assert_eq!(air.sent.len(), 1);
+        // Not installed, and not answered either (the access point
+        // would take the key for in place): the link starts over.
+        assert!(air.sent.is_empty());
         assert!(air.keys.is_empty());
         assert_eq!(s.state, State::Idle);
     }
@@ -2633,6 +2909,7 @@ mod tests {
         s.state = State::Eapol;
         s.keys = KeyState::Msg1;
         s.replay_active = false;
+        s.ap_keyed = false;
         air.sent.clear();
         input(&mut s, &mut air, &msg1(0x66), false);
         let mut msg2 = air.sent[0][24 + 8..].to_vec();
@@ -2711,6 +2988,193 @@ mod tests {
         cleared.sort();
         assert_eq!(cleared, [0, 1, 2, 3]);
         assert!(air.keys.iter().all(|(_, k)| k.is_empty()));
+    }
+
+    /// WPA2 with TKIP: key descriptor version 1 (MD5, RC4), which the
+    /// tests can build by hand.
+    const WPA2_TKIP: Security = Security::Psk {
+        wpa2: true,
+        group: Cipher::Ccmp,
+        pairwise: Some(Cipher::Tkip),
+    };
+
+    /// The access point's RSN element (CCMP group, TKIP pairwise, PSK).
+    const AP_RSN: [u8; 22] = [
+        48, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 2, 1, 0, 0x00, 0x0F, 0xAC, 2, 0,
+        0,
+    ];
+
+    /// An EAPOL-Key frame from the access point, version 1: `info`
+    /// (pairwise, ack, ...), its replay counter, nonce and key data,
+    /// which is encrypted (RC4) and signed (MD5) if `s` has keys.
+    fn eapol_key(s: &Station, info: u16, counter: u64, nonce: &[u8; 32], data: &[u8]) -> Vec<u8> {
+        let mut e = std::vec![0u8; 99];
+        e[..2].copy_from_slice(&[1, 3]);
+        e[4] = 2;
+        e[5..7].copy_from_slice(&(info | 1).to_be_bytes());
+        e[9..17].copy_from_slice(&counter.to_be_bytes());
+        e[17..49].copy_from_slice(nonce);
+        e[97..99].copy_from_slice(&(data.len() as u16).to_be_bytes());
+        let mut data = data.to_vec();
+        if info & 0x100 != 0 {
+            let mut k = [0u8; 32];
+            k[16..].copy_from_slice(&s.ptk[16..32]);
+            rc4(&k, 256, &mut data);
+        }
+        e.extend_from_slice(&data);
+        let n = e.len() as u16 - 4;
+        e[2..4].copy_from_slice(&n.to_be_bytes());
+        if info & 0x100 != 0 {
+            let mic = hmac_md5(&s.ptk[..16], &[&e]);
+            e[81..97].copy_from_slice(&mic);
+        }
+        let mut body = LLC_EAPOL.to_vec();
+        body.extend_from_slice(&e);
+        from_ap(0, &OWN, &body)
+    }
+
+    /// A station between messages 1 and 3 of its first handshake with
+    /// `AP`, which it scanned (`AP_RSN`).
+    fn in_handshake() -> (Station, Air) {
+        let mut s = running(WPA2_TKIP);
+        s.state = State::Eapol;
+        s.keys = KeyState::Msg1;
+        s.bss = Offer::from_elements(AP, &AP_RSN);
+        s.bss_known = true;
+        let mut air = Air::default();
+        let msg1 = eapol_key(&s, 0x0088, 1, &[0x77; 32], &[]);
+        input(&mut s, &mut air, &msg1, false);
+        assert_eq!(s.keys, KeyState::Msg3);
+        (s, air)
+    }
+
+    const MSG3: u16 = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+
+    /// Message 3 without a group key: message 4 went first, the keys
+    /// were taken as in place, and the key data was looked at after.
+    /// The access point then took the station for ready, and the
+    /// rabbit heard no broadcast. Now message 3 is checked whole before
+    /// it is answered.
+    #[test]
+    fn message_3_without_a_group_key_is_not_answered() {
+        let (mut s, mut air) = in_handshake();
+        air.sent.clear();
+        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &AP_RSN);
+        input(&mut s, &mut air, &f, false);
+        assert!(air.sent.is_empty(), "answered");
+        assert_eq!(s.keys, KeyState::Msg3);
+        assert_eq!(s.state, State::Eapol);
+        // With it, the same message goes through.
+        let mut data = AP_RSN.to_vec();
+        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
+        data.extend_from_slice(&[0x47; 16]);
+        let f = eapol_key(&s, MSG3, 3, &[0x77; 32], &data);
+        input(&mut s, &mut air, &f, false);
+        assert_eq!(air.sent.len(), 1);
+        assert_eq!(s.state, State::Run);
+        assert!(air.keys.contains(&(1, std::vec![0x47; 16])));
+    }
+
+    /// Message 3 brings an RSN element other than the one the scan saw:
+    /// the station went on (802.11 says to stop: the beacon may have
+    /// been forged to hide the network's WPA3). It now stops, and keeps
+    /// what message 3 said for the next attempt.
+    #[test]
+    fn message_3_with_another_element_ends_the_attempt() {
+        let (mut s, mut air) = in_handshake();
+        air.sent.clear();
+        // The genuine element offers SAE as well (and protection).
+        let mut rsn = AP_RSN.to_vec();
+        rsn[1] = 24;
+        rsn[14] = 2;
+        rsn.splice(20..20, [0x00, 0x0F, 0xAC, 8]);
+        rsn[24] = 0x80;
+        let mut data = rsn.clone();
+        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
+        data.extend_from_slice(&[0x47; 16]);
+        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
+        input(&mut s, &mut air, &f, false);
+        assert!(air.sent.is_empty(), "answered");
+        assert_eq!(s.state, State::Idle);
+        let learned = s.learned.unwrap();
+        assert_eq!(learned.bssid, AP);
+        assert!(learned.rsn.is_some_and(|(_, _, akm, _)| akm & 1 << 8 != 0));
+    }
+
+    /// The access point sends message 1 again (message 2 lost): the
+    /// station drew a new nonce for each, as if each began a handshake.
+    /// One nonce now serves the whole handshake, as in wpa_supplicant.
+    #[test]
+    fn every_message_1_of_a_handshake_gets_the_same_nonce() {
+        let (mut s, mut air) = in_handshake();
+        let msg1 = eapol_key(&s, 0x0088, 2, &[0x77; 32], &[]);
+        input(&mut s, &mut air, &msg1, false);
+        assert_eq!(air.sent.len(), 2);
+        let nonce = |f: &Vec<u8>| f[24 + 8 + 17..24 + 8 + 49].to_vec();
+        assert_eq!(nonce(&air.sent[0]), nonce(&air.sent[1]));
+    }
+
+    /// Between association and message 3 the bytecode's frames went out
+    /// in clear, on a WPA link. Only the handshake may.
+    #[test]
+    fn nothing_but_the_handshake_goes_in_clear() {
+        let (mut s, mut air) = in_handshake();
+        air.sent.clear();
+        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
+        assert!(!s.send(&mut air, &ip, &BROADCAST, false));
+        assert!(air.sent.is_empty());
+        // The null frame carries nothing: it may.
+        assert!(s.send(&mut air, &[], &AP, false));
+    }
+
+    /// The access point refused the cached key in the 4-way handshake
+    /// (it accepted the association, then the handshake failed): the
+    /// station came back with the same key every time, forever. And it
+    /// kept the key for ever, where access points keep theirs twelve
+    /// hours.
+    #[test]
+    fn a_cached_key_that_fails_or_expires_is_forgotten() {
+        let commit_sent = |s: &mut Station, air: &mut Air| {
+            air.sent.clear();
+            s.state = State::Idle;
+            s.auth(
+                air,
+                b"Terrier",
+                &AP,
+                &AP,
+                6,
+                1,
+                false,
+                CRYPT_WPA2 | 0x0A,
+                &[0; 32],
+                b"carotte",
+            );
+            // Algorithm 3: SAE; 0: open, with the cached key.
+            le16(&air.sent[0], 24) == 3
+        };
+        let mut s = Station::new();
+        let mut rsn = std::vec![1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4];
+        rsn.extend_from_slice(&[1, 0, 0x00, 0x0F, 0xAC, 8, 0xC0, 0]);
+        s.offers[0] = Offer {
+            bssid: AP,
+            rsn: suites(&rsn, [0x00, 0x0F, 0xAC]),
+            ..Offer::default()
+        };
+        let mut air = Air::default();
+        s.pmksa = Some((AP, [9; 32], [8; 16], 0));
+        assert!(!commit_sent(&mut s, &mut air));
+        // That attempt goes nowhere: the next one runs SAE.
+        assert!(commit_sent(&mut s, &mut air));
+        // A key that worked is kept, for twelve hours.
+        s.pmksa = Some((AP, [9; 32], [8; 16], 0));
+        s.cached = false;
+        assert!(!commit_sent(&mut s, &mut air));
+        s.pmksa_proven = true;
+        air.now = PMKSA_LIFETIME_MS - 1;
+        assert!(!commit_sent(&mut s, &mut air));
+        s.pmksa_proven = true;
+        air.now = PMKSA_LIFETIME_MS;
+        assert!(commit_sent(&mut s, &mut air));
     }
 
     /// The access point mode answers an authentication of any sequence

@@ -1268,6 +1268,13 @@ impl AccessPoint {
             1
         } else if element(ies, 0) != Some(self.ssid.as_bytes()) {
             1
+        } else if self.stations[&sta].sae_h2e
+            && element(ies, 244).is_none_or(|x| x.first().is_none_or(|b| b & 0x20 == 0))
+        {
+            // After a hash-to-element exchange the station says so in
+            // its RSN extension element (802.11-2020 12.4.2): otherwise
+            // a downgrade to hunting and pecking would go unseen.
+            40
         } else if let Some((wpa2, pairwise, group)) = psk {
             let mut did_sae = self.stations[&sta].sae_key.is_some();
             // Open authentication then SAE's key management: only with the

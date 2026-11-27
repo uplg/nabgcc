@@ -28,6 +28,10 @@ struct World {
     cipher_errors: u32,
     seq: u16,
     rng: u64,
+    /// Someone on the air changing what the station hears (before the
+    /// stick sees it), or keeping what it sends from the access point.
+    rewrite: Option<fn(&mut Vec<u8>)>,
+    lose: Option<fn(&[u8]) -> bool>,
 }
 
 fn emu_cipher(c: HwCipher) -> Option<Cipher> {
@@ -57,6 +61,8 @@ impl World {
             cipher_errors: 0,
             seq: 0,
             rng: 0x1234_5678_9ABC_DEF1,
+            rewrite: None,
+            lose: None,
         }
     }
 
@@ -95,6 +101,9 @@ impl Link for World {
             };
             f = crypto::protect(&key, &f, tx.iv, tx.eiv);
         }
+        if self.lose.is_some_and(|lose| lose(&f)) {
+            return true;
+        }
         self.radio.tx.push_back(TxFrame {
             data: f,
             channel: self.channel,
@@ -103,7 +112,10 @@ impl Link for World {
     }
     fn receive(&mut self, buffer: &mut [u8]) -> Option<Rx> {
         loop {
-            let f = self.radio.rx.pop_front()?.data;
+            let mut f = self.radio.rx.pop_front()?.data;
+            if let Some(rewrite) = self.rewrite {
+                rewrite(&mut f);
+            }
             let to = &f[4..10];
             if !(to == STA || to[0] & 1 != 0) {
                 continue;
@@ -433,6 +445,121 @@ fn joins_wpa3_only() {
 #[test]
 fn prefers_wpa3_on_a_transition_network() {
     joins_wpa3(Wpa3::Transition);
+}
+
+/// A transition network (WPA2 and WPA3) whose beacons and probe
+/// responses someone rewrites to offer WPA2 alone: the station, which
+/// holds the password, joined with the pre-shared key, as told. The
+/// RSN element of message 3 cannot be forged: it differs, the attempt
+/// ends there, and the next one runs WPA3 (802.11-2020 12.7.6.4).
+#[test]
+fn a_transition_network_made_to_look_wpa2_only_is_joined_with_wpa3() {
+    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Transition);
+    w.rewrite = Some(|f| {
+        if f[0] != 0x80 && f[0] != 0x50 {
+            return;
+        }
+        // The same element with PSK alone, no protection, and no RSN
+        // extension element.
+        let at = 24 + 12;
+        let mut out = f[..at].to_vec();
+        let mut ies = &f[at..];
+        while let [id, len, rest @ ..] = ies {
+            let body = &rest[..*len as usize];
+            match id {
+                48 => out.extend_from_slice(&[
+                    48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 2,
+                    0, 0,
+                ]),
+                244 => {}
+                _ => {
+                    out.extend_from_slice(&[*id, *len]);
+                    out.extend_from_slice(body);
+                }
+            }
+            ies = &rest[*len as usize..];
+        }
+        *f = out;
+    });
+    let mut sta = Station::new();
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert!(!sta.is_wpa3() || sta.net_state() != wifi::S_CONNECTED);
+    assert_ne!(sta.net_state(), wifi::S_CONNECTED, "joined with WPA2");
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    assert!(sta.is_wpa3());
+    talks(&mut w, &mut sta);
+}
+
+/// After hashing the password to the curve, the association request
+/// carries the RSN extension element that says so: without it, the
+/// access point cannot tell a downgrade to hunting and pecking, and
+/// (as the emulated one, after 802.11) refuses the association.
+#[test]
+fn wpa3_says_it_hashed_to_the_curve() {
+    let (w, sta) = joins_wpa3(Wpa3::Only);
+    assert!(sta.is_wpa3());
+    let request = w
+        .radio
+        .tx
+        .iter()
+        .find(|f| f.data[0] == 0x00)
+        .expect("no association request");
+    assert!(request.data.windows(3).any(|e| e == [244, 1, 0x20]));
+}
+
+/// A message 1 with the largest replay counter, from someone else,
+/// just before the access point's own: the station took its counter as
+/// the last one seen, and dropped the genuine message 1 and every one
+/// the access point sent again. The handshake could never finish.
+#[test]
+fn a_forged_message_1_does_not_lock_the_handshake_out() {
+    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Off);
+    let mut sta = Station::new();
+    let found = scan(&mut w, &mut sta);
+    let r = *found.iter().find(|r| r.bssid == BSSID).unwrap();
+    sta.auth(
+        &mut w,
+        &r.ssid[..r.ssid_len],
+        &r.mac,
+        &r.bssid,
+        r.channel,
+        r.rateset,
+        false,
+        r.encryption,
+        &pmk(),
+        &[],
+    );
+    // Up to the association response, which the access point sends
+    // with its message 1.
+    let mut buf = vec![0u8; 2400];
+    for _ in 0..1000 {
+        w.step();
+        if w.radio.rx.iter().any(|f| f.data[0] == 0x10) {
+            break;
+        }
+        while let Some(rx) = w.receive(&mut buf) {
+            sta.input(&mut w, &mut buf, rx);
+        }
+    }
+    let mut forged = vec![0x08, 0x02, 0, 0];
+    forged.extend_from_slice(&STA);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&[0, 0]);
+    forged.extend_from_slice(&wifi::LLC_EAPOL);
+    let mut e = vec![2, 3, 0, 95, 2, 0x00, 0x8A, 0, 16];
+    e.extend_from_slice(&[0xFF; 8]);
+    e.extend_from_slice(&[0x99; 32]);
+    e.resize(99, 0);
+    forged.extend_from_slice(&e);
+    let at = w.radio.rx.iter().position(|f| f.data[0] == 0x10).unwrap();
+    w.radio
+        .rx
+        .insert(at + 1, nabemu::rt2573::RxFrame::new(forged));
+    run(&mut w, &mut sta, 4000, &mut Vec::new());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    talks(&mut w, &mut sta);
 }
 
 #[test]

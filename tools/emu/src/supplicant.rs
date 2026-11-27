@@ -360,6 +360,10 @@ impl Supplicant {
         request.extend_from_slice(self.ssid.as_bytes());
         request.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8B, 0x96]);
         request.extend_from_slice(&self.own_element());
+        if self.method == Method::HashToElement {
+            // The RSN extension element: hash-to-element was used.
+            request.extend_from_slice(&[244, 1, 0x20]);
+        }
         self.transmit(radio, 0x00, 0, self.bssid, &request, false);
         self.state = State::Associating;
     }
