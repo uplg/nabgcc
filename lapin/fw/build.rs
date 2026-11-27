@@ -6,7 +6,7 @@ fn pack(d: &[u8]) -> Vec<u8> {
     let mut chains: HashMap<[u8; 3], Vec<usize>> = HashMap::new();
     let mut out = Vec::new();
     let mut i = 0;
-    let mut note = |chains: &mut HashMap<[u8; 3], Vec<usize>>, at: usize| {
+    let note = |chains: &mut HashMap<[u8; 3], Vec<usize>>, at: usize| {
         if at + 3 <= d.len() {
             chains
                 .entry([d[at], d[at + 1], d[at + 2]])
@@ -22,8 +22,10 @@ fn pack(d: &[u8]) -> Vec<u8> {
                 break;
             }
             let (mut best, mut off) = (0, 0);
-            if i + 3 <= d.len() {
-                if let Some(starts) = chains.get(&[d[i], d[i + 1], d[i + 2]]) {
+            if i + 3 <= d.len()
+                && let Some(starts) = chains.get(&[d[i], d[i + 1], d[i + 2]])
+            {
+                {
                     for &j in starts.iter().rev() {
                         if i - j > 4096 {
                             break;
