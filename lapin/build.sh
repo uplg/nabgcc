@@ -18,16 +18,18 @@ import struct, sys, zlib
 rescue = open(sys.argv[1], 'rb').read()
 app = bytearray(open(sys.argv[2], 'rb').read())
 size = 20 * 1024
-if len(rescue) > size:
-    sys.exit(f"the rescue core takes {len(rescue)} bytes, more than its {size}")
+if len(rescue) > size - 8:
+    sys.exit(f"the rescue core takes {len(rescue)} bytes, more than its {size - 8}")
+core = rescue + b'\xff' * (size - 8 - len(rescue))
+core += struct.pack('<II', 0x5250414C, zlib.crc32(core) & 0xFFFFFFFF)
 if struct.unpack_from('<I', app, 0)[0] != 0x4150414C:
     sys.exit(f"{sys.argv[2]}: no application header")
 if size + len(app) > 124 * 1024:
     sys.exit(f"{sys.argv[2]}: {len(app)} bytes do not fit after the rescue core")
 struct.pack_into('<I', app, 4, len(app))
-struct.pack_into('<I', app, 8, zlib.crc32(bytes(app[16:])) & 0xFFFFFFFF)
+struct.pack_into('<I', app, 8, zlib.crc32(bytes(app[12:])) & 0xFFFFFFFF)
 open(sys.argv[2], 'wb').write(app)
-open(sys.argv[3], 'wb').write(rescue + b'\xff' * (size - len(rescue)) + app)
+open(sys.argv[3], 'wb').write(core + app)
 PY
 done
 ls -l ../target/*-full.bin | awk '{print $5, $NF}' 
@@ -36,8 +38,11 @@ ls -l ../target/*-full.bin | awk '{print $5, $NF}'
 # in the flash: every branch in the initialised data stays in RAM, and
 # the only jump through a register is the return (`bx lr`, or Thumb's
 # `pop {rN}` then `bx rN`).
-if command -v arm-none-eabi-objdump >/dev/null; then
-    for elf in rescue lapin; do
+if ! command -v arm-none-eabi-objdump >/dev/null; then
+    echo "arm-none-eabi-objdump is missing: the code in RAM cannot be checked" >&2
+    exit 1
+fi
+for elf in rescue lapin; do
     bad=$(arm-none-eabi-objdump -d -j .data "$out/$elf" | awk '
         /^[0-9a-f]+ <.*>:$/ { next }
         $3 ~ /^(b|bl|blx|b[a-z][a-z])(\.n|\.w)?$/ && $4 !~ /^(1[0-9a-f]{7})$/ { print }
@@ -50,5 +55,4 @@ if command -v arm-none-eabi-objdump >/dev/null; then
         echo "$bad" >&2
         exit 1
     fi
-    done
-fi
+done

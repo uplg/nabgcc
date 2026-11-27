@@ -32,10 +32,27 @@ pub fn millis() -> u32 {
     MILLIS.get()
 }
 
-/// Wait, feeding the watchdog.
+/// Wait at least `ms` milliseconds, feeding the watchdog. With
+/// interrupts held back (inside [`irq::free`]) the tick cannot come:
+/// the timer's overflow flag is counted here instead, and the clock
+/// kept, or the wait would never end.
 pub fn delay_ms(ms: u32) {
-    let start = millis();
-    while millis().wrapping_sub(start) < ms {
+    let on = irq::irq_disable();
+    if on {
+        irq::irq_enable();
+        let start = millis();
+        // One more than asked: `start` may be the end of a tick.
+        while millis().wrapping_sub(start) <= ms {
+            watchdog::feed();
+        }
+        return;
+    }
+    let mut ticks = 0;
+    while ticks <= ms {
         watchdog::feed();
+        if TMOVF.read() & 1 != 0 {
+            on_tick();
+            ticks += 1;
+        }
     }
 }

@@ -6,11 +6,18 @@
 #![no_main]
 
 use lapin_core::sae::{self, vector};
-use lapin_fw::{clock, halt, uart};
+use lapin_fw::{clock, uart, watchdog};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     lapin_fw::panicked()
+}
+
+/// The next step: the rescue core hands over with the watchdog running,
+/// and each step takes well under its two seconds.
+fn step(name: &[u8]) {
+    watchdog::feed();
+    uart::write(name);
 }
 
 fn verdict(name: &[u8], ok: bool) {
@@ -27,14 +34,14 @@ extern "C" fn main() -> ! {
     uart::init();
     uart::write(b"lapin bench\n");
 
-    uart::write(b"> hunting\n");
+    step(b"> hunting\n");
     let element = sae::password_element_looping(&vector::ADDR1, &vector::ADDR2, vector::PASSWORD);
-    uart::write(b"> commit\n");
+    step(b"> commit\n");
     let mut session = element.map(|e| sae::Session::new(e, &vector::RAND, &vector::MASK));
     let commit_ok = session
         .as_ref()
         .is_some_and(|s| s.commit().to_bytes() == vector::LOCAL_COMMIT);
-    uart::write(b"> shared\n");
+    step(b"> shared\n");
     let peer = sae::Commit::from_bytes(&vector::PEER_COMMIT);
     let keys_ok = match (&mut session, &peer) {
         (Some(s), Some(p)) => {
@@ -42,19 +49,21 @@ extern "C" fn main() -> ! {
         }
         _ => false,
     };
-    uart::write(b"> confirm\n");
+    step(b"> confirm\n");
     let confirm = session.as_ref().and_then(|s| s.confirm(1));
-    uart::write(b"> point\n");
+    step(b"> point\n");
     let point = sae::password_point(vector::SSID, vector::PASSWORD, vector::IDENTIFIER);
-    uart::write(b"> element\n");
+    step(b"> element\n");
     let h2e = point.map(|p| sae::password_element_from_point(&p, &vector::ADDR1B, &vector::ADDR2B));
     let h2e_ok = h2e.and_then(|e| e.to_bytes()) == Some(vector::ELEMENT);
-    uart::write(b"> done\n");
+    step(b"> done\n");
 
     verdict(b"commit", commit_ok);
     verdict(b"keys", keys_ok);
     verdict(b"confirm", confirm.is_some());
     verdict(b"hash-to-element", h2e_ok);
     uart::write(b"end\n");
-    halt()
+    loop {
+        watchdog::feed();
+    }
 }

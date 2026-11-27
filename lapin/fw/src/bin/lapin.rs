@@ -91,8 +91,17 @@ extern "C" fn main() -> ! {
     let n = lapin_core::lz::unpack(BOOT_PACKED, boot);
     vm.boot(&boot[..n]);
     let mut confirmed = false;
+    // The button held from the start for 20 seconds asks for the rescue
+    // core (longer than the setup's 2 and the factory test's 8): the way
+    // in for an application that starts but cannot take an update.
+    let mut held = board::button();
     loop {
         vm.main_loop_once();
+        held &= board::button();
+        if held && timer::millis() > 20_000 {
+            lapin_fw::boot::Slots::ask_rescue();
+            watchdog::reset_now();
+        }
         // A minute up: the application is well, the rescue core can
         // forget the restarts before (lapin_fw::boot).
         if !confirmed && timer::millis() > 60_000 {

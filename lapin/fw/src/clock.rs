@@ -7,6 +7,9 @@ reg! {
     PLL1: u32 = 0xB700_0008;
     PLL2: u32 = 0xB700_000C;
     CLKCNT: u32 = 0xB700_0010;
+    TMEN: u8 = 0xB800_1004;
+    TMRLR: u16 = 0xB800_1008;
+    TMOVF: u8 = 0xB800_1010;
 }
 
 /// Processor and peripheral clock once [`init`] has run.
@@ -17,6 +20,20 @@ pub fn init() {
     // the running clock alone.
     if CLKCNT.read() == 0x0009_0009 {
         return;
+    }
+    // Still on the ring oscillator, as out of reset: give the crystal
+    // 10 ms to settle, timed by the system timer, before running on it
+    // (the C's reset code, sys/asm/init.s, the same way).
+    if CLKCNT.read() & 0x300 == 0x100 {
+        TMEN.write(0);
+        TMOVF.write(1);
+        // The ring oscillator's 16 MHz, divided by 16: 10 000 counts.
+        TMRLR.write((0x1_0000 - 10 * 16 * 1000 / 16) as u16);
+        TMEN.write(1);
+        while TMOVF.read() & 1 == 0 {}
+        CLKCNT.write(CLKCNT.read() & 0xFFFF_FCFF);
+        TMEN.write(0);
+        TMOVF.write(1);
     }
     PLL1.write(0x3101_3110);
     PLL2.write(0x0003_0101);

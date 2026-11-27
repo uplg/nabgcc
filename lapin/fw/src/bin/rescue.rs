@@ -13,7 +13,7 @@ use core::arch::{asm, global_asm};
 use lapin_fw::boot::{self, MAX_FAILED_BOOTS, Slots};
 use lapin_fw::rescue::Rescue;
 use lapin_fw::wifi::rt2573::Stick;
-use lapin_fw::{board, clock, halt, irq, led, spi, timer, uart, usb, watchdog};
+use lapin_fw::{board, clock, irq, led, spi, timer, uart, usb, watchdog};
 
 global_asm!(
     r#"
@@ -65,6 +65,9 @@ extern "C" fn main() -> ! {
     clock::init();
     let app = boot::installed_app();
     if let Some(entry) = app.filter(|_| failed < MAX_FAILED_BOOTS) {
+        // Running before the jump: an application that hangs before
+        // its own start of it still comes back here, and counts.
+        watchdog::start();
         // SAFETY: the application's reset code, at the address its whole
         // and checked header gives; it takes over the processor from
         // scratch, as from a reset.
@@ -80,7 +83,9 @@ extern "C" fn main() -> ! {
     led::init();
     led::set_all(RED);
     uart::init();
-    uart::write(if app.is_some() {
+    uart::write(if failed == boot::ASKED {
+        b"secours: asked for\n"
+    } else if app.is_some() {
         b"secours: the application keeps restarting\n"
     } else {
         b"secours: no application\n"
@@ -92,8 +97,15 @@ extern "C" fn main() -> ! {
         .and_then(Stick::start);
     let Ok(mut stick) = stick else {
         uart::write(b"secours: no stick\n");
-        // Nothing to offer: let the watchdog try the whole again.
-        halt()
+        if app.is_some() {
+            // No network to offer: the application, without one, is
+            // still more than a red rabbit. Its three tries again.
+            Slots::fresh();
+            watchdog::reset_now();
+        }
+        // Nothing at all to run: try the stick again in a while.
+        timer::delay_ms(5000);
+        watchdog::reset_now()
     };
     let mut rescue = Rescue::new(stick.mac);
     rescue.start(&mut stick);

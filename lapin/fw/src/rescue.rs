@@ -62,6 +62,8 @@ struct Ends {
     theirs: bool,
 }
 
+// Word aligned: the flash routine reads it a word at a time.
+#[repr(C, align(4))]
 struct Upload(core::cell::UnsafeCell<[u8; 128 * 1024]>);
 // SAFETY: the rescue core's main loop alone touches it.
 unsafe impl Sync for Upload {}
@@ -85,6 +87,10 @@ pub struct Rescue {
     after: After,
     ends: Ends,
     last_visit: u32,
+    /// When the connection under way was last heard from.
+    heard_at: u32,
+    /// How much of the request was searched for the end of its headers.
+    scanned: usize,
     frame: [u8; 1600],
 }
 
@@ -137,6 +143,8 @@ impl Rescue {
                 theirs: false,
             },
             last_visit: timer::millis(),
+            heard_at: 0,
+            scanned: 0,
             frame: [0; 1600],
         }
     }
@@ -194,6 +202,7 @@ impl Rescue {
         loop {
             watchdog::feed();
             while let Some(got) = stick.receive(&mut rx) {
+                watchdog::feed();
                 self.input(stick, &rx[..got.len]);
             }
             self.retransmit(stick);
@@ -206,7 +215,7 @@ impl Rescue {
                 match self.after {
                     After::Flash(len) => {
                         uart::write(b"secours: writing\n");
-                        Slots::confirm();
+                        Slots::fresh();
                         // SAFETY: the upload buffer, alone in use now.
                         let image = unsafe { &(&*UPLOAD.0.get())[..len] };
                         let app = if boot::check_app(image).is_some() {
@@ -217,17 +226,20 @@ impl Rescue {
                         crate::flash::write_app(app)
                     }
                     _ => {
-                        Slots::confirm();
+                        Slots::fresh();
                         watchdog::reset_now()
                     }
                 }
             }
+            // Ten minutes without a request (a phone that joined and
+            // left, or rejoins on its own, does not count): give the
+            // application another try.
             if app_present
-                && self.peer.is_none()
+                && self.tcp == Tcp::Listen
                 && timer::millis().wrapping_sub(self.last_visit) > IDLE_MS
             {
                 uart::write(b"secours: back to the application\n");
-                Slots::confirm();
+                Slots::fresh();
                 watchdog::reset_now();
             }
         }
@@ -271,22 +283,22 @@ impl Rescue {
                 self.frame[n + 6..n + 9].copy_from_slice(&[1, 1, 0x82]);
                 self.send(stick, n + 9, true);
                 self.peer = Some(a2);
-                self.last_visit = timer::millis();
             }
             (0xA0 | 0xC0, 0) if for_us && self.peer == Some(a2) => {
                 self.peer = None;
                 self.tcp = Tcp::Listen;
                 self.after = After::Nothing;
-                self.last_visit = timer::millis();
             }
-            (0x08, 1) if for_us && self.peer == Some(a2) && f.len() >= 32 => {
-                self.last_visit = timer::millis();
-                if f[24..30] == [0xAA, 0xAA, 3, 0, 0, 0] {
-                    match be16(f, 30) {
-                        0x0806 => self.arp(stick, &a2, &f[32..]),
-                        0x0800 => self.ip(stick, &a2, &f[32..]),
-                        _ => {}
-                    }
+            (0x08, 1)
+                if for_us
+                    && self.peer == Some(a2)
+                    && f.len() >= 32
+                    && f[24..30] == [0xAA, 0xAA, 3, 0, 0, 0] =>
+            {
+                match be16(f, 30) {
+                    0x0806 => self.arp(stick, &a2, &f[32..]),
+                    0x0800 => self.ip(stick, &a2, &f[32..]),
+                    _ => {}
                 }
             }
             _ => {}
@@ -479,8 +491,22 @@ impl Rescue {
             }
             return;
         }
+        if ours {
+            self.heard_at = timer::millis();
+        }
         if flags & 0x02 != 0 {
+            // A second connection while one is under way (a browser's
+            // spare one, a favicon) is not taken: it would drop the
+            // upload. One silent for ten seconds is given up.
+            let busy = self.tcp != Tcp::Listen
+                && !ours
+                && timer::millis().wrapping_sub(self.heard_at) < 10_000;
+            if busy {
+                return;
+            }
             // A new connection drops whatever was going on.
+            self.heard_at = timer::millis();
+            self.scanned = 0;
             self.remote = (src, port);
             self.rcv_nxt = seq.wrapping_add(1);
             self.iss = timer::millis().wrapping_mul(2_654_435_761);
@@ -554,9 +580,15 @@ impl Rescue {
         // SAFETY: as above.
         let buf = unsafe { &*UPLOAD.0.get() };
         let req = &buf[..self.request];
-        let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+        // Look for the end of the headers in what came since last time
+        // only: an upload is 110 KB.
+        let from = self.scanned.saturating_sub(3);
+        let Some(end) = req[from..].windows(4).position(|w| w == b"\r\n\r\n") else {
+            self.scanned = req.len();
             return;
         };
+        let end = from + end;
+        self.scanned = end;
         let head = &req[..end];
         let body = end + 4;
         let length = head
@@ -569,10 +601,16 @@ impl Rescue {
                 core::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()
             })
             .unwrap_or(0);
-        if req.len() < body + length {
+        // More than the buffer holds (or a length that wraps): refused at
+        // once, not waited for.
+        let too_big = body.checked_add(length).is_none_or(|n| n > buf.len());
+        if !too_big && req.len() < body + length {
             return;
         }
-        let (answer, after) = if head.starts_with(b"POST /flash") {
+        self.last_visit = timer::millis();
+        let (answer, after) = if too_big {
+            (REFUSED, After::Nothing)
+        } else if head.starts_with(b"POST /flash") {
             let image = &req[body..body + length];
             let whole =
                 image.len() > RESCUE_SIZE && boot::check_app(&image[RESCUE_SIZE..]).is_some();

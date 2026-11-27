@@ -22,8 +22,12 @@ const MODE_BASE: u16 = 0x0C00;
 const MODE_RESET: u16 = 0x0004;
 const MODE_RECORD: u16 = 0x3000;
 
+/// Wait for the chip to take more, at most half a second: a codec that
+/// never answers (the C waits for ever, feeding the watchdog) leaves a
+/// rabbit without sound, not a frozen one.
 fn wait_ready() {
-    while !board::codec_wants_data() {
+    let start = timer::millis();
+    while !board::codec_wants_data() && timer::millis().wrapping_sub(start) < 500 {
         watchdog::feed();
     }
 }

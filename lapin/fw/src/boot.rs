@@ -15,8 +15,12 @@
 //! |---|---|
 //! | 0 | [`MAGIC`] |
 //! | 1 | length in bytes, header included |
-//! | 2 | CRC-32 of the bytes after the header (filled in by `build.sh`) |
-//! | 3 | address of its reset code |
+//! | 2 | CRC-32 of word 3 and everything after it (filled in by `build.sh`) |
+//! | 3 | address of its reset code, inside the application |
+//!
+//! A whole image (`lapin-full.bin`) is the rescue core, padded to
+//! [`RESCUE_SIZE`] and ending on a trailer of its own ([`RESCUE_MAGIC`],
+//! then the CRC-32 of the bytes before it), then the application.
 //!
 //! The two share four words at the bottom of the internal RAM, which
 //! neither one's startup clears: see [`Slots`].
@@ -32,10 +36,17 @@ pub const APP_END: usize = flash::SETTINGS;
 pub const HEADER_LEN: usize = 16;
 /// "LAPA", little-endian.
 pub const MAGIC: u32 = 0x4150_414C;
+/// "LAPR", little-endian: the rescue core's trailer.
+pub const RESCUE_MAGIC: u32 = 0x5250_414C;
+/// The bytes at the start of an image that say it is lapin's (the
+/// vectors and the first of the rescue core).
+const SIGNATURE: usize = 64;
 
 /// Restarts in a row without the application saying it is well, after
 /// which the rescue core takes over.
 pub const MAX_FAILED_BOOTS: u32 = 3;
+/// What [`Slots::count_boot`] gives when the rescue core was asked for.
+pub const ASKED: u32 = u32::MAX;
 
 /// The words at the bottom of the internal RAM, kept across a restart
 /// (not across a power cut): `SLOT_MAGIC` there when the rest is
@@ -66,6 +77,24 @@ impl Slots {
             let n = slot(1).read_volatile().saturating_add(1);
             slot(1).write_volatile(n);
             n
+        }
+    }
+
+    /// Start afresh, as after a power cut: the next start counts 0 (the
+    /// rescue core handing back to the application gives it its three
+    /// tries again).
+    pub fn fresh() {
+        // SAFETY: as above.
+        unsafe { slot(0).write_volatile(0) }
+    }
+
+    /// Have the rescue core take over at the next start (the gesture
+    /// that asks for it, in the application).
+    pub fn ask_rescue() {
+        // SAFETY: as above.
+        unsafe {
+            slot(0).write_volatile(SLOT_MAGIC);
+            slot(1).write_volatile(ASKED);
         }
     }
 
@@ -108,21 +137,34 @@ pub fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
-/// An application image, from its header: its length if it is whole.
+fn word(image: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(image.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// An application image, from its header: its length if it is whole,
+/// its reset address inside it.
 pub fn check_app(image: &[u8]) -> Option<usize> {
-    let word = |i: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(
-            image.get(4 * i..4 * i + 4)?.try_into().ok()?,
-        ))
-    };
-    if word(0)? != MAGIC {
+    if word(image, 0)? != MAGIC {
         return None;
     }
-    let len = word(1)? as usize;
+    let len = word(image, 4)? as usize;
     if !(HEADER_LEN..=APP_END - APP_BASE).contains(&len) || len > image.len() {
         return None;
     }
-    (crc32(&image[HEADER_LEN..len]) == word(2)?).then_some(len)
+    let entry = (word(image, 12)? as usize).wrapping_sub(APP_BASE);
+    if !(HEADER_LEN..len).contains(&entry) || entry % 4 != 0 {
+        return None;
+    }
+    (crc32(&image[12..len]) == word(image, 8)?).then_some(len)
+}
+
+/// A rescue core, padded and with its trailer: whether it is whole.
+pub fn check_rescue(core: &[u8]) -> bool {
+    let Some(core) = core.get(..RESCUE_SIZE) else {
+        return false;
+    };
+    let end = RESCUE_SIZE - 8;
+    word(core, end) == Some(RESCUE_MAGIC) && word(core, end + 4) == Some(crc32(&core[..end]))
 }
 
 /// The application in the flash, if it is whole: its reset address.
@@ -130,9 +172,7 @@ pub fn installed_app() -> Option<u32> {
     // SAFETY: the flash is mapped and readable; nothing writes it now.
     let flash = unsafe { core::slice::from_raw_parts(APP_BASE as *const u8, APP_END - APP_BASE) };
     check_app(flash)?;
-    Some(u32::from_le_bytes([
-        flash[12], flash[13], flash[14], flash[15],
-    ]))
+    word(flash, 12)
 }
 
 /// The rescue core as it is in the flash.
@@ -142,20 +182,37 @@ pub fn installed_rescue() -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(flash::BASE as *const u8, RESCUE_SIZE) }
 }
 
-/// What part of `image` an update writes, from where: a whole image
-/// (rescue core and application) whose rescue core is the one in place
-/// rewrites the application alone; an application image alone, the
-/// same; anything else (an older firmware, a new rescue core) the whole
-/// flash, as before there was one. `None`: a damaged application,
-/// refused.
+/// What part of `image` an update writes, from where; `None`: refused,
+/// nothing written.
+///
+/// - A whole image whose rescue core is the one in place, or an
+///   application image alone: the application, if it is whole.
+/// - A whole image with another rescue core: the whole flash, only if
+///   both parts are whole (a power cut in the first 20 KB of that
+///   write still kills the rabbit: there is one rescue core).
+/// - Anything else that starts as lapin does: a damaged or cut image,
+///   refused.
+/// - An image of another firmware (the C one): the whole flash, as
+///   before there was a rescue core, with the same risk.
 pub fn update_plan(image: &[u8]) -> Option<(usize, &[u8])> {
-    if image.len() > RESCUE_SIZE && image[..RESCUE_SIZE] == *installed_rescue() {
+    let installed = installed_rescue();
+    if image.len() > RESCUE_SIZE && image[..RESCUE_SIZE] == *installed {
         let app = &image[RESCUE_SIZE..];
         let len = check_app(app)?;
         return Some((APP_BASE, &app[..len]));
     }
     if let Some(len) = check_app(image) {
         return Some((APP_BASE, &image[..len]));
+    }
+    if word(image, RESCUE_SIZE - 8) == Some(RESCUE_MAGIC) {
+        if !check_rescue(image) {
+            return None;
+        }
+        let len = check_app(&image[RESCUE_SIZE..])?;
+        return Some((flash::BASE, &image[..RESCUE_SIZE + len]));
+    }
+    if image.get(..SIGNATURE) == Some(&installed[..SIGNATURE]) {
+        return None;
     }
     Some((flash::BASE, image))
 }

@@ -126,6 +126,8 @@ fn word(address: usize) -> crate::reg::Reg<u32> {
 static CONTROL_RESULT: Shared<u32> = Shared::new(PENDING);
 static PORT_CHANGED: Shared<bool> = Shared::new(false);
 static TX_BUSY: Shared<bool> = Shared::new(false);
+/// When the transfer out on its way was queued.
+static TX_AT: Shared<u32> = Shared::new(0);
 static BROKEN: Shared<bool> = Shared::new(false);
 /// What takes the packets received on the bulk endpoint.
 type PacketHandler = fn(&[u8]);
@@ -527,6 +529,18 @@ pub fn tx_busy() -> bool {
 /// false, without calling `fill`, while the previous transfer is still
 /// on its way.
 pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
+    if tx_busy() && timer::millis().wrapping_sub(TX_AT.get()) > 1000 {
+        // A second on its way: the stick will not take it. Take it back
+        // from the controller, as a control transfer that timed out, or
+        // nothing would ever be sent again.
+        irq::free(|| {
+            word(ED_OUT).write(word(ED_OUT).read() | ED_SKIP);
+            timer::delay_ms(2);
+            word(ED_OUT + 8).write(word(ED_OUT + 4).read());
+            word(ED_OUT).write(word(ED_OUT).read() & !ED_SKIP);
+            TX_BUSY.set(false);
+        });
+    }
     if tx_busy() || len == 0 || len > TX_MAX {
         return false;
     }
@@ -537,6 +551,7 @@ pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
     crate::sync::barrier();
     irq::free(|| {
         TX_BUSY.set(true);
+        TX_AT.set(timer::millis());
         let td = word(ED_OUT + 4).read() as usize;
         let spare = if td == TD_OUT { TD_OUT + 16 } else { TD_OUT };
         fill_td(td, TD_OUT_PID, TX_BUFFER, len, spare);
