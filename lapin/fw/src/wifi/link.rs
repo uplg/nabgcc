@@ -89,6 +89,8 @@ impl Link for Radio<'_> {
             len: got.len,
             rssi: got.rssi,
             decrypted: got.decrypted,
+            iv: got.iv,
+            eiv: got.eiv,
         })
     }
 

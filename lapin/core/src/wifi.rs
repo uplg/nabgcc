@@ -51,6 +51,11 @@ pub struct Rx {
     pub rssi: i8,
     /// The stick decrypted it.
     pub decrypted: bool,
+    /// The IV and extended IV of a frame the stick decrypted, as its
+    /// receive descriptor gives them (words 2 and 3): the packet number
+    /// is in them, and the stick checks none.
+    pub iv: u32,
+    pub eiv: u32,
 }
 
 /// What the station needs from the stick and the board.
@@ -221,8 +226,6 @@ struct SoftKeys {
     tk: [u8; 16],
     gtk: Option<(u8, [u8; 16])>,
     igtk: Option<(u16, [u8; 16])>,
-    rx_pn: u64,
-    group_rx_pn: u64,
     mgmt_rx_pn: u64,
     igtk_ipn: u64,
 }
@@ -264,6 +267,16 @@ pub struct Station {
     ptk: [u8; 64],
     /// Packet number (or TKIP sequence counter) of the next frame.
     tx_pn: u64,
+    /// The last packet number received under the pairwise key, and
+    /// under each group key (by key identifier): a frame that does not
+    /// exceed it is a replay.
+    rx_pn: u64,
+    group_rsc: [u64; 4],
+    /// The group keys installed, by identifier (bit `i` of `gtk_set`
+    /// says key `i` is): the same key handed over again is not
+    /// installed again, which would wind its counter back.
+    gtks: [[u8; 32]; 4],
+    gtk_set: u8,
     soft: Option<SoftKeys>,
     sae: Option<SaeRun>,
     /// The hash-to-element password point of the last network, kept:
@@ -453,6 +466,10 @@ impl Station {
             anonce: [0; 32],
             ptk: [0; 64],
             tx_pn: 1,
+            rx_pn: 0,
+            group_rsc: [0; 4],
+            gtks: [[0; 32]; 4],
+            gtk_set: 0,
             soft: None,
             sae: None,
             pt: None,
@@ -866,6 +883,9 @@ impl Station {
         for slot in 0..4 {
             link.set_key(slot, HwCipher::None, &[], &none, &none);
         }
+        self.gtk_set = 0;
+        self.group_rsc = [0; 4];
+        self.rx_pn = 0;
         self.security = match encryption & 0xF0 {
             CRYPT_NONE => Security::Open,
             CRYPT_WEP => {
@@ -1546,9 +1566,9 @@ impl Station {
             return None;
         };
         let mut decrypted = rx.decrypted;
+        let group = destination[0] & 1 != 0;
         if frame[1] & 0x40 != 0 && self.soft.is_some() && !decrypted {
             // WPA3: the stick holds no key, the frame is opened here.
-            let group = destination[0] & 1 != 0;
             let soft = self.soft.as_mut()?;
             let (pn, key_id) = ccmp::header(&frame[..len])?;
             let key = if group {
@@ -1560,17 +1580,32 @@ impl Station {
                 soft.tk
             };
             let (n, _) = ccmp::unprotect(&key, &mut frame[..len])?;
-            let last = if group {
-                &mut soft.group_rx_pn
-            } else {
-                &mut soft.rx_pn
-            };
-            if pn <= *last {
+            if !self.fresh(group, key_id, pn) {
                 return None;
             }
-            *last = pn;
             len = n;
             decrypted = true;
+        } else if decrypted
+            && let Security::Psk {
+                pairwise, group: g, ..
+            } = self.security
+        {
+            // What the stick opened: its packet number, from the IV
+            // words of the descriptor, must be new (the C driver never
+            // looked, and a frame recorded on the air went up again).
+            let cipher = if group {
+                g
+            } else {
+                pairwise.unwrap_or(Cipher::Ccmp)
+            };
+            let (iv, eiv) = (rx.iv, rx.eiv as u64);
+            let pn = match cipher {
+                Cipher::Ccmp => eiv << 16 | (iv & 0xFFFF) as u64,
+                Cipher::Tkip => eiv << 16 | ((iv & 0xFF) << 8 | (iv >> 16) & 0xFF) as u64,
+            };
+            if !self.fresh(group, (iv >> 30) as u8, pn) {
+                return None;
+            }
         }
         if frame[1] & 0x40 != 0 && !decrypted {
             // Still sealed: the stick had no key for it (it hands such
@@ -1624,6 +1659,21 @@ impl Station {
             }
             _ => None,
         }
+    }
+
+    /// Whether a packet number is past the last one of its key, which
+    /// it then becomes.
+    fn fresh(&mut self, group: bool, key_id: u8, pn: u64) -> bool {
+        let last = if group {
+            &mut self.group_rsc[key_id as usize & 3]
+        } else {
+            &mut self.rx_pn
+        };
+        if pn <= *last {
+            return false;
+        }
+        *last = pn;
+        true
     }
 
     // ---- WPA and WPA2: the key handshakes ---------------------------------
@@ -1831,8 +1881,6 @@ impl Station {
                     tk,
                     gtk: old.as_ref().and_then(|o| o.gtk),
                     igtk: old.as_ref().and_then(|o| o.igtk),
-                    rx_pn: 0,
-                    group_rx_pn: old.as_ref().map_or(0, |o| o.group_rx_pn),
                     mgmt_rx_pn: 0,
                     igtk_ipn: old.as_ref().map_or(0, |o| o.igtk_ipn),
                 });
@@ -1850,8 +1898,10 @@ impl Station {
             _ => link.set_key(0, HwCipher::Ccmp, &tk, &none, &none),
         }
         // The first frame is numbered 1 (the C driver started at 0, and
-        // access points dropped it as a replay).
+        // access points dropped it as a replay); the access point's
+        // numbers start again too.
         self.tx_pn = 1;
+        self.rx_pn = 0;
     }
 
     fn check_mic(&self, f: &mut [u8]) -> bool {
@@ -1914,7 +1964,7 @@ impl Station {
         if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
             let mut plain = [0u8; 160];
             if let Some(n) = self.key_data(f, &mut plain) {
-                self.install_group_keys(link, &plain[..n]);
+                self.install_group_keys(link, &plain[..n], Self::key_rsc(f));
             }
             if self.is_wpa3() {
                 self.keys = KeyState::Run;
@@ -1944,15 +1994,24 @@ impl Station {
         if let Some(n) =
             groups.filter(|_| !matches!(self.security, Security::Psk { wpa2: false, .. }))
         {
-            self.install_group_keys(link, &plain[..n]);
+            self.install_group_keys(link, &plain[..n], Self::key_rsc(f));
         }
         self.timeout = RUN_TIMEOUT;
     }
 
+    /// The key receive sequence counter of an EAPOL-Key frame: where the
+    /// group key it brings stands.
+    fn key_rsc(f: &[u8]) -> u64 {
+        let mut rsc = [0u8; 8];
+        rsc[..6].copy_from_slice(&f[65..71]);
+        u64::from_le_bytes(rsc)
+    }
+
     /// Install the group key (and, on WPA3, the integrity group key)
-    /// from a list of key data elements. False if there was none.
+    /// from a list of key data elements, the group key's counter at
+    /// `rsc`. False if there was none.
     #[inline(never)]
-    fn install_group_keys(&mut self, link: &mut impl Link, plain: &[u8]) -> bool {
+    fn install_group_keys(&mut self, link: &mut impl Link, plain: &[u8], rsc: u64) -> bool {
         let mut found = false;
         for (id, e) in elements(plain) {
             if id != 0xDD || e.len() < 4 || e[..3] != [0x00, 0x0F, 0xAC] {
@@ -1964,15 +2023,19 @@ impl Station {
                     if index == 0 {
                         continue;
                     }
-                    found |= self.install_gtk(link, index, &e[6..]);
+                    found |= self.install_gtk(link, index, &e[6..], rsc);
                 }
                 9 if e.len() >= 28 => {
                     if let Some(soft) = self.soft.as_mut() {
                         let mut k = [0u8; 16];
                         k.copy_from_slice(&e[12..28]);
-                        soft.igtk = Some((le16(e, 4), k));
-                        soft.igtk_ipn =
-                            u64::from_le_bytes([e[6], e[7], e[8], e[9], e[10], e[11], 0, 0]);
+                        let igtk = Some((le16(e, 4), k));
+                        // The same key again keeps its counter.
+                        if soft.igtk != igtk {
+                            soft.igtk = igtk;
+                            soft.igtk_ipn =
+                                u64::from_le_bytes([e[6], e[7], e[8], e[9], e[10], e[11], 0, 0]);
+                        }
                     }
                 }
                 _ => {}
@@ -1981,31 +2044,47 @@ impl Station {
         found
     }
 
-    fn install_gtk(&mut self, link: &mut impl Link, index: u8, key: &[u8]) -> bool {
+    /// Install group key `index`, its counter at `rsc`; the key it
+    /// already holds is left alone, counter and all (a retransmitted
+    /// message 3 or group message, or a replayed one, must not wind the
+    /// counter back: CVE-2017-13080).
+    fn install_gtk(&mut self, link: &mut impl Link, index: u8, key: &[u8], rsc: u64) -> bool {
         let group = match self.security {
             Security::Psk { group, .. } => group,
             _ => Cipher::Ccmp,
         };
-        if key.len() < 16 {
+        let len = if group == Cipher::Tkip && self.soft.is_none() {
+            32
+        } else {
+            16
+        };
+        if key.len() < len {
             return false;
         }
+        let i = index as usize & 3;
+        let mut k = [0u8; 32];
+        k[..len].copy_from_slice(&key[..len]);
+        if self.gtk_set & 1 << i != 0 && ccmp::constant_eq(&self.gtks[i], &k) {
+            return true;
+        }
+        self.gtks[i] = k;
+        self.gtk_set |= 1 << i;
+        self.group_rsc[i] = rsc;
         if let Some(soft) = self.soft.as_mut() {
             let mut k = [0u8; 16];
             k.copy_from_slice(&key[..16]);
             soft.gtk = Some((index, k));
-            soft.group_rx_pn = 0;
             return true;
         }
         let none = [0u8; 8];
         match group {
-            Cipher::Tkip if key.len() >= 32 => {
+            Cipher::Tkip => {
                 let mut tx_mic = [0u8; 8];
                 let mut rx_mic = [0u8; 8];
                 tx_mic.copy_from_slice(&key[24..32]);
                 rx_mic.copy_from_slice(&key[16..24]);
                 link.set_key(index, HwCipher::Tkip, &key[..16], &tx_mic, &rx_mic);
             }
-            Cipher::Tkip => return false,
             Cipher::Ccmp => link.set_key(index, HwCipher::Ccmp, &key[..16], &none, &none),
         }
         true
@@ -2036,9 +2115,9 @@ impl Station {
         let ok = match (n, self.security) {
             (Some(n), Security::Psk { wpa2: false, .. }) => {
                 // WPA: the bare key, in the slot the key information names.
-                index != 0 && self.install_gtk(link, index as u8, &plain[..n])
+                index != 0 && self.install_gtk(link, index as u8, &plain[..n], Self::key_rsc(f))
             }
-            (Some(n), _) => self.install_group_keys(link, &plain[..n]),
+            (Some(n), _) => self.install_group_keys(link, &plain[..n], Self::key_rsc(f)),
             (None, _) => false,
         };
         if !ok {
@@ -2230,6 +2309,8 @@ mod tests {
         now: u32,
         sent: Vec<Vec<u8>>,
         keys: Vec<(u8, Vec<u8>)>,
+        /// The packet number of the last frame handed in.
+        pn: u64,
     }
 
     impl Link for Air {
@@ -2290,12 +2371,28 @@ mod tests {
     }
 
     fn input(s: &mut Station, air: &mut Air, f: &[u8], decrypted: bool) -> Option<Delivery> {
+        air.pn += 1;
+        let pn = air.pn;
+        input_numbered(s, air, f, decrypted, pn)
+    }
+
+    /// A frame the stick opened (if `decrypted`) under packet number
+    /// `pn`, with CCMP's IV words.
+    fn input_numbered(
+        s: &mut Station,
+        air: &mut Air,
+        f: &[u8],
+        decrypted: bool,
+        pn: u64,
+    ) -> Option<Delivery> {
         let mut buf = [0u8; 2400];
         buf[..f.len()].copy_from_slice(f);
         let rx = Rx {
             len: f.len(),
             rssi: -40,
             decrypted,
+            iv: pn as u32 & 0xFFFF | 0x2000_0000 | (f[4] as u32 & 1) << 30,
+            eiv: (pn >> 16) as u32,
         };
         s.input(air, &mut buf, rx)
     }
@@ -2358,6 +2455,11 @@ mod tests {
     /// A group message (key 1) of replay counter `counter`, signed and
     /// its key data encrypted as version 1 does it (MD5, RC4).
     fn group_message(s: &Station, counter: u64, key: &[u8]) -> Vec<u8> {
+        group_message_at(s, counter, key, 0)
+    }
+
+    /// The same, the group key's counter at `rsc`.
+    fn group_message_at(s: &Station, counter: u64, key: &[u8], rsc: u64) -> Vec<u8> {
         let mut e = std::vec![0u8; 99];
         e[..2].copy_from_slice(&[1, 3]);
         e[4] = if matches!(s.security, Security::Psk { wpa2: false, .. }) {
@@ -2368,6 +2470,7 @@ mod tests {
         // Group, key 1, ack, MIC, secure; version 1.
         e[5..7].copy_from_slice(&0x0391u16.to_be_bytes());
         e[9..17].copy_from_slice(&counter.to_be_bytes());
+        e[65..73].copy_from_slice(&rsc.to_le_bytes());
         e[97..99].copy_from_slice(&(key.len() as u16).to_be_bytes());
         let mut data = key.to_vec();
         let mut k = [0u8; 32];
@@ -2381,6 +2484,63 @@ mod tests {
         let mut body = LLC_EAPOL.to_vec();
         body.extend_from_slice(&e);
         from_ap(0, &OWN, &body)
+    }
+
+    /// The stick opens frames and checks none of their packet numbers
+    /// (its descriptor gives them); the station did not either: a frame
+    /// recorded on the air and sent again went up twice.
+    #[test]
+    fn frames_the_stick_opened_are_not_taken_twice() {
+        let mut s = running(WPA2);
+        let mut air = Air::default();
+        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
+        let unicast = from_ap(0, &OWN, &ip);
+        let group = from_ap(0, &BROADCAST, &ip);
+        for (f, pn, up) in [
+            (&unicast, 5, true),
+            (&unicast, 5, false),
+            (&unicast, 4, false),
+            (&unicast, 6, true),
+            // Group frames count apart, by key.
+            (&group, 3, true),
+            (&group, 3, false),
+            (&group, 7, true),
+        ] {
+            let got = input_numbered(&mut s, &mut air, f, true, pn);
+            assert_eq!(got.is_some(), up, "{pn}");
+        }
+    }
+
+    /// A group message handed over again (the access point retransmits
+    /// it when the answer is lost; anyone can replay it) installed the
+    /// same key again, its counter back at zero: every broadcast frame
+    /// recorded since went up again (CVE-2017-13080). And the counter
+    /// the message gave for the key was ignored.
+    #[test]
+    fn a_group_key_handed_over_again_keeps_its_counter() {
+        let mut s = running(Security::Psk {
+            wpa2: true,
+            group: Cipher::Ccmp,
+            pairwise: Some(Cipher::Tkip),
+        });
+        s.ptk = [0x5C; 64];
+        let mut kde = std::vec![0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0];
+        kde.extend_from_slice(&[0x47; 16]);
+        let mut air = Air::default();
+        let f = group_message_at(&s, 1, &kde, 100);
+        input(&mut s, &mut air, &f, true);
+        assert_eq!(air.keys, [(1, std::vec![0x47; 16])]);
+        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
+        let group = from_ap(0, &BROADCAST, &ip);
+        // At or below the counter the access point gave: old frames.
+        assert!(input_numbered(&mut s, &mut air, &group, true, 100).is_none());
+        assert!(input_numbered(&mut s, &mut air, &group, true, 101).is_some());
+        // The same key again.
+        let f = group_message_at(&s, 2, &kde, 0);
+        input(&mut s, &mut air, &f, true);
+        assert_eq!(air.keys.len(), 1, "installed again");
+        assert!(input_numbered(&mut s, &mut air, &group, true, 101).is_none());
+        assert_eq!(s.state, State::Run);
     }
 
     /// WPA with a CCMP group key: a group message whose key data is
@@ -2535,7 +2695,18 @@ mod tests {
         let mut s = running(WPA2);
         s.state = State::Idle;
         let mut air = Air::default();
-        s.auth(&mut air, b"Terrier", &AP, &AP, 6, 1, false, CRYPT_NONE, &[], &[]);
+        s.auth(
+            &mut air,
+            b"Terrier",
+            &AP,
+            &AP,
+            6,
+            1,
+            false,
+            CRYPT_NONE,
+            &[],
+            &[],
+        );
         let mut cleared: Vec<u8> = air.keys.iter().map(|(i, _)| *i).collect();
         cleared.sort();
         assert_eq!(cleared, [0, 1, 2, 3]);

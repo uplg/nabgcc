@@ -143,6 +143,9 @@ pub struct Air {
     now: u32,
     rng: u64,
     rx: VecDeque<(Vec<u8>, Rx)>,
+    /// Frames handed over so far: what the stick's descriptor says of
+    /// their packet numbers, always new.
+    pushed: u32,
     /// Calls the station made: a bound on its work for one input.
     work: u64,
     pmk: [u8; 32],
@@ -164,6 +167,7 @@ impl Air {
             now: 1000,
             rng: 0x1234_5678_9ABC_DEF1,
             rx: VecDeque::new(),
+            pushed: 0,
             work: 0,
             pmk,
             keys: Keys {
@@ -296,12 +300,15 @@ impl Air {
         // nothing.
         let decrypted = decrypted && matches!(self.kind, Kind::Wep { .. } | Kind::Psk { .. });
         if self.rx.len() < 64 {
+            self.pushed += 1;
             self.rx.push_back((
                 frame.clone(),
                 Rx {
                     len: frame.len(),
                     rssi,
                     decrypted,
+                    iv: 0,
+                    eiv: self.pushed,
                 },
             ));
         }

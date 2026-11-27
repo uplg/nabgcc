@@ -6,8 +6,9 @@ use core::cell::UnsafeCell;
 use crate::sync::Shared;
 
 const SIZE: usize = 16 * 1024;
-/// What precedes each frame: length, signal strength, flags.
-const HEADER: usize = 4;
+/// What precedes each frame: length, signal strength, flags, then the
+/// IV and extended IV of the stick's descriptor.
+const HEADER: usize = 12;
 
 struct Ring(UnsafeCell<[u8; SIZE]>);
 // SAFETY: the writer only touches bytes between `TAIL` and `HEAD`'s
@@ -27,6 +28,10 @@ pub struct Received {
     pub rssi: i8,
     /// The stick decrypted it.
     pub decrypted: bool,
+    /// Words 2 and 3 of the receive descriptor: the frame's IV and
+    /// extended IV, which hold its packet number.
+    pub iv: u32,
+    pub eiv: u32,
 }
 
 fn byte(at: usize) -> *mut u8 {
@@ -36,7 +41,7 @@ fn byte(at: usize) -> *mut u8 {
 
 /// From the interrupt handler: queue a frame, or drop it if there is
 /// no room.
-pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool) {
+pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool, iv: u32, eiv: u32) {
     let (head, tail) = (HEAD.get(), TAIL.get());
     // The indexes are volatile, the bytes are not: without these fences
     // the compiler may move a byte's access across an index's, and the
@@ -47,11 +52,21 @@ pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool) {
         DROPPED.set(DROPPED.get() + 1);
         return;
     }
+    let [i0, i1, i2, i3] = iv.to_le_bytes();
+    let [e0, e1, e2, e3] = eiv.to_le_bytes();
     let header = [
         frame.len() as u8,
         (frame.len() >> 8) as u8,
         rssi as u8,
         decrypted as u8,
+        i0,
+        i1,
+        i2,
+        i3,
+        e0,
+        e1,
+        e2,
+        e3,
     ];
     for (i, b) in header.iter().chain(frame).enumerate() {
         // SAFETY: free space, checked above.
@@ -73,10 +88,13 @@ pub(super) fn pop(out: &mut [u8]) -> Option<Received> {
         // SAFETY: bytes the writer has finished with.
         let at = |i: usize| unsafe { byte(tail + i).read() };
         let len = at(0) as usize | (at(1) as usize) << 8;
+        let word = |i: usize| u32::from_le_bytes([at(i), at(i + 1), at(i + 2), at(i + 3)]);
         let info = Received {
             len,
             rssi: at(2) as i8,
             decrypted: at(3) != 0,
+            iv: word(4),
+            eiv: word(8),
         };
         let fits = len <= out.len();
         if fits {

@@ -111,6 +111,7 @@ impl Link for World {
             let protected = f.len() > 28 && f[1] & 0x40 != 0 && f[0] & 0x0C == 0x08;
             let mut out = f.clone();
             let mut decrypted = false;
+            let (mut iv, mut eiv) = (0, 0);
             if protected {
                 let index = (f[27] >> 6) as usize;
                 if let Some(slot) = &self.keys[index] {
@@ -120,9 +121,10 @@ impl Link for World {
                         mic: &slot.rx_mic,
                     };
                     match crypto::unprotect(&key, &f) {
-                        Ok((clear, _, _)) => {
+                        Ok((clear, i, e)) => {
                             out = clear;
                             decrypted = true;
+                            (iv, eiv) = (i, e);
                         }
                         Err(_) => {
                             self.cipher_errors += 1;
@@ -136,6 +138,8 @@ impl Link for World {
                 len: out.len(),
                 rssi: -50,
                 decrypted,
+                iv,
+                eiv,
             });
         }
     }
@@ -310,6 +314,28 @@ fn joins_wpa2() {
     assert!(!sta.is_wpa3());
     talks(&mut w, &mut sta);
     assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
+}
+
+/// A frame the access point sent, recorded and sent again by someone
+/// else: the stick opens it a second time without a word, and the
+/// station handed it up twice.
+#[test]
+fn a_frame_sent_again_goes_up_once() {
+    for security in [Security::wpa2(PASSPHRASE), Security::wpa(PASSPHRASE)] {
+        let mut w = World::new(security, Wpa3::Off);
+        let mut sta = Station::new();
+        join(&mut w, &mut sta, &pmk(), &[]);
+        assert_eq!(sta.net_state(), wifi::S_CONNECTED);
+        for to in [STA, [0xFF; 6]] {
+            w.aps[0].send(&mut w.radio, &ethernet(to, [2, 0, 0, 0, 0, 1], b"une fois"));
+            let recorded = w.radio.rx.back().unwrap().clone();
+            w.radio.rx.push_back(recorded);
+            let mut up = Vec::new();
+            run(&mut w, &mut sta, 20, &mut up);
+            let n = up.iter().filter(|f| f.ends_with(b"une fois")).count();
+            assert_eq!(n, 1, "to {to:x?}");
+        }
+    }
 }
 
 #[test]

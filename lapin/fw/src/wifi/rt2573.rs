@@ -234,7 +234,12 @@ fn on_packet(packet: &[u8]) {
         return;
     }
     let rssi = (buffer[5] as i16 - RSSI_TO_DBM).clamp(-128, 127) as i8;
-    rxq::push(&buffer[24..24 + len], rssi, cipher != 0);
+    // Words 2 and 3: the IV and extended IV of what the stick opened
+    // (as Linux's rt73usb reads them), for the replay check it leaves
+    // to us.
+    let word =
+        |i: usize| u32::from_le_bytes([buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]);
+    rxq::push(&buffer[24..24 + len], rssi, cipher != 0, word(8), word(12));
 }
 
 impl Stick {
