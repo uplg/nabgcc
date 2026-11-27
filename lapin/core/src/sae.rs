@@ -156,6 +156,7 @@ impl Commit {
 }
 
 /// One run of the exchange, for one end.
+#[derive(Clone)]
 pub struct Session {
     element: Point,
     rand: Limbs,

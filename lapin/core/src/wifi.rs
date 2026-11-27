@@ -99,6 +99,9 @@ const RUN_TIMEOUT: u32 = 600;
 const EAPOL_TIMEOUT: u32 = 600;
 const STA_ASSOC_TIMEOUT: u32 = 200;
 const STA_MAX_IDLE: u32 = 3000;
+/// The longest association comeback time waited for, in time units
+/// (1.024 ms): access points ask for one second.
+const MAX_COMEBACK_TU: u32 = 10_000;
 const MAX_STATIONS: usize = 5;
 const RSSI_SAMPLES: usize = 15;
 /// How long the scan listens on each channel: one beacon interval
@@ -225,6 +228,7 @@ struct SoftKeys {
 }
 
 /// A password exchange under way.
+#[derive(Clone)]
 struct SaeRun {
     session: sae::Session,
     /// The commit, to send again with an anti-clogging token.
@@ -232,6 +236,7 @@ struct SaeRun {
     confirmed: bool,
 }
 
+#[derive(Clone)]
 pub struct Station {
     pub mode: Mode,
     pub state: State,
@@ -1271,10 +1276,13 @@ impl Station {
                 if status == 30 && self.is_wpa3() {
                     // Refused for now: the access point is asking our
                     // old association whether it is still alive (after a
-                    // restart, say). Come back when it says.
+                    // restart, say). Come back when it says, within ten
+                    // seconds: a longer wait (up to fifty days, and the
+                    // frame is unprotected) counts as a refusal.
                     let tu = elements(&frame[30..len])
                         .find(|(id, e)| *id == 56 && e.len() == 5 && e[0] == 3)
-                        .map(|(_, e)| u32::from_le_bytes([e[1], e[2], e[3], e[4]]));
+                        .map(|(_, e)| u32::from_le_bytes([e[1], e[2], e[3], e[4]]))
+                        .filter(|tu| *tu <= MAX_COMEBACK_TU);
                     match tu {
                         Some(tu) => {
                             let ms = (tu * 1024).div_ceil(1000);
@@ -1469,7 +1477,7 @@ impl Station {
             None
         };
         if let Some(code) = refuse {
-            return self.send_auth(link, sta, algorithm, seq + 1, code);
+            return self.send_auth(link, sta, algorithm, seq.wrapping_add(1), code);
         }
         let slot = self
             .peer(sta)
@@ -1560,6 +1568,12 @@ impl Station {
             *last = pn;
             len = n;
             decrypted = true;
+        }
+        if frame[1] & 0x40 != 0 && !decrypted {
+            // Still sealed: the stick had no key for it (it hands such
+            // frames up as they came). What follows the header is
+            // whatever the sender wrote, in clear: not to be believed.
+            return None;
         }
         match frame[0] & 0xF0 {
             0x00 => {
@@ -1685,7 +1699,9 @@ impl Station {
             return;
         }
         let declared = be16(f, 2) as usize + 4;
-        if declared > f.len() {
+        // The length it declares may cut the frame short, but not
+        // before the end of its fixed fields.
+        if declared < 99 || declared > f.len() {
             return;
         }
         let f = &mut f[..declared];
@@ -1725,7 +1741,17 @@ impl Station {
         }
         if !rekey {
             self.keys = KeyState::Msg1;
+            // A rekey left half done (the link went down between its
+            // messages 1 and 3) is over: its keys would sign this
+            // handshake, and every one after it.
+            self.next_ptk = None;
         }
+        // Message 2 answers with this counter. Message 1 carries no
+        // integrity code: on a running link, its counter is not adopted
+        // (a forged one, huge, would make every genuine frame after it
+        // look replayed); it is during the handshake, which waits for
+        // it, as in the C.
+        let earned = self.replay;
         self.replay.copy_from_slice(&f[9..17]);
         self.replay_active = true;
         if let Security::Psk {
@@ -1753,6 +1779,7 @@ impl Station {
         let n = self.own_element(&mut e);
         self.send_key(link, 0x0008 | 0x0100, &snonce, &e[..n]);
         if rekey {
+            self.replay = earned;
             return;
         }
         // The pairwise key goes in now, as the C driver did: message 4
@@ -1956,6 +1983,9 @@ impl Station {
             Security::Psk { group, .. } => group,
             _ => Cipher::Ccmp,
         };
+        if key.len() < 16 {
+            return false;
+        }
         if let Some(soft) = self.soft.as_mut() {
             let mut k = [0u8; 16];
             k.copy_from_slice(&key[..16]);
@@ -1978,8 +2008,16 @@ impl Station {
         true
     }
 
+    /// A group message is signed with the keys in use: a rekey under
+    /// way (perhaps begun by a forged message 1) has not replaced them.
     #[inline(never)]
     fn group_message(&mut self, link: &mut impl Link, f: &mut [u8], info: u16) {
+        let pending = self.next_ptk.take();
+        self.group_message_current(link, f, info);
+        self.next_ptk = pending;
+    }
+
+    fn group_message_current(&mut self, link: &mut impl Link, f: &mut [u8], info: u16) {
         if self.keys != KeyState::Group && self.keys != KeyState::Run {
             return;
         }
@@ -2169,5 +2207,327 @@ impl Station {
             }
             _ => {}
         }
+    }
+}
+
+/// Frames found by fuzzing (`lapin/fuzz`), each of which halted the
+/// rabbit or got past a check; the station set up by hand in the state
+/// each one needs.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::vec::Vec;
+
+    const AP: Mac = [0x02, 0, 0, 0, 0, 0xA1];
+    const OWN: Mac = [0x00, 0x19, 0xDB, 0x9C, 0x28, 0x15];
+
+    #[derive(Default)]
+    struct Air {
+        now: u32,
+        sent: Vec<Vec<u8>>,
+        keys: Vec<(u8, Vec<u8>)>,
+    }
+
+    impl Link for Air {
+        fn mac(&self) -> Mac {
+            OWN
+        }
+        fn millis(&self) -> u32 {
+            self.now
+        }
+        fn transmit(&mut self, frame: &[u8], _: &Tx) -> bool {
+            self.sent.push(frame.to_vec());
+            true
+        }
+        fn receive(&mut self, _: &mut [u8]) -> Option<Rx> {
+            None
+        }
+        fn set_channel(&mut self, _: u8) {}
+        fn set_bssid(&mut self, _: &Mac) {}
+        fn set_key(&mut self, i: u8, _: HwCipher, key: &[u8], _: &[u8; 8], _: &[u8; 8]) {
+            self.keys.push((i, key.to_vec()));
+        }
+        fn set_beacon(&mut self, _: Option<&[u8]>) {}
+        fn set_answer_rates(&mut self, _: u16) {}
+        fn pause(&mut self) {}
+        fn random(&mut self, out: &mut [u8]) {
+            out.fill(0x33);
+        }
+    }
+
+    /// A station on a running link to `AP`.
+    fn running(security: Security) -> Station {
+        let mut s = Station::new();
+        s.ap = AP;
+        s.bssid = AP;
+        s.security = security;
+        s.state = State::Run;
+        s.timeout = RUN_TIMEOUT;
+        s.keys = KeyState::Run;
+        s
+    }
+
+    const WPA2: Security = Security::Psk {
+        wpa2: true,
+        group: Cipher::Ccmp,
+        pairwise: Some(Cipher::Ccmp),
+    };
+
+    /// A data frame from the access point, `fc1` its flags beyond
+    /// "from the network".
+    fn from_ap(fc1: u8, to: &Mac, body: &[u8]) -> Vec<u8> {
+        let mut f = std::vec![0x08, 0x02 | fc1, 0, 0];
+        f.extend_from_slice(to);
+        f.extend_from_slice(&AP);
+        f.extend_from_slice(&AP);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(body);
+        f
+    }
+
+    fn input(s: &mut Station, air: &mut Air, f: &[u8], decrypted: bool) -> Option<Delivery> {
+        let mut buf = [0u8; 2400];
+        buf[..f.len()].copy_from_slice(f);
+        let rx = Rx {
+            len: f.len(),
+            rssi: -40,
+            decrypted,
+        };
+        s.input(air, &mut buf, rx)
+    }
+
+    /// An EAPOL-Key frame whose length field says less than its fixed
+    /// fields take: it was cut there, and every field read past the cut
+    /// panicked. In clear, and before any integrity check: anyone near
+    /// the rabbit could halt it.
+    #[test]
+    fn an_eapol_frame_shorter_than_its_fields_is_dropped() {
+        for declared in [0u16, 8, 50, 94] {
+            let mut s = running(WPA2);
+            s.replay_active = true;
+            let mut e = std::vec![0u8; 99];
+            e[..2].copy_from_slice(&[2, 3]);
+            e[2..4].copy_from_slice(&declared.to_be_bytes());
+            e[4] = 2;
+            // Message 3: pairwise, ack, MIC, secure.
+            e[5..7].copy_from_slice(&0x038Au16.to_be_bytes());
+            e[9..17].fill(0xFF);
+            let mut body = LLC_EAPOL.to_vec();
+            body.extend_from_slice(&e);
+            let mut air = Air::default();
+            assert_eq!(
+                input(&mut s, &mut air, &from_ap(0, &OWN, &body), false),
+                None
+            );
+            assert_eq!(s.state, State::Run);
+            assert!(air.sent.is_empty());
+        }
+    }
+
+    /// A frame with its protected bit set that the stick could not open
+    /// (no key in the slot its header names: the stick hands it up as
+    /// it came) was handed to the bytecode: whoever sent it could
+    /// write, in clear, what the rabbit received on a WPA2 link.
+    #[test]
+    fn a_frame_still_sealed_is_not_handed_up() {
+        // The CCMP header names key 3; then an IP datagram, in clear.
+        let mut body = std::vec![0, 0, 0, 0xE0, 0, 0, 0, 0];
+        body.extend_from_slice(&[0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20]);
+        for security in [
+            WPA2,
+            Security::Open,
+            Security::Wep {
+                key: [7; 13],
+                long: true,
+            },
+        ] {
+            let mut s = running(security);
+            let mut air = Air::default();
+            let sealed = from_ap(0x40, &BROADCAST, &body);
+            assert_eq!(input(&mut s, &mut air, &sealed, false), None);
+            // What the stick did open still goes up.
+            let opened = from_ap(0, &BROADCAST, &body[8..]);
+            assert!(input(&mut s, &mut air, &opened, true).is_some());
+        }
+    }
+
+    /// A group message (key 1) of replay counter `counter`, signed and
+    /// its key data encrypted as version 1 does it (MD5, RC4).
+    fn group_message(s: &Station, counter: u64, key: &[u8]) -> Vec<u8> {
+        let mut e = std::vec![0u8; 99];
+        e[..2].copy_from_slice(&[1, 3]);
+        e[4] = if matches!(s.security, Security::Psk { wpa2: false, .. }) {
+            0xFE
+        } else {
+            2
+        };
+        // Group, key 1, ack, MIC, secure; version 1.
+        e[5..7].copy_from_slice(&0x0391u16.to_be_bytes());
+        e[9..17].copy_from_slice(&counter.to_be_bytes());
+        e[97..99].copy_from_slice(&(key.len() as u16).to_be_bytes());
+        let mut data = key.to_vec();
+        let mut k = [0u8; 32];
+        k[16..].copy_from_slice(&s.ptk[16..32]);
+        rc4(&k, 256, &mut data);
+        e.extend_from_slice(&data);
+        let n = e.len() as u16 - 4;
+        e[2..4].copy_from_slice(&n.to_be_bytes());
+        let mic = hmac_md5(&s.ptk[..16], &[&e]);
+        e[81..97].copy_from_slice(&mic);
+        let mut body = LLC_EAPOL.to_vec();
+        body.extend_from_slice(&e);
+        from_ap(0, &OWN, &body)
+    }
+
+    /// WPA with a CCMP group key: a group message whose key data is
+    /// shorter than a key had the station read sixteen bytes of it.
+    #[test]
+    fn a_group_key_too_short_is_refused() {
+        let mut s = running(Security::Psk {
+            wpa2: false,
+            group: Cipher::Ccmp,
+            pairwise: Some(Cipher::Tkip),
+        });
+        s.ptk = [0x5C; 64];
+        let f = group_message(&s, 1, &[0xAB; 8]);
+        let mut air = Air::default();
+        assert_eq!(input(&mut s, &mut air, &f, true), None);
+        // Answered (message 2 of the group handshake), not installed:
+        // the link starts over.
+        assert_eq!(air.sent.len(), 1);
+        assert!(air.keys.is_empty());
+        assert_eq!(s.state, State::Idle);
+    }
+
+    /// A message 1 on a running link (anyone can send one: it carries
+    /// no integrity code) with the largest replay counter. The station
+    /// took the counter as the newest, and refused every genuine frame
+    /// after it as replayed; and it checked the next group message
+    /// with the keys of the rekey that message 1 began, which the
+    /// access point knew nothing of. Either way the next group rekey
+    /// failed and the link went down.
+    #[test]
+    fn a_forged_message_1_does_not_move_the_replay_counter() {
+        let mut s = running(Security::Psk {
+            wpa2: true,
+            group: Cipher::Ccmp,
+            pairwise: Some(Cipher::Tkip),
+        });
+        s.ptk = [0x5C; 64];
+        s.replay = 5u64.to_be_bytes();
+        s.replay_active = true;
+        let mut e = std::vec![0u8; 99];
+        e[..2].copy_from_slice(&[2, 3]);
+        e[2..4].copy_from_slice(&95u16.to_be_bytes());
+        e[4] = 2;
+        e[5..7].copy_from_slice(&0x0089u16.to_be_bytes());
+        e[9..17].fill(0xFF);
+        e[17..49].fill(0x77);
+        let mut body = LLC_EAPOL.to_vec();
+        body.extend_from_slice(&e);
+        let mut air = Air::default();
+        input(&mut s, &mut air, &from_ap(0, &OWN, &body), true);
+        // Answered, with its counter.
+        assert_eq!(air.sent.len(), 1);
+        assert_eq!(air.sent[0][24 + 8 + 9..24 + 8 + 17], [0xFF; 8]);
+        // The access point's next group key still goes in.
+        let mut kde = std::vec![0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0];
+        kde.extend_from_slice(&[0x47; 16]);
+        let f = group_message(&s, 6, &kde);
+        input(&mut s, &mut air, &f, true);
+        assert_eq!(air.keys, [(1, std::vec![0x47; 16])]);
+        assert_eq!(s.state, State::Run);
+    }
+
+    /// A rekey begun (message 1 on a running link, which anyone can
+    /// send) and never finished: its keys stayed, and signed every
+    /// handshake after it. The link went down and never came back up
+    /// until the rabbit restarted.
+    #[test]
+    fn a_rekey_left_half_done_does_not_sign_the_next_handshake() {
+        let mut s = running(Security::Psk {
+            wpa2: true,
+            group: Cipher::Ccmp,
+            pairwise: Some(Cipher::Tkip),
+        });
+        let msg1 = |anonce: u8| {
+            let mut e = std::vec![0u8; 99];
+            e[..2].copy_from_slice(&[2, 3]);
+            e[2..4].copy_from_slice(&95u16.to_be_bytes());
+            e[4] = 2;
+            e[5..7].copy_from_slice(&0x0089u16.to_be_bytes());
+            e[9..17].copy_from_slice(&1u64.to_be_bytes());
+            e[17..49].fill(anonce);
+            let mut body = LLC_EAPOL.to_vec();
+            body.extend_from_slice(&e);
+            from_ap(0, &OWN, &body)
+        };
+        let mut air = Air::default();
+        input(&mut s, &mut air, &msg1(0x77), true);
+        assert!(s.next_ptk.is_some());
+        // The link goes down; a new association, a new handshake.
+        s.state = State::Eapol;
+        s.keys = KeyState::Msg1;
+        s.replay_active = false;
+        air.sent.clear();
+        input(&mut s, &mut air, &msg1(0x66), false);
+        let mut msg2 = air.sent[0][24 + 8..].to_vec();
+        let mic: [u8; 16] = msg2[81..97].try_into().unwrap();
+        msg2[81..97].fill(0);
+        assert_eq!(mic, hmac_md5(&s.ptk[..16], &[&msg2]));
+        assert_eq!(s.keys, KeyState::Msg3);
+    }
+
+    /// WPA3: an association refused for now, "come back in" fifty days
+    /// (a time interval of 2^32 - 1 units). The multiplication wrapped,
+    /// and the station waited in the association state for as long as
+    /// the access point (or anyone using its address) asked.
+    #[test]
+    fn a_comeback_time_too_long_is_a_refusal() {
+        for (tu, waits) in [
+            (1000u32, true),
+            (10_000, true),
+            (10_001, false),
+            (u32::MAX, false),
+        ] {
+            let mut s = running(Security::Sae { h2e: false });
+            s.state = State::Assoc;
+            s.timeout = ASSOC_TIMEOUT;
+            let mut f = std::vec![0x10, 0, 0, 0];
+            f.extend_from_slice(&OWN);
+            f.extend_from_slice(&AP);
+            f.extend_from_slice(&AP);
+            f.extend_from_slice(&[0, 0, 0x01, 0, 30, 0, 1, 0xC0]);
+            f.extend_from_slice(&[56, 5, 3]);
+            f.extend_from_slice(&tu.to_le_bytes());
+            let mut air = Air::default();
+            input(&mut s, &mut air, &f, false);
+            if waits {
+                assert_eq!(s.state, State::Assoc);
+                assert!(s.timeout <= ASSOC_TIMEOUT + 52);
+                assert!(s.retry_assoc_at.is_some());
+            } else {
+                assert_eq!(s.state, State::Idle);
+            }
+        }
+    }
+
+    /// The access point mode answers an authentication of any sequence
+    /// number with the next one, as the C did (in 16 bits).
+    #[test]
+    fn the_access_point_refuses_the_last_sequence_number() {
+        let mut s = Station::new();
+        let mut air = Air::default();
+        s.set_mode(&mut air, true, b"Nabaztag", 4);
+        air.sent.clear();
+        let mut f = std::vec![0xB0, 0, 0, 0];
+        f.extend_from_slice(&OWN);
+        f.extend_from_slice(&AP);
+        f.extend_from_slice(&OWN);
+        f.extend_from_slice(&[0, 0, 0, 0, 0xFF, 0xFF, 0, 0]);
+        input(&mut s, &mut air, &f, false);
+        assert_eq!(air.sent.len(), 1);
+        assert_eq!(air.sent[0][26..30], [0, 0, 14, 0]);
     }
 }
