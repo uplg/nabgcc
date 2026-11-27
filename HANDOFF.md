@@ -38,7 +38,7 @@ passes in the emulator everything the C firmware passes there.
 | 3. 802.11 station and access point: WEP, WPA, WPA2, WPA3 | done, in `lapin/core/src/wifi.rs` |
 | 4. Metal virtual machine, to run the boot bytecode and garenne as they are | done, `lapin/metal`, checked word for word against the C machine (`lapin/cref`) |
 | 5. Resident loader, so a failed update no longer kills the rabbit | done: the rescue core (see below) |
-| 6. Size, soak, then a real rabbit | size 110.8 KB (rescue core included), 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
+| 6. Size, soak, then a real rabbit | size 115.4 KB (rescue core included), two hours of garenne soaked, an independent review's findings fixed, in the emulator; the real rabbit waits for Léonard's go |
 
 Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
@@ -46,8 +46,8 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 110.8
-KB, the boot bytecode's 27.6 KB included, packed to 16 KB, and the rescue core's 20 KB: 13.2 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 115.4
+KB, the boot bytecode's 27.6 KB included, packed to 16 KB, and the rescue core's 20 KB: 11.3 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -97,21 +97,40 @@ the arrival times, strengths and first bytes of received frames, and
 the main loop's rhythm. Unmeasured on a real rabbit.
 
 **The rescue core.** The first 20 KB of the flash (`lapin/fw/src/bin/rescue.rs`,
-`boot.rs`, `rescue.rs`, 18.5 KB) hold the vectors and a core that
+`boot.rs`, `rescue.rs`, 18.9 KB) hold the vectors and a core that
 the application's updates never write: the firmware proper is an
-application after it, with a header (length, CRC-32) the core checks
-at every start. An update that brings the same core (`lapin-full.bin`
+application after it, with a header (length, CRC-32, entry) the core
+checks at every start; the core itself ends on a trailer (magic,
+CRC-32). An update that brings the same core (`lapin-full.bin`
 from `lapin/build.sh`, as clapier sends it) rewrites the application
 alone. When the application is missing or damaged, or has restarted
 three times without running a minute, the core raises an open network
 "Nabaztag-secours-XXXX" (192.168.0.1, DHCP) with a page to send it
 `lapin-full.bin` from a phone; with an application in place it gives
-it another try after ten idle minutes, or at once from the page.
+it another try after ten minutes without a request, or at once from
+the page. The button held 20 seconds from power-on (setup takes 2, the
+factory test 8) asks a running application for the rescue core.
 Léonard chose this over a download from clapier: no server change.
 `tools/emu/tests/rescue.rs` cuts the power at 17 points of an update:
-the rabbit always comes back. An image that does not bring the same
-core (the C firmware, a new core) still rewrites the whole flash, with
-the old risk.
+the rabbit always comes back. An image with a new core is written
+whole only when both its parts check (a power cut in its first 20 KB
+still kills the rabbit: there is one core); one that starts as lapin
+but is damaged or cut is refused. The C firmware's images are still
+written whole, unchecked, with the old risk (Léonard to decide whether
+to keep that way back).
+
+**The review.** Three independent reviews (station and crypto, the
+machine against the C, the firmware and rescue core) found about forty
+problems, fixed with a test each: among them a WPA3 link that never
+noticed its access point had forgotten it (SA Query now), no replay
+check on frames the stick decrypts, a transition network forced down
+to WPA2, a group key reinstalled (KRACK), the curve arithmetic not
+constant-time, a collector that could loop, a USB timeout that froze
+the rabbit with the watchdog fed, and an image cut short that rewrote
+the rescue core. `tools/emu/tests/hardening.rs`, `wifi_review.rs`,
+`odd_audio.rs` and `lapin/cref/tests/ops.rs` hold the tests. A WPA
+(TKIP) link now reports itself up after its group key, not at
+message 3: timing only for the bytecode.
 
 **WPA3.** The bytecode knows nothing of it: an RSN network offering
 SAE is reported as WPA2, and the station uses SAE when the settings
