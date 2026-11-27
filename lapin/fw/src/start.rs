@@ -71,6 +71,8 @@ trap:
 
 /// Makes sure the reset code above is linked into the image.
 pub fn link() {
+    // SAFETY: `_start` is the reset code's label above; only its address
+    // is taken, never a byte read through it.
     unsafe extern "C" {
         static _start: u8;
     }

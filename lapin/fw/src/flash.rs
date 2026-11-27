@@ -28,6 +28,9 @@ const WDTCON: *mut u8 = 0xB7E0_0000 as *mut u8;
 // no branch out of the RAM code.
 
 /// Wait for the flash's command to complete.
+///
+/// # Safety
+/// Only from code running in RAM, interrupts off.
 #[inline(always)]
 unsafe fn flash_wait() {
     // SAFETY: a register of the processor.
@@ -35,6 +38,9 @@ unsafe fn flash_wait() {
 }
 
 /// The unlock sequence of a flash command, then the command.
+///
+/// # Safety
+/// As [`flash_wait`]; the flash then runs the command.
 #[inline(always)]
 unsafe fn flash_command(command: u8) {
     // SAFETY: the command registers of the flash, the routine in RAM.
@@ -46,6 +52,8 @@ unsafe fn flash_command(command: u8) {
     }
 }
 
+/// # Safety
+/// As [`flash_wait`]; `at` is a sector of the flash, which is erased.
 #[inline(always)]
 unsafe fn erase_sector(at: *mut u8) {
     // SAFETY: as above; `at` is a sector of the flash.
@@ -59,6 +67,9 @@ unsafe fn erase_sector(at: *mut u8) {
 }
 
 /// Program one word (skipped when all ones, the erased value).
+///
+/// # Safety
+/// As [`flash_wait`]; `at` is a word of the flash, erased.
 #[inline(always)]
 unsafe fn program_word(at: *mut u8, word: u32) {
     if word == u32::MAX {
@@ -77,6 +88,10 @@ unsafe fn program_word(at: *mut u8, word: u32) {
 
 /// Erase the sector at `address` and program it with the 4096 bytes at
 /// `data` (word aligned, outside the flash).
+///
+/// # Safety
+/// Interrupts off; `address` is a sector of the flash other than the
+/// running code's, `data` 4096 readable bytes outside the flash.
 #[unsafe(link_section = ".data.ramcode")]
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -97,6 +112,10 @@ unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
 /// Rewrite the flash from its first sector with the `len` bytes at
 /// `image`, feeding the watchdog after every word; then stop feeding
 /// it and wait: the watchdog restarts the board on the new image.
+///
+/// # Safety
+/// Interrupts off for good; `image` is `len` readable bytes outside the
+/// flash, word aligned, `len` at most the flash below the settings.
 #[unsafe(link_section = ".data.ramcode")]
 #[unsafe(no_mangle)]
 #[inline(never)]

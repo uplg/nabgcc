@@ -9,7 +9,6 @@
 
 use crate::sync::Shared;
 use crate::{irq, reg, timer, watchdog};
-
 const CHIP: usize = 0xF000_0000;
 /// The controller's RAM, which it sees at the same addresses we do.
 const RAM: usize = CHIP + 0x1000;
@@ -265,6 +264,9 @@ fn retire(td: usize) {
         let buffer = RX_BUFFERS + slot * PACKET;
         let end = word(td + 4).read() as usize;
         let len = if end == 0 { PACKET } else { end - buffer };
+        // The buffer is read plainly between the descriptor's register
+        // reads and writes: keep it there.
+        crate::sync::barrier();
         if condition == 0 {
             if let Some(handler) = RX_HANDLER.get() {
                 // SAFETY: the controller is done with this buffer until
@@ -275,6 +277,7 @@ fn retire(td: usize) {
             BULK_ERRORS.set(BULK_ERRORS.get() + 1);
             clear_halt(ED_IN);
         }
+        crate::sync::barrier();
         queue_rx(td);
     } else if (TD_OUT..TD_OUT + 32).contains(&td) {
         if condition != 0 {
@@ -529,6 +532,9 @@ pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
     }
     // SAFETY: the buffer is ours until the descriptor is queued.
     fill(unsafe { core::slice::from_raw_parts_mut(TX_BUFFER as *mut u8, len) });
+    // The buffer is written plainly, the controller started by register
+    // writes: the frame must be all there before.
+    crate::sync::barrier();
     irq::free(|| {
         TX_BUSY.set(true);
         let td = word(ED_OUT + 4).read() as usize;

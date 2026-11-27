@@ -29,3 +29,13 @@ impl<T: Copy> Shared<T> {
         unsafe { self.0.get().write_volatile(value) }
     }
 }
+
+/// No memory access moves across this, in either direction: what
+/// `compiler_fence` would be, but on this target it becomes a call to
+/// `__sync_synchronize`, which does not exist. Emits no instruction.
+#[inline(always)]
+pub fn barrier() {
+    // SAFETY: an empty instruction sequence; without `nomem` the
+    // compiler must assume it reads and writes any memory.
+    unsafe { core::arch::asm!("", options(nostack, preserves_flags)) }
+}

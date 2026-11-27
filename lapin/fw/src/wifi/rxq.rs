@@ -38,6 +38,10 @@ fn byte(at: usize) -> *mut u8 {
 /// no room.
 pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool) {
     let (head, tail) = (HEAD.get(), TAIL.get());
+    // The indexes are volatile, the bytes are not: without these fences
+    // the compiler may move a byte's access across an index's, and the
+    // other side see a frame half written, or have it overwritten.
+    crate::sync::barrier();
     let used = head.wrapping_sub(tail);
     if frame.len() > 0xFFFF || used + HEADER + frame.len() > SIZE {
         DROPPED.set(DROPPED.get() + 1);
@@ -53,6 +57,7 @@ pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool) {
         // SAFETY: free space, checked above.
         unsafe { byte(head + i).write(*b) };
     }
+    crate::sync::barrier();
     HEAD.set(head + HEADER + frame.len());
 }
 
@@ -64,6 +69,7 @@ pub(super) fn pop(out: &mut [u8]) -> Option<Received> {
         if tail == HEAD.get() {
             return None;
         }
+        crate::sync::barrier();
         // SAFETY: bytes the writer has finished with.
         let at = |i: usize| unsafe { byte(tail + i).read() };
         let len = at(0) as usize | (at(1) as usize) << 8;
@@ -78,6 +84,7 @@ pub(super) fn pop(out: &mut [u8]) -> Option<Received> {
                 *slot = at(HEADER + i);
             }
         }
+        crate::sync::barrier();
         TAIL.set(tail + HEADER + len);
         if fits {
             return Some(info);

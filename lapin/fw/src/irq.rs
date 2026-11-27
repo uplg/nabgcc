@@ -19,6 +19,7 @@ pub const SYSTEM_TIMER: u32 = 0;
 /// External interrupt 2: the USB controller.
 pub const USB: u32 = 36;
 
+// SAFETY: defined in the assembly below, with these signatures.
 unsafe extern "C" {
     /// Let interrupts through. Returns whether they were already on.
     pub safe fn irq_enable() -> bool;
