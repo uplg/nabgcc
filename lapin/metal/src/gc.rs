@@ -54,6 +54,14 @@ impl<H: Host> Vm<'_, H> {
     fn reach(&mut self, k: i32, first: &mut i32) {
         if k & 1 != 0 && k != NIL {
             let k = val(k);
+            // A word that only looks like a pointer, outside the memory:
+            // the C marks and chains it in the RAM next to the heap,
+            // where the bytecode never looks. Here the chaining word
+            // would read back 0 and send the walk through the bytecode:
+            // skip it, which leaves what the bytecode sees the same.
+            if !inside(k) {
+                return;
+            }
             if !self.used(k) {
                 self.mark(k);
                 self.setf(k.wrapping_add(HEADER_LIST), *first);
@@ -148,14 +156,16 @@ impl<H: Host> Vm<'_, H> {
                 self.setf(pos + HEADER_GC, 0);
                 if newpos != pos {
                     let (from, to, n) = (pos as usize, newpos as usize, realsize as usize);
-                    if from.saturating_add(n) <= VMEM_LENGTH {
+                    // `to` is below `from` (`newpos` never passes `pos`),
+                    // and not below 0: the loader's start is unsigned.
+                    if newpos >= 0 && from.saturating_add(n) <= VMEM_LENGTH {
                         // Down the heap, word by word from the start: the
                         // block never lands above where it was (a call to
                         // `memcpy` costs more than this loop, measured).
                         let heap = self.mem.heap.as_mut_ptr();
                         for k in 0..n {
-                            // SAFETY: `from + n` is inside the heap, checked
-                            // above, and `to` is below `from`.
+                            // SAFETY: `from + n` is inside the heap and
+                            // `0 <= to <= from`, checked above.
                             unsafe { *heap.add(to + k) = *heap.add(from + k) };
                         }
                     }
@@ -324,4 +334,12 @@ impl<H: Host> Vm<'_, H> {
         }
         self.push(pnt(p));
     }
+}
+
+/// Whether a block at `k` has its header (and so the collector's two
+/// words) inside the memory.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+#[inline(always)]
+fn inside(k: i32) -> bool {
+    (k as u32) < (VMEM_LENGTH as u32 - HEADER_LIST as u32)
 }

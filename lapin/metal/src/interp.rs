@@ -199,12 +199,12 @@ impl<H: Host> Vm<'_, H> {
                 match op {
                     INTB => {
                         let v = b!(pc);
-                        pc += 1;
+                        pc = pc.wrapping_add(1);
                         push!(int(v));
                     }
                     INT => {
                         let v = short!(pc.wrapping_add(2)) << 16 | short!(pc);
-                        pc += 4;
+                        pc = pc.wrapping_add(4);
                         push!(int(v));
                     }
                     NIL_ => push!(NIL),
@@ -212,19 +212,19 @@ impl<H: Host> Vm<'_, H> {
                     DUP => push!(get!(0)),
                     GETLOCALB => {
                         let i = b!(pc);
-                        pc += 1;
+                        pc = pc.wrapping_add(1);
                         push!(cget!(callstack, i));
                     }
                     SETLOCALB => {
                         let i = b!(pc);
-                        pc += 1;
+                        pc = pc.wrapping_add(1);
                         let v = get!(0);
                         sp = sp.wrapping_add(1);
                         cset!(callstack, i, v);
                     }
                     GETGLOBALB => {
                         let i = b!(pc);
-                        pc += 1;
+                        pc = pc.wrapping_add(1);
                         push!(cget!(self.global_start, i));
                     }
                     ADD..=SHR => {
@@ -270,12 +270,12 @@ impl<H: Host> Vm<'_, H> {
                         if v == 0 {
                             pc = pcbase.wrapping_add(short!(pc));
                         } else {
-                            pc += 2;
+                            pc = pc.wrapping_add(2);
                         }
                     }
                     FETCHB => {
                         let i = b!(pc);
-                        pc += 1;
+                        pc = pc.wrapping_add(1);
                         let p = get!(0);
                         if p != NIL {
                             put!(0, w!(val(p).wrapping_add(HEADER_LENGTH).wrapping_add(i)));
@@ -293,7 +293,12 @@ impl<H: Host> Vm<'_, H> {
                         let i = get!(1);
                         sp = sp.wrapping_add(2);
                         let p = get!(0);
-                        if p != NIL && i != NIL {
+                        // `i >= 0 || i < size`, as the C: false only for a
+                        // negative index into a header of -1280 or less.
+                        if p != NIL
+                            && i != NIL
+                            && (val(i) >= 0 || val(i) < ((w!(val(p)) >> 8) + 4) >> 2)
+                        {
                             set!(val(p).wrapping_add(HEADER_LENGTH).wrapping_add(val(i)), v);
                         }
                         put!(0, v);
@@ -320,7 +325,7 @@ impl<H: Host> Vm<'_, H> {
                     CALLRB | CALLR => {
                         let n = if op == CALLRB {
                             let n = b!(pc);
-                            pc += 1;
+                            pc = pc.wrapping_add(1);
                             n
                         } else {
                             let n = val(get!(0));
@@ -497,12 +502,12 @@ impl<H: Host> Vm<'_, H> {
             }
             INTB => {
                 let v = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 self.push(int(v));
             }
             INT => {
                 let v = self.int32(r.pc);
-                r.pc += 4;
+                r.pc = r.pc.wrapping_add(4);
                 self.push(int(v));
             }
             NIL_ => {
@@ -514,7 +519,7 @@ impl<H: Host> Vm<'_, H> {
             }
             GETLOCALB => {
                 let i = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 self.push(self.cget(r.callstack, i));
             }
             GETLOCAL => {
@@ -562,12 +567,12 @@ impl<H: Host> Vm<'_, H> {
                 if self.pull() == 0 {
                     r.pc = r.pcbase.wrapping_add(self.short(r.pc));
                 } else {
-                    r.pc += 2;
+                    r.pc = r.pc.wrapping_add(2);
                 }
             }
             MKTABB => {
                 let n = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 let p = self.alloc_tab_clear(n);
                 self.push(pnt(p));
             }
@@ -578,7 +583,7 @@ impl<H: Host> Vm<'_, H> {
             }
             DEFTABB => {
                 let n = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 self.stack_to_tab(n);
             }
             DEFTAB => {
@@ -587,7 +592,7 @@ impl<H: Host> Vm<'_, H> {
             }
             FETCHB => {
                 let i = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 let p = self.sget(0);
                 if p != NIL {
                     self.sset(0, self.fetch(val(p), i));
@@ -609,7 +614,7 @@ impl<H: Host> Vm<'_, H> {
             }
             GETGLOBALB => {
                 let i = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 self.push(self.cget(self.global_start, i));
             }
             GETGLOBAL => {
@@ -620,7 +625,7 @@ impl<H: Host> Vm<'_, H> {
             IECHO => self.iecho(self.sget(0), false),
             SETLOCALB => {
                 let i = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 let v = self.pull();
                 self.cset(r.callstack, i, v);
             }
@@ -638,7 +643,7 @@ impl<H: Host> Vm<'_, H> {
                 // The C checks `i >= 0 || i < size`, which always
                 // holds: the store happens whatever the index.
                 let i = self.b(r.pc) as i32;
-                r.pc += 1;
+                r.pc = r.pc.wrapping_add(1);
                 let v = self.pull();
                 let p = self.sget(0);
                 if p != NIL {
@@ -649,7 +654,7 @@ impl<H: Host> Vm<'_, H> {
                 let i = self.pull();
                 let v = self.pull();
                 let p = self.sget(0);
-                if p != NIL && i != NIL {
+                if p != NIL && i != NIL && self.indexable(val(p), val(i)) {
                     self.store(val(p), val(i), v);
                 }
             }
@@ -668,7 +673,7 @@ impl<H: Host> Vm<'_, H> {
                 let v = self.pull();
                 let i = self.pull();
                 let p = self.sget(0);
-                if p != NIL && i != NIL {
+                if p != NIL && i != NIL && self.indexable(val(p), val(i)) {
                     self.store(val(p), val(i), v);
                 }
                 self.sset(0, v);
@@ -698,7 +703,7 @@ impl<H: Host> Vm<'_, H> {
             CALLRB | CALLR => {
                 let n = if op == CALLRB {
                     let n = self.b(r.pc) as i32;
-                    r.pc += 1;
+                    r.pc = r.pc.wrapping_add(1);
                     n
                 } else {
                     val(self.pull())

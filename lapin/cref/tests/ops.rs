@@ -768,3 +768,195 @@ fn a_new_bytecode_takes_over_with_its_environment() {
     let out = both(&bytecode(&[&inner, b"the environment"], &[&f]));
     assert!(out.contains("the environment"), "{out}");
 }
+
+/// What a run left, without the world's handlers (which stay on their
+/// thread).
+#[derive(Debug, PartialEq)]
+struct Left {
+    console: Vec<u8>,
+    log: String,
+    registers: (i32, i32, i32),
+    heap: Vec<i32>,
+    fifo: Vec<u8>,
+}
+
+fn left(o: &Outcome) -> Left {
+    Left {
+        console: o.world.console.clone(),
+        log: format!("{:?}", o.world.log),
+        registers: o.registers,
+        heap: o.heap.to_vec(),
+        fifo: o.fifo.to_vec(),
+    }
+}
+
+/// Run the Rust machine on a thread, or say it never finished: a hang
+/// in the collector must fail the test, not stall it.
+fn rust_within(bc: &[u8], runs: usize, secs: u64) -> Left {
+    let bc = bc.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(left(&run_rust(World::new(Vec::new()), &bc, runs)));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("the Rust machine never finished")
+}
+
+const LEN: i32 = lapin_metal::VMEM_LENGTH as i32;
+
+#[test]
+fn a_store_at_a_negative_index_into_a_negative_header_is_skipped_as_in_c() {
+    for op in [STORE, SETSTRUCT] {
+        let mut m = main_fun();
+        // A table whose first slot holds -1000 (a header of -2000 seen
+        // from the pointer made to it): VSIZE is negative there.
+        m.int(-1000)
+            .b(DEFTABB, 1)
+            .op(DUP)
+            .b(INTB, 3)
+            .op(ADD)
+            .b(INTB, 1)
+            .op(COREBIT0);
+        if op == STORE {
+            m.int(-1).b(INTB, 77).op(STORE);
+        } else {
+            m.b(INTB, 77).int(-1).op(SETSTRUCT);
+        }
+        m.op(DROP);
+        end(&mut m);
+        let bc = bytecode(&[], &[&m]);
+        same(
+            &run_c(World::new(Vec::new()), &bc, 0),
+            &run_rust(World::new(Vec::new()), &bc, 0),
+        );
+    }
+}
+
+/// A recording whose push collects: the samples land in the block
+/// where it moved, as the C (which reads it back from the stack).
+#[test]
+fn a_recording_block_moved_by_its_own_push_gets_the_samples() {
+    let prog = |x: i32| {
+        let mut m = main_fun();
+        m.int(8000)
+            .b(INTB, 0)
+            .b(INTB, 1)
+            .op(RECSTART)
+            .op(DROP)
+            .int(x)
+            .op(STRNEW)
+            .op(DROP);
+        end(&mut m);
+        let mut cb = Fun::new(1, 0);
+        cb.b(GETLOCALB, 0)
+            .op(STRLEN)
+            .op(IECHOLN)
+            .op(DROP)
+            .b(GETLOCALB, 0)
+            .op(SECHOLN)
+            .op(RET);
+        bytecode(&[], &[&m, &cb])
+    };
+    let (stack, heapindex, _) = run_c(World::new(Vec::new()), &prog(0), 0).registers;
+    // 16 words left after the recording's block: its push collects.
+    let want = LEN + stack - heapindex + 4 - 84;
+    let mut collected = 0;
+    for dw in -3..=3 {
+        let bc = prog((want + dw - 3) * 4 - 4);
+        let c = run_c(World::new(Vec::new()), &bc, 1);
+        let r = run_rust(World::new(Vec::new()), &bc, 1);
+        collected += String::from_utf8_lossy(&c.world.console)
+            .matches("#GC")
+            .count();
+        same(&c, &r);
+    }
+    assert!(collected > 0, "no collection met: the test lost its point");
+}
+
+/// A word that looks like a pointer outside the memory, on the stack
+/// at a collection: the C chains it in the RAM beside the heap and
+/// finishes; so must this one, with the same memory.
+#[test]
+fn the_collector_finishes_with_a_pointer_outside_the_memory() {
+    for k in [-5i32, LEN + 1000, LEN - 2] {
+        let mut m = main_fun();
+        // Words 1 and 2 of the memory (the code's bytes 4..12) zero.
+        let l = m.label();
+        m.jump(GOTO, l);
+        m.code.extend([0; 12]);
+        m.here(l);
+        m.int(k)
+            .b(INTB, 1)
+            .op(COREBIT0)
+            .op(GC)
+            .op(IECHOLN)
+            .op(DROP)
+            .b(INTB, 42)
+            .op(IECHOLN)
+            .op(DROP);
+        end(&mut m);
+        let bc = bytecode(&[], &[&m]);
+        let r = rust_within(&bc, 0, 10);
+        if k == LEN - 2 {
+            // Its first word inside, its chaining word outside: the C's
+            // mark would land in the heap's last word. Finishing is
+            // what matters here.
+            assert!(String::from_utf8_lossy(&r.console).contains("42"));
+        } else {
+            let c = left(&run_c(World::new(Vec::new()), &bc, 0));
+            assert_eq!(
+                String::from_utf8_lossy(&c.console),
+                String::from_utf8_lossy(&r.console)
+            );
+            assert_eq!(c.registers, r.registers, "k {k}");
+            assert_eq!(c.log, r.log, "k {k}");
+            if let Some(i) = (0..c.heap.len()).find(|&i| c.heap[i] != r.heap[i]) {
+                panic!(
+                    "k {k}: memory differs from word {i}: C {:08x}, Rust {:08x}",
+                    c.heap[i], r.heap[i]
+                );
+            }
+            assert_eq!(c.fifo, r.fifo, "k {k}");
+        }
+    }
+}
+
+/// A bytecode whose code size makes the C's unsigned `(n + 3) >> 2`
+/// huge: the Rust machine must neither copy below its memory nor hang.
+#[test]
+fn a_bytecode_with_an_absurd_size_is_survived() {
+    let n: i32 = 1_073_741_804;
+    let mut m = main_fun();
+    let first = m.label();
+    m.op(RAND)
+        .jump(ELSE, first)
+        .int(n)
+        .op(STRNEW)
+        .op(DROP)
+        .int(n)
+        .op(STRNEW)
+        .op(DROP)
+        .b(MKTABB, 1)
+        .op(GC)
+        .op(IECHOLN)
+        .op(DROP)
+        .b(INTB, 42)
+        .op(IECHOLN)
+        .op(RET);
+    m.here(first)
+        .b(INTB, 16)
+        .op(STRNEW)
+        .b(INTB, 0)
+        .int(0x0400)
+        .op(STRPUTWORD)
+        .b(INTB, 4)
+        .int(0xFCFF)
+        .op(STRPUTWORD)
+        .b(INTB, 6)
+        .int(0xFF7F)
+        .op(STRPUTWORD)
+        .op(BYTECODE)
+        .op(RET);
+    let bc = bytecode(&[], &[&m]);
+    rust_within(&bc, 0, 10);
+}

@@ -218,7 +218,8 @@ impl<H: Host> Vm<'_, H> {
         if ind < 0 || ind.wrapping_add(2) > len {
             return -1;
         }
-        ((self.b(src + ind) as i32) << 8) + self.b(src + ind + 1) as i32
+        ((self.b(src.wrapping_add(ind)) as i32) << 8)
+            + self.b(src.wrapping_add(ind).wrapping_add(1)) as i32
     }
 
     /// `sysStrputword`.

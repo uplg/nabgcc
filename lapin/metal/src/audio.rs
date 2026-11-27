@@ -6,7 +6,7 @@
 //! asks for data. Recording, the codec's ADPCM words go to the record
 //! callback as they come.
 
-use crate::{AUDIO_FIFOPLAY, Host, NIL, SYS_CBPLAY, SYS_CBREC, Vm, int, pnt};
+use crate::{AUDIO_FIFOPLAY, Host, NIL, SYS_CBPLAY, SYS_CBREC, Vm, int, pnt, val};
 
 const VS1003_MODE: u8 = 0x00;
 const VS1003_DECODE_TIME: u8 = 0x04;
@@ -428,7 +428,9 @@ impl<H: Host> Vm<'_, H> {
         }
         let p = self.alloc_bin((words as i32) << 1);
         self.push(pnt(p));
-        let mut at = Self::start_bin(p);
+        // The push may have collected and moved the block: from the
+        // stack, as the C's VSTACKGET(0).
+        let mut at = Self::start_bin(val(self.sget(0)));
         while words > 0 {
             words -= 1;
             let v = self.host.codec_read(VS1003_HDAT0);
@@ -617,11 +619,19 @@ impl<H: Host> Vm<'_, H> {
         }
     }
 
+    /// An `int16_t` read as the C's `ldrsh` does on the ARM7TDMI: from
+    /// an odd address the core loads the one byte there, sign-extended.
     fn get16(&self, at: i32) -> i16 {
+        if at & 1 != 0 {
+            return self.b(at) as i8 as i16;
+        }
         (self.b(at) as u16 | (self.b(at + 1) as u16) << 8) as i16
     }
 
+    /// An `int16_t` written as the C's `strh` does on the ARM7TDMI: the
+    /// low bit of the address ignored.
     fn put16(&mut self, at: i32, v: i16) {
+        let at = at & !1;
         self.set_b(at, v as u8);
         self.set_b(at + 1, (v >> 8) as u8);
     }

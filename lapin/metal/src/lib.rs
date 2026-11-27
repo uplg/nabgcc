@@ -139,7 +139,8 @@ pub struct Auth<'a> {
 pub trait Host {
     /// Text for the serial console (`putbin_uart`).
     fn console(&mut self, text: &[u8]);
-    /// Called before every instruction, as the C clears the watchdog.
+    /// Called every 256 instructions (the C clears the watchdog before
+    /// each one; 256 of them take far less than its two seconds).
     fn watchdog(&mut self) {}
     /// Milliseconds since boot (`counter_timer`).
     fn time_ms(&mut self) -> u32;
@@ -450,6 +451,14 @@ impl<'m, H: Host> Vm<'m, H> {
     #[inline]
     fn fetch(&self, p: i32, i: i32) -> i32 {
         self.w(p.wrapping_add(HEADER_LENGTH).wrapping_add(i))
+    }
+
+    /// The C's test before a store, `i >= 0 || i < VSIZE(p)`: false
+    /// only for a negative index into a block whose header says -1280
+    /// or less.
+    #[inline]
+    fn indexable(&self, p: i32, i: i32) -> bool {
+        i >= 0 || i < self.size_tab(p)
     }
 
     /// `VSTORE`.

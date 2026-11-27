@@ -48,7 +48,9 @@ impl<H: Host> Vm<'_, H> {
     }
 
     fn load_rest(&mut self, n: i32) {
-        self.vmem_init((n + 3) >> 2);
+        // The C's sizes are unsigned: a huge one gives a start far up,
+        // never below 0.
+        self.vmem_init(words(n));
         self.sys_start = self.stack - 1;
         for _ in 0..SYS_NB {
             self.push(NIL);
@@ -56,16 +58,16 @@ impl<H: Host> Vm<'_, H> {
         let n = self.int32(0);
         let mut src = 4;
         self.global_start = self.stack - 1;
-        while src < n {
+        while (src as u32) < n as u32 {
             src = self.load_rec(src);
         }
         let n = self.int32(src);
-        src += 4;
-        self.tabfun = n + 2;
-        self.nbfun = self.short(src + n) as u16;
-        let n = n + 2 + ((self.nbfun as i32) << 2);
+        src = src.wrapping_add(4);
+        self.tabfun = n.wrapping_add(2);
+        self.nbfun = self.short(src.wrapping_add(n)) as u16;
+        let n = n.wrapping_add(2).wrapping_add((self.nbfun as i32) << 2);
         self.copy_bytes(0, src, n);
-        self.set_start((n + 3) >> 2);
+        self.set_start(words(n));
     }
 
     /// `loaderInitRec`: one global value, pushed.
@@ -98,4 +100,9 @@ impl<H: Host> Vm<'_, H> {
     pub(crate) fn fun_start(&self, fun: i32) -> i32 {
         self.int32(self.tabfun.wrapping_add(fun << 2))
     }
+}
+
+/// `(n + 3) >> 2` on the C's `uint32_t`.
+fn words(n: i32) -> i32 {
+    ((n as u32).wrapping_add(3) >> 2) as i32
 }

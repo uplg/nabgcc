@@ -14,7 +14,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let how = input.u8();
     let turns = input.u8() % 8;
     // The machine calls it every 256 instructions.
-    let board = Board::new(1000, &mut input);
+    let board = Board::new(256_000, &mut input);
     let bytecode = if how & 1 == 0 {
         assemble(&mut input)
     } else {

@@ -65,8 +65,10 @@ impl Host for Board {
         }
     }
     fn watchdog(&mut self) {
-        self.steps += 1;
-        self.now = self.now.wrapping_add((self.steps & 1) as u32);
+        // Called every 256 instructions: half a millisecond each, as
+        // before when it came with every instruction.
+        self.steps += 256;
+        self.now = self.now.wrapping_add(128);
         if self.steps > self.budget {
             std::panic::panic_any(Stop);
         }
