@@ -107,10 +107,18 @@ real chip reports in that case has not been checked.
 | `tests/setup.rs` | a phone on the rabbit's own network: setup page, saving settings, firmware upload |
 | `web/test.mjs` | the WebAssembly build, under Node |
 | `tests/garenne.rs` | the real application bytecode, when a build is around |
-| `tests/lapin.rs` | the Rust firmware in `../../lapin`, when it is built: WPA3 on the ARM7, timed |
+| `tests/soak.rs` | garenne for minutes (`NABEMU_SOAK_MINUTES`, 3 by default) through group key renewals |
+| `tests/lapin.rs` | what only the Rust firmware in `../../lapin` has, when it is built: its banner, the radios it refuses, WPA3 on the ARM7 timed against the watchdog, the wait after a power cut, the interpreter's speed against the C one's |
 
-All of them run the released image in `artifacts/`. Three of them pin
-down defects of that image (search the tests for "Known defect").
+The tests that run a firmware run the released C image in `artifacts/`
+(r3), or the Rust one with `NABEMU_FIRMWARE=lapin` (build it first with
+`lapin/build.sh`); CI runs them on both:
+
+    NABEMU_FIRMWARE=lapin cargo test --release --test boot --test board --test join \
+        --test link --test network --test setup --test rfid --test factory --test flash --test garenne
+
+Three of them pin down defects of r3 (search the tests for "Known
+defect"); on lapin, the same tests check the fixed behaviour.
 
 The instruction test ROMs are fetched in CI, not kept here:
 

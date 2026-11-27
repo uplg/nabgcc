@@ -10,22 +10,47 @@ in this repository. It is developed against the emulator in
 | Crate | What it is |
 |---|---|
 | `p256` | the NIST P-256 curve: field, points, constant-time scalar multiplication |
-| `core` | everything portable: SHA-256, HMAC, key derivation, the WPA3 password exchange (SAE) |
+| `core` | everything portable: the hashes and ciphers 802.11 uses (SHA-1, SHA-256, MD5, RC4, AES with CCM, CMAC and key wrap), CCMP and BIP, the WPA3 password exchange (SAE), and the 802.11 station and setup access point |
 | `metal` | the Metal virtual machine that runs the bytecode, as the C firmware runs it |
 | `cref` | tests only: the C firmware's machine built for the host, to check `metal` against word for word |
 | `fw` | the firmware itself, for the ARM7TDMI (`thumbv4t-none-eabi`) |
 
-`p256` and `core` have no dependency and no allocation, and are tested
-on the machine that builds them (`cargo test` in each).
+`p256`, `core` and `metal` have no dependency and no allocation, and
+are tested on the machine that builds them (`cargo test` in each).
+`core/tests/station.rs` runs the station against the emulator's access
+point, on the host.
 
 ## Where it stands
 
-`lapin`, the firmware, brings the board up (clock, pins, interrupts, a
-millisecond tick, the watchdog, leds, button), starts the USB host,
-finds the Wi-Fi stick, loads its firmware, reads its address and
-calibration, then goes through the channels asking who is there and
-names the networks it hears. 10.6 KB so far, the stick's own 1.6 KB
-firmware included.
+`lapin`, the firmware, does what the C firmware does: it brings the
+board up, starts the USB host and the Wi-Fi stick, then runs the boot
+bytecode (the one the r3 release carries, `fw/src/boot.bc`) on the
+Metal machine, whose calls to the board (`fw/src/host.rs`) go to this
+firmware's drivers and its 802.11 station. 106.8 KB of the 124 KB, the
+boot bytecode's 27.6 KB included.
+
+It passes the emulator's acceptance tests, the ones written for the C
+firmware (`NABEMU_FIRMWARE=lapin`, see `tools/emu/README.md`): boot,
+setup mode and its page, joining every kind of network, the boot over
+the network, the link through rekeys and restarts, the tag reader, the
+factory test, a firmware update over the air, and garenne itself, for
+minutes. Where the C firmware has a known defect, lapin does it right:
+the handshake of a mixed-mode network, 104-bit WEP keys, the first
+encrypted frame's number, probe requests without a network name.
+
+It adds WPA3, without a change to the bytecode: a network that offers
+SAE is still "WPA2" to the bytecode, which hands over the derived key;
+the firmware reads the passphrase where the setup page saved it and
+runs SAE (hash to element when offered), with protected management
+frames, CCMP done in software (the stick may hold no key on such a
+link), BIP on broadcast deauthentications, SA Query answered, and the
+wait an access point asks for after a restart.
+
+What differs from the C on purpose: a new image is written by a RAM
+routine that feeds the watchdog after every word (the C counted on the
+whole rewrite fitting in 2.09 s), and the interpreter takes 1.4 times
+as long as the C one on a tight loop (2.4 s against 1.7 s for 500 000
+instructions; `tools/emu/tests/lapin.rs` fails past 1.5).
 
 `selftest` exercises the other drivers one by one: both ears (it
 counts the teeth of a full turn), the tag reader, the settings sector
@@ -49,13 +74,11 @@ pecking, 1.35 s by hash-to-element, in 15 KB with everything it needs.
 `tools/emu/tests/lapin.rs` checks all of the above on every run and
 fails if the timings drift.
 
-The watchdog bites after 2.09 s: these computations will have to feed
-it as they go.
+The watchdog bites after 2.09 s: the station feeds it between these
+steps. Joining a WPA3 network takes 1.6 s after the scan on the
+emulated rabbit.
 
 ## What is left
 
-In order: the 802.11 station and access point with WEP, WPA, WPA2 and
-WPA3, the Metal virtual machine that runs the existing bytecode, then
-a resident loader so that a failed update no longer kills the rabbit.
-Each step has its tests waiting in `tools/emu/tests`, which today run
-the C firmware.
+A resident loader, so that a power cut during an update no longer
+kills the rabbit; then the real rabbit.
