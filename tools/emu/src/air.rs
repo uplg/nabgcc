@@ -155,6 +155,38 @@ pub enum ApEvent {
     UnprotectedDeauthIgnored {
         sta: Mac,
     },
+    /// Too many password exchanges were open: the commit was answered
+    /// with an anti-clogging token to send back (status 76).
+    SaeTokenRequested {
+        sta: Mac,
+    },
+    /// A commit carried a token this access point never gave out; it
+    /// was dropped without an answer.
+    SaeTokenRejected {
+        sta: Mac,
+    },
+    /// A station protecting its management frames asked to associate
+    /// again while its association still stood: refused for now
+    /// (status 30) and the station that holds the keys is asked
+    /// whether it is still there.
+    SaQueryStarted {
+        sta: Mac,
+    },
+    /// The station answered the query, keys and all: it is alive, the
+    /// association it holds stays.
+    SaQueryAnswered {
+        sta: Mac,
+    },
+    /// Nobody answered within the limit: the next association attempt
+    /// is let in.
+    SaQueryTimedOut {
+        sta: Mac,
+    },
+    /// A robust action frame arrived in clear from a station that
+    /// protects its management frames; it was dropped.
+    UnprotectedActionDropped {
+        sta: Mac,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +227,17 @@ struct Station {
     akm: u8,
     /// Management frames are protected on this link.
     pmf: bool,
+    /// The password exchange in progress chose hash-to-element.
+    sae_h2e: bool,
+    /// Last packet number of a protected management frame from the
+    /// station: a counter of its own, apart from data frames.
+    rx_mgmt_pn: u64,
+    /// SA Query procedure: transaction identifiers sent so far, when
+    /// the first went out, when the next is due.
+    sa_query: Vec<[u8; 2]>,
+    sa_query_start: u64,
+    sa_query_next: u64,
+    sa_query_timed_out: bool,
 }
 
 pub struct AccessPoint {
@@ -219,7 +262,22 @@ pub struct AccessPoint {
     /// Only take WPA3 stations that derive the password element by
     /// hashing to the curve.
     pub require_h2e: bool,
+    /// Open password exchanges from which a new commit has to come
+    /// back with an anti-clogging token; 0 demands one every time.
+    /// hostapd's default is 5.
+    pub anti_clogging_threshold: usize,
+    /// How long, in time units of 1024 µs, a station that may have lost
+    /// its keys is given to answer an SA Query, and how often it is
+    /// asked (hostapd's `assoc_sa_query_max_timeout` and
+    /// `assoc_sa_query_retry_timeout`).
+    pub sa_query_max_tu: u64,
+    pub sa_query_retry_tu: u64,
     psk: [u8; 32],
+    comeback_key: [u8; 32],
+    igtk_index: u8,
+    /// Packet number of the last frame protected with the integrity
+    /// group key.
+    ipn: u64,
     passphrase: String,
     igtk: [u8; 16],
     gtk: [u8; 32],
@@ -243,6 +301,7 @@ const MGMT_BEACON: u8 = 0x80;
 const MGMT_DISASSOC: u8 = 0xA0;
 const MGMT_AUTH: u8 = 0xB0;
 const MGMT_DEAUTH: u8 = 0xC0;
+const MGMT_ACTION: u8 = 0xD0;
 
 const LLC_SNAP: [u8; 6] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00];
 const ETHERTYPE_EAPOL: u16 = 0x888E;
@@ -340,7 +399,13 @@ impl AccessPoint {
             probes_answered: 0,
             probes_ignored: 0,
             require_h2e: false,
+            anti_clogging_threshold: 5,
+            sa_query_max_tu: 1000,
+            sa_query_retry_tu: 201,
             psk,
+            comeback_key: [0; 32],
+            igtk_index: 4,
+            ipn: 0,
             passphrase: String::new(),
             igtk: [0; 16],
             gtk: [0; 32],
@@ -357,6 +422,7 @@ impl AccessPoint {
         };
         ap.gtk = ap.random();
         ap.igtk = ap.random();
+        ap.comeback_key = ap.random();
         if let Security::Psk { passphrase, .. } = &ap.security {
             ap.passphrase = passphrase.clone();
         }
@@ -546,6 +612,20 @@ impl AccessPoint {
             }
         }
 
+        // SA Query: a new request at every retry interval until the
+        // procedure times out (hostapd's `ap_sa_query_timer`).
+        let querying: Vec<Mac> = self
+            .stations
+            .iter()
+            .filter(|(_, s)| s.sa_query_next != 0 && now_ms >= s.sa_query_next)
+            .map(|(m, _)| *m)
+            .collect();
+        for sta in querying {
+            if !self.sa_query_timeout(sta) {
+                self.sa_query_round(radio, sta);
+            }
+        }
+
         let due: Vec<Mac> = self
             .stations
             .iter()
@@ -599,6 +679,7 @@ impl AccessPoint {
             MGMT_AUTH => self.on_auth(radio, sta, frame),
             MGMT_ASSOC_REQ | MGMT_REASSOC_REQ => self.on_assoc(radio, sta, subtype, body),
             MGMT_DEAUTH | MGMT_DISASSOC => self.on_leave(sta, frame),
+            MGMT_ACTION => self.on_action(radio, sta, frame),
             _ => {}
         }
     }
@@ -616,24 +697,10 @@ impl AccessPoint {
                 self.events.push(ApEvent::UnprotectedDeauthIgnored { sta });
                 return;
             }
-            let key = Key {
-                cipher: Cipher::Ccmp,
-                key: &station.ptk[32..48],
-                mic: &[0; 8],
+            let Some(clear) = self.open_management(sta, frame) else {
+                return;
             };
-            match crypto::unprotect(&key, frame) {
-                Ok((clear, iv, eiv)) if pn_of(Cipher::Ccmp, iv, eiv) > station.rx_pn => {
-                    body = clear[crypto::HEADER_LEN..].to_vec();
-                }
-                Ok(_) => {
-                    self.events.push(ApEvent::Replay { sta });
-                    return;
-                }
-                Err(error) => {
-                    self.events.push(ApEvent::DecryptFailure { sta, error });
-                    return;
-                }
-            }
+            body = clear[crypto::HEADER_LEN..].to_vec();
         }
         self.stations.remove(&sta);
         let reason = body
@@ -668,7 +735,31 @@ impl AccessPoint {
                         why: "hash-to-element is required",
                     });
                 }
-                let Some(theirs) = sae::Commit::from_bytes(rest) else {
+                // The anti-clogging token: in a container element after
+                // the element when hashing to the curve, between the
+                // group and the scalar otherwise.
+                let (commit, token) = if h2e {
+                    let token = rest.get(98..).and_then(|ies| {
+                        let mut ies = ies;
+                        while let [255, len, rest @ ..] = ies {
+                            let body = rest.get(..*len as usize)?;
+                            if body.first() == Some(&93) {
+                                return Some(body[1..].to_vec());
+                            }
+                            ies = &rest[*len as usize..];
+                        }
+                        None
+                    });
+                    (rest.to_vec(), token)
+                } else if rest.len() >= 98 + 32 {
+                    let split = rest.len() - 96;
+                    let mut commit = rest[..2].to_vec();
+                    commit.extend_from_slice(&rest[split..]);
+                    (commit, Some(rest[2..split].to_vec()))
+                } else {
+                    (rest.to_vec(), None)
+                };
+                let Some(theirs) = sae::Commit::from_bytes(&commit) else {
                     // Status 77: unsupported finite cyclic group.
                     self.reply_auth(radio, sta, 3, 1, 77, &[]);
                     return self.events.push(ApEvent::SaeRejected {
@@ -676,6 +767,25 @@ impl AccessPoint {
                         why: "not a group 19 commit",
                     });
                 };
+                if token
+                    .as_ref()
+                    .is_some_and(|t| *t != self.comeback_token(sta))
+                {
+                    return self.events.push(ApEvent::SaeTokenRejected { sta });
+                }
+                // A station already in the middle of an exchange may
+                // start it again without a token, as hostapd lets it.
+                let restarting = self.stations.get(&sta).is_some_and(|s| s.sae.is_some());
+                if token.is_none() && !restarting && self.needs_anti_clogging() {
+                    let mut body = sae::GROUP.to_le_bytes().to_vec();
+                    let token = self.comeback_token(sta);
+                    if h2e {
+                        body.extend_from_slice(&[255, 1 + token.len() as u8, 93]);
+                    }
+                    body.extend_from_slice(&token);
+                    self.reply_auth(radio, sta, 3, 1, 76, &body);
+                    return self.events.push(ApEvent::SaeTokenRequested { sta });
+                }
                 let element = if h2e {
                     let point =
                         sae::password_point(self.ssid.as_bytes(), self.passphrase.as_bytes(), None);
@@ -692,10 +802,20 @@ impl AccessPoint {
                     });
                 }
                 let ours = session.commit().to_bytes();
-                let mut s = Self::new_station();
+                // A station whose management frames are protected keeps
+                // its association and keys while it authenticates again:
+                // a clear authentication frame must not be enough to
+                // throw it out.
+                let keep = self
+                    .stations
+                    .get(&sta)
+                    .is_some_and(|s| s.pmf && s.phase == Phase::Authorized);
+                if !keep {
+                    self.stations.insert(sta, Self::new_station());
+                }
+                let s = self.stations.get_mut(&sta).unwrap();
                 s.sae = Some(session);
-                s.challenge = vec![h2e as u8];
-                self.stations.insert(sta, s);
+                s.sae_h2e = h2e;
                 self.reply_auth(radio, sta, 3, 1, status, &ours);
             }
             2 => {
@@ -718,14 +838,206 @@ impl AccessPoint {
                 let mut reply = 1u16.to_le_bytes().to_vec();
                 reply.extend_from_slice(&session.confirm(1));
                 s.sae_key = Some((session.pmk, session.pmkid));
-                let hash_to_element = s.challenge == [1];
+                let hash_to_element = s.sae_h2e;
                 s.sae = None;
-                s.challenge.clear();
                 self.reply_auth(radio, sta, 3, 2, 0, &reply);
                 self.events.push(ApEvent::SaeComplete {
                     sta,
                     hash_to_element,
                 });
+            }
+            _ => {}
+        }
+    }
+
+    /// The token a station has to send back when the access point is
+    /// under load: only this access point can make it, and it is bound
+    /// to the station's address.
+    fn comeback_token(&self, sta: Mac) -> Vec<u8> {
+        crypto::hmac_sha256(&self.comeback_key, &[&sta]).to_vec()
+    }
+
+    /// Whether a new commit has to come back with a token: as hostapd,
+    /// once as many exchanges are open as the threshold says.
+    fn needs_anti_clogging(&self) -> bool {
+        let open = self.stations.values().filter(|s| s.sae.is_some()).count();
+        open >= self.anti_clogging_threshold
+    }
+
+    /// The station holds an association whose management frames are
+    /// protected: nothing sent in clear may undo it.
+    fn holds_protected_association(&self, sta: Mac) -> bool {
+        self.stations
+            .get(&sta)
+            .is_some_and(|s| s.pmf && s.keys_installed && s.phase == Phase::Authorized)
+    }
+
+    fn tu_to_ms(tu: u64) -> u64 {
+        tu * 1024 / 1000
+    }
+
+    /// hostapd's `check_sa_query`: for a station holding a protected
+    /// association, start the SA Query procedure unless it is running,
+    /// and say in how many time units to come back; `None` once the
+    /// procedure timed out, which lets the association through.
+    fn check_sa_query(&mut self, radio: &mut Radio, sta: Mac) -> Option<u64> {
+        if !self.holds_protected_association(sta) {
+            return None;
+        }
+        self.sa_query_timeout(sta);
+        let s = &self.stations[&sta];
+        if s.sa_query_timed_out {
+            return None;
+        }
+        if s.sa_query.is_empty() {
+            self.events.push(ApEvent::SaQueryStarted { sta });
+            self.sa_query_round(radio, sta);
+        }
+        let s = &self.stations[&sta];
+        let passed = (self.now - s.sa_query_start) * 1000 / 1024;
+        let mut tu = self.sa_query_max_tu.saturating_sub(passed);
+        if tu < self.sa_query_max_tu {
+            // hostapd adds a unit for its own timers.
+            tu += 1;
+        }
+        Some(tu)
+    }
+
+    /// End the procedure if its time is up. True when it ended.
+    fn sa_query_timeout(&mut self, sta: Mac) -> bool {
+        let max = self.sa_query_max_tu;
+        let now = self.now;
+        let Some(s) = self.stations.get_mut(&sta) else {
+            return false;
+        };
+        if s.sa_query.is_empty() || (now - s.sa_query_start) * 1000 / 1024 <= max {
+            return false;
+        }
+        s.sa_query.clear();
+        s.sa_query_next = 0;
+        s.sa_query_timed_out = true;
+        self.events.push(ApEvent::SaQueryTimedOut { sta });
+        true
+    }
+
+    /// One SA Query request, protected with the station's pairwise key,
+    /// with a fresh transaction identifier.
+    fn sa_query_round(&mut self, radio: &mut Radio, sta: Mac) {
+        let id: [u8; 2] = self.random();
+        let (now, retry) = (self.now, Self::tu_to_ms(self.sa_query_retry_tu));
+        let s = self.stations.get_mut(&sta).unwrap();
+        if s.sa_query.is_empty() {
+            s.sa_query_start = now;
+        }
+        s.sa_query.push(id);
+        s.sa_query_next = now + retry.max(1);
+        // Category 8 (SA Query), action 0 (request).
+        self.send_action(radio, sta, &[8, 0, id[0], id[1]]);
+    }
+
+    /// An action frame to a station, protected when its management
+    /// frames are.
+    fn send_action(&mut self, radio: &mut Radio, sta: Mac, body: &[u8]) {
+        let mut f = self.mgmt(MGMT_ACTION, sta);
+        f.extend_from_slice(body);
+        if let Some(s) = self
+            .stations
+            .get_mut(&sta)
+            .filter(|s| s.pmf && s.keys_installed)
+        {
+            s.tx_pn += 1;
+            let (iv, eiv) = iv_words(Cipher::Ccmp, s.tx_pn, 0);
+            let key = Key {
+                cipher: Cipher::Ccmp,
+                key: &s.ptk[32..48],
+                mic: &[0; 8],
+            };
+            f = crypto::protect(&key, &f, iv, eiv);
+        }
+        self.emit(radio, f);
+    }
+
+    /// A protected management frame from a station: its clear version,
+    /// or why it is refused. Its packet number is checked against the
+    /// counter kept for management frames.
+    fn open_management(&mut self, sta: Mac, frame: &[u8]) -> Option<Vec<u8>> {
+        let station = self.stations.get_mut(&sta)?;
+        let key = Key {
+            cipher: Cipher::Ccmp,
+            key: &station.ptk[32..48],
+            mic: &[0; 8],
+        };
+        match crypto::unprotect(&key, frame) {
+            Ok((clear, iv, eiv)) if pn_of(Cipher::Ccmp, iv, eiv) > station.rx_mgmt_pn => {
+                station.rx_mgmt_pn = pn_of(Cipher::Ccmp, iv, eiv);
+                Some(clear)
+            }
+            Ok(_) => {
+                self.events.push(ApEvent::Replay { sta });
+                None
+            }
+            Err(error) => {
+                self.events.push(ApEvent::DecryptFailure { sta, error });
+                None
+            }
+        }
+    }
+
+    /// An action frame from a station.
+    fn on_action(&mut self, radio: &mut Radio, sta: Mac, frame: &[u8]) {
+        let associated = self
+            .stations
+            .get(&sta)
+            .is_some_and(|s| s.phase != Phase::Authenticated);
+        let Some(&category) = frame.get(crypto::HEADER_LEN) else {
+            return;
+        };
+        let category = if frame[1] & 0x40 != 0 {
+            None
+        } else {
+            Some(category)
+        };
+        // Public action frames (category 4) are for anyone; the others
+        // only from associated stations.
+        if !associated && category != Some(4) {
+            return;
+        }
+        let protects = self
+            .stations
+            .get(&sta)
+            .is_some_and(|s| s.pmf && s.keys_installed);
+        let body = if frame[1] & 0x40 != 0 {
+            if !protects {
+                return;
+            }
+            let Some(clear) = self.open_management(sta, frame) else {
+                return;
+            };
+            clear[crypto::HEADER_LEN..].to_vec()
+        } else {
+            // Robust action frames have to be protected on such a link
+            // (all categories but public, HT, unprotected WNM,
+            // self-protected, unprotected DMG, VHT and vendor-specific).
+            let robust = !matches!(category, Some(4 | 7 | 11 | 15 | 20 | 21 | 127));
+            if protects && robust {
+                return self.events.push(ApEvent::UnprotectedActionDropped { sta });
+            }
+            frame[crypto::HEADER_LEN..].to_vec()
+        };
+        match body[..] {
+            [8, 0, a, b, ..] => {
+                // Somebody checks that we still hold their association.
+                self.send_action(radio, sta, &[8, 1, a, b]);
+            }
+            [8, 1, a, b, ..] => {
+                let Some(s) = self.stations.get_mut(&sta) else {
+                    return;
+                };
+                if s.sa_query.contains(&[a, b]) {
+                    s.sa_query.clear();
+                    s.sa_query_next = 0;
+                    self.events.push(ApEvent::SaQueryAnswered { sta });
+                }
             }
             _ => {}
         }
@@ -772,7 +1084,9 @@ impl AccessPoint {
         let demands_shared = wep.as_ref().is_some_and(|(_, shared)| *shared);
         match (algorithm, seq) {
             (0, 1) if !demands_shared => {
-                self.stations.insert(sta, Self::new_station());
+                if !self.holds_protected_association(sta) {
+                    self.stations.insert(sta, Self::new_station());
+                }
                 self.reply_auth(radio, sta, 0, 2, 0, &[]);
                 self.events.push(ApEvent::Authenticated {
                     sta,
@@ -835,6 +1149,12 @@ impl AccessPoint {
             sae_key: None,
             akm: 2,
             pmf: false,
+            sae_h2e: false,
+            rx_mgmt_pn: 0,
+            sa_query: Vec::new(),
+            sa_query_start: 0,
+            sa_query_next: 0,
+            sa_query_timed_out: false,
         }
     }
 
@@ -936,6 +1256,14 @@ impl AccessPoint {
         } else {
             0
         };
+        // The association stands while its keys may still be in use:
+        // status 30, come back later, and ask the holder of the keys.
+        let comeback = if status == 0 {
+            self.check_sa_query(radio, sta)
+        } else {
+            None
+        };
+        let status = if comeback.is_some() { 30 } else { status };
         let reply = if subtype == MGMT_REASSOC_REQ {
             MGMT_REASSOC_RESP
         } else {
@@ -946,6 +1274,11 @@ impl AccessPoint {
         f.extend_from_slice(&status.to_le_bytes());
         f.extend_from_slice(&0xC001u16.to_le_bytes());
         f.extend_from_slice(&Self::RATES);
+        if let Some(tu) = comeback {
+            // Timeout interval element, type 3: association comeback time.
+            f.extend_from_slice(&[56, 5, 3]);
+            f.extend_from_slice(&(tu as u32).to_le_bytes());
+        }
         self.emit(radio, f);
         if status != 0 {
             self.events.push(ApEvent::AssocRejected { sta, status });
@@ -1048,7 +1381,10 @@ impl AccessPoint {
         }
         let station = &self.stations[&sta];
         let must_protect = self.security != Security::Open;
-        if station.phase != Phase::Authorized {
+        // As hostapd: the port opens with the pairwise keys, at the end
+        // of the 4-way handshake; with WPA the group key handshake that
+        // follows does not hold traffic back.
+        if !matches!(station.phase, Phase::Authorized | Phase::Group) {
             self.events.push(ApEvent::NotAuthorized { sta });
             return;
         }
@@ -1076,7 +1412,11 @@ impl AccessPoint {
             if self.stations.values().any(|s| s.phase == Phase::Authorized) {
                 self.send_data(radio, dst, src, &body, true, true);
             }
-        } else if self.is_authorized(dst) {
+        } else if self
+            .stations
+            .get(&dst)
+            .is_some_and(|s| matches!(s.phase, Phase::Authorized | Phase::Group))
+        {
             self.send_data(radio, dst, src, &body, true, false);
         }
     }
@@ -1301,7 +1641,11 @@ impl AccessPoint {
 
     fn send_group_message(&mut self, radio: &mut Radio, sta: Mac) {
         let (wpa2, _, group) = self.psk_params().unwrap();
-        let (data, iv) = self.wrap_key_data(sta, self.group_key_data(group, wpa2));
+        let mut plain = self.group_key_data(group, wpa2);
+        if self.stations[&sta].pmf {
+            plain.extend_from_slice(&self.igtk_kde());
+        }
+        let (data, iv) = self.wrap_key_data(sta, plain);
         let mut info = KEY_INFO_ACK | KEY_INFO_MIC | KEY_INFO_SECURE;
         info |= if wpa2 {
             KEY_INFO_ENCRYPTED
@@ -1330,6 +1674,13 @@ impl AccessPoint {
         self.gtk = self.random();
         self.gtk_index = if self.gtk_index == 1 { 2 } else { 1 };
         self.group_pn = 0;
+        // The integrity group key is renewed with it, under the other
+        // of its two identifiers (as hostapd's `wpa_gtk_update`).
+        if self.wpa3 != Wpa3::Off {
+            self.igtk = self.random();
+            self.igtk_index = if self.igtk_index == 4 { 5 } else { 4 };
+            self.ipn = 0;
+        }
         let authorised: Vec<Mac> = self
             .stations
             .iter()
@@ -1339,6 +1690,51 @@ impl AccessPoint {
         for sta in authorised {
             self.stations.get_mut(&sta).unwrap().rekeying = true;
             self.send_group_message(radio, sta);
+        }
+    }
+
+    /// IGTK key data element: identifier, packet number, key.
+    fn igtk_kde(&self) -> Vec<u8> {
+        let mut kde = vec![0xDD, 28, 0x00, 0x0F, 0xAC, 0x09, self.igtk_index, 0];
+        kde.extend_from_slice(&self.ipn.to_le_bytes()[..6]);
+        kde.extend_from_slice(&self.igtk);
+        kde
+    }
+
+    /// Protect a group-addressed management frame with BIP-CMAC-128:
+    /// the frame stays readable, a management MIC element (76) is
+    /// appended.
+    fn bip_protect(&mut self, mut frame: Vec<u8>) -> Vec<u8> {
+        self.ipn += 1;
+        frame.extend_from_slice(&[76, 16, self.igtk_index, 0]);
+        frame.extend_from_slice(&self.ipn.to_le_bytes()[..6]);
+        frame.extend_from_slice(&[0; 8]);
+        let mic = crypto::bip_mic(&self.igtk, &frame);
+        let n = frame.len();
+        frame[n - 8..].copy_from_slice(&mic);
+        frame
+    }
+
+    /// Stop, as hostapd does when it is shut down: every station is
+    /// told to leave by a deauthentication to everyone (reason 3),
+    /// protected by BIP when the network offers management frame
+    /// protection, and forgotten. The access point then has to be taken
+    /// off the air by the caller.
+    pub fn shut_down(&mut self, radio: &mut Radio) {
+        let mut f = self.mgmt(MGMT_DEAUTH, [0xFF; 6]);
+        f.extend_from_slice(&3u16.to_le_bytes());
+        if self.wpa3 != Wpa3::Off && self.psk_params().is_some() {
+            f = self.bip_protect(f);
+        }
+        self.emit(radio, f);
+        let gone: Vec<Mac> = self.stations.keys().copied().collect();
+        self.stations.clear();
+        for sta in gone {
+            self.events.push(ApEvent::Deauthenticated {
+                sta,
+                reason: 3,
+                by_ap: true,
+            });
         }
     }
 
@@ -1440,9 +1836,7 @@ impl AccessPoint {
                     plain.extend_from_slice(&self.group_key_data(group, true));
                     if self.stations[&sta].pmf {
                         // The integrity group key, for protected broadcasts.
-                        plain.extend_from_slice(&[0xDD, 28, 0x00, 0x0F, 0xAC, 0x09, 4, 0]);
-                        plain.extend_from_slice(&[0; 6]);
-                        plain.extend_from_slice(&self.igtk);
+                        plain.extend_from_slice(&self.igtk_kde());
                     }
                     self.wrap_key_data(sta, plain)
                 } else {

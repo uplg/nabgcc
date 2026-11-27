@@ -20,24 +20,26 @@ Two examples show both sides of a link:
 | Part | State |
 |---|---|
 | ARM7TDMI, ARM and Thumb | complete; passes jsmolka's `arm.gba` and `thumb.gba` |
-| Interrupt controller, system timer, watchdog | as the firmware uses them |
-| Internal flash: erase and program command sequences, timing, power cuts | yes |
-| Internal and external RAM | yes |
-| UART0 | transmit only |
+| Clocks | ring oscillator at reset, 8 MHz crystal, PLLs and dividers as CLKCNT, PLL1 and PLL2 set them; the processor, system timer, watchdog and UART follow |
+| Registers | every register of the chip's register list, with its value after reset (`src/regmap.rs`); an address the chip does not have is reported |
+| Interrupt controller, system timer | as the firmware uses them |
+| Watchdog | counter, clock select, halt (WDHLT), reset or interrupt on overflow, INTST, what survives its own reset |
+| Internal flash: erase and program command sequences, FLACON flags, timing, power cuts | yes |
+| Internal RAM; external SRAM and the USB controller on the external bus | yes, with the bus timing BWC, RAMAC and IO0AC set, and an abort when a bank is switched off |
+| UART0 | transmitter: baud rate, 16-byte FIFO, status and interrupt; the receiver is not wired on the rabbit |
 | ML60842 USB host controller (OHCI) | control and bulk lists, one port |
 | RT2573 Wi-Fi stick | enumeration, firmware upload, registers, EEPROM, shared key table, WEP/TKIP/CCMP encryption and decryption, beacon generation |
 | Leds, head button, volume wheel (`board`) | yes |
 | Ears: motors and encoders | yes, with an estimated speed |
 | Audio codec (`vs1003`) | control registers, the stream sent to the decoder split into tracks and drained at its own pace, the microphone recorded as IMA ADPCM; no decoding of MP3 or MIDI |
 | RFID reader and tags (`rfid`), I2C master | identifiers, anticollision slots, memory blocks read and written |
-| Access points (`air`) | beacons, probes, open and shared-key authentication, association, WPA and WPA2 pre-shared-key handshakes, group key renewal, replay checks, hidden networks, WPA3 (SAE by hunting and pecking or hash-to-element, key management 8, protected management frames), WPA2/WPA3 transition |
+| Access points (`air`) | beacons, probes, open and shared-key authentication, association, WPA and WPA2 pre-shared-key handshakes, group key renewal, replay checks, hidden networks, WPA3 (SAE by hunting and pecking or hash-to-element, anti-clogging tokens, key management 8, protected management frames, SA Query, BIP for broadcasts, integrity group key renewal), WPA2/WPA3 transition; timers and thresholds as hostapd's defaults |
 | A phone joining the rabbit in setup mode (`visitor`) | open association, DHCP client, HTTP client |
 | A WPA3 station written from the standard (`supplicant`) | what the next firmware has to do; the access point's opposite number in tests |
 | Wired network (`lan`) | DHCP, DNS, HTTP server, UDP capture and injection |
 
-Not there yet: protected broadcast management frames (BIP) and the SA
-query procedure, SAE anti-clogging tokens, the pairwise key table of
-the stick, cycle-exact timing.
+Not there yet: the pairwise key table of the stick, MP3 and MIDI
+decoding.
 
 ## In a browser
 
@@ -54,11 +56,21 @@ has a plain C interface (`src/web.rs`), wrapped by `web/nabemu.mjs`;
 
 ## What the numbers are worth
 
-Time is counted in clock cycles at 32 MHz, each instruction costing
-what the ARM7TDMI data sheet says (wait states on the bus are not
-modelled), so a run is exactly reproducible. Flash
-timings (22 ms per sector erase, 40 µs per word) are derived from the
-"63 ms per sector" in the firmware's comments, not measured. An ear
+Time is counted in cycles of 32 MHz. Each instruction costs what the
+ARM7TDMI data sheet says, at the processor clock the clock registers
+give, plus the clocks it waits on the external bus, from the tables
+of chapter 7 of the ML67Q4050/4060 user's manual (FEUL67Q4050-10):
+pulse widths, address setup and hold, the split of a 32-bit access on
+the 16-bit bus, the gap between chip selects. A run is exactly
+reproducible. The manual gives no wait for the internal flash and RAM
+(they sit on the processor bus, no wait setting exists) nor for the
+peripheral registers: they are taken to answer in one clock. The ring
+oscillator the chip boots on is taken at 16 MHz, the top of its 4 to
+16 MHz range; the firmware leaves it within the first milliseconds.
+
+Flash timings (22 ms per sector erase, 40 µs per word) are derived
+from the "63 ms per sector" in the firmware's comments, within the
+manual's maxima (50 ms, 40 µs), not measured. An ear
 is given about three seconds for a full turn (the factory test bounds
 it from below). The stick's power-on beacon
 interval (100 time units) is inferred from the firmware never
@@ -77,7 +89,7 @@ real chip reports in that case has not been checked.
 
 | File | What it covers |
 |---|---|
-| `src/crypto.rs` | hashes, PSK, PRF, KDF, HKDF, AES key wrap, AES-CMAC, RC4, Michael, TKIP mixing, CCMP against published vectors |
+| `src/crypto.rs` | hashes, PSK, PRF, KDF, HKDF, AES key wrap, AES-CMAC, RC4, Michael, TKIP mixing, CCMP, BIP and CCMP on management frames against published vectors |
 | `src/p256.rs`, `src/sae.rs` | the curve against published points; SAE against the IEEE 802.11-2020 J.10 vectors, both methods |
 | `src/rfid.rs`, `src/vs1003.rs`, `src/board.rs` | the tag reader, the codec, leds and ears on their own |
 | `tests/cpu_roms.rs` | the instruction test ROMs |
@@ -89,7 +101,7 @@ real chip reports in that case has not been checked.
 | `tests/board.rs` | leds, button, setup mode, factory test mode |
 | `tests/factory.rs` | the firmware's own factory test: ears, tag reader, playing a tone, recording and playing back |
 | `tests/rfid.rs` | the firmware reading and writing a tag |
-| `tests/wpa3.rs` | WPA3 between the access point and the reference station, forged and genuine deauthentications, replays |
+| `tests/wpa3.rs` | WPA3 between the access point and the reference station: both password element methods, anti-clogging tokens, a station that restarts (SA Query, status 30, comeback), an impostor, forged and genuine deauthentications, BIP, replays |
 | `tests/setup.rs` | a phone on the rabbit's own network: setup page, saving settings, firmware upload |
 | `web/test.mjs` | the WebAssembly build, under Node |
 | `tests/garenne.rs` | the real application bytecode, when a build is around |

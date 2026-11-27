@@ -12,7 +12,7 @@
 //! | `D000_0000` + 1M         | external SRAM                          |
 //! | `F000_0000` + 8K         | ML60842 USB host controller and its RAM |
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::board::Board;
 use crate::cpu::Bus;
@@ -32,6 +32,7 @@ pub const CLOCK_HZ: u64 = 32_000_000;
 const FRAME_CYCLES: u64 = CLOCK_HZ / 1000;
 
 pub const INT_SYSTEM_TIMER: u32 = 0;
+pub const INT_WDT: u32 = 1;
 pub const INT_UART0: u32 = 9;
 pub const INT_EXINT2_USB: u32 = 36;
 
@@ -50,13 +51,27 @@ const EXILCB: u32 = 0x7BF0_0028;
 const EXIRQC: u32 = 0x7BF0_0030;
 const EXILCC: u32 = 0x7BF0_0038;
 const FLACON: u32 = 0xB700_0100;
+const PLL1: u32 = 0xB700_0008;
+const PLL2: u32 = 0xB700_000C;
+const CLKCNT: u32 = 0xB700_0010;
+/// The crystal on SYSCLK.
+const SYSCLK_HZ: u64 = 8_000_000;
+/// The chip's ring oscillator, which it starts on (BOOTCLK is low on
+/// the rabbit). The manual bounds it between 4 and 16 MHz and calls 16
+/// the specified maximum; nobody measured the rabbit's.
+pub const RING_OSC_HZ: u64 = 16_000_000;
+/// RTCCLK, the 32.768 kHz watch crystal input.
+const RTCCLK_HZ: u64 = 32_768;
 const TMEN: u32 = 0xB800_1004;
 const TMRLR: u32 = 0xB800_1008;
 const TMOVF: u32 = 0xB800_1010;
 const WDTCON: u32 = 0xB7E0_0000;
 const TBGCON: u32 = 0xB7E0_0004;
 const WDTCNT: u32 = 0xB7E0_0010;
+const INTST: u32 = 0xB7E0_0008;
 const UART0: u32 = 0xB7B0_0000;
+/// Where the divisor latches are kept, apart from THR/IER (internal).
+const UART0_DIVISOR: u32 = 0xB7B0_0800;
 const SPI0: u32 = 0xB7B0_2000;
 const SPI1: u32 = 0xB7B0_3000;
 const GPIO: u32 = 0xB7A0_0000;
@@ -68,6 +83,9 @@ const FTM2GR: u32 = 0xB7F0_0050;
 const PO2: u32 = 0xB7A0_2000;
 const PO4: u32 = 0xB7A0_4000;
 const PO11: u32 = 0xB7A0_B000;
+const BWC: u32 = 0x7810_0000;
+const RAMAC: u32 = 0x7810_0008;
+const IO0AC: u32 = 0x7810_000C;
 const I2CCTL: u32 = 0xB780_0C04;
 const I2CSR: u32 = 0xB780_0C08;
 const I2CDR: u32 = 0xB780_0C0C;
@@ -98,6 +116,10 @@ enum FlashState {
 struct FlashCtl {
     state: FlashState,
     busy_until: u64,
+    /// An erase or program was started and has not yet raised FWEND.
+    started: bool,
+    /// FWEND: set when an operation ends, until the program writes 1.
+    ended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,33 +138,168 @@ struct I2c {
     nak: bool,
 }
 
+/// A cycle on the external bus, by the kind of the one before it
+/// matters for when the next may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtCycle {
+    RamRead,
+    RamWrite,
+    IoRead,
+    IoWrite,
+}
+
+/// The external memory controller as the processor sees it: SRAM bank
+/// (the 1 MB at `D000_0000`) and I/O bank 0 (the USB host controller),
+/// timed as chapter 7 of the ML67Q4050/4060 user's manual gives it.
+/// Internal flash and RAM sit on the processor bus and have no wait
+/// setting at all; they are taken to answer in one clock.
 #[derive(Default)]
+struct ExtBus {
+    last: Option<ExtCycle>,
+    /// Board time at which the last cycle released its chip select.
+    released_at: u64,
+}
+
+/// (OE_N/WR_N pulse, read-off) for RAMTYPE, manual table 7.5.4.
+fn ram_timing(ramac: u32) -> Option<(u64, u64)> {
+    match ramac & 7 {
+        0 => Some((1, 0)),
+        1 => Some((2, 0)),
+        2 => Some((3, 2)),
+        3 => Some((4, 2)),
+        7 => Some((8, 4)),
+        _ => None,
+    }
+}
+
+/// (address setup, OE_N/WR_N pulse, data-off) for IOTYPE, table 7.5.5.
+fn io_timing(ioac: u32) -> Option<(u64, u64, u64)> {
+    match ioac & 7 {
+        0 => Some((1, 1, 1)),
+        1 => Some((1, 4, 2)),
+        3 => Some((2, 8, 4)),
+        4 => Some((2, 12, 6)),
+        5 => Some((2, 16, 7)),
+        7 => Some((4, 24, 10)),
+        _ => None,
+    }
+}
+
+/// Clocks from one chip select going away to the next coming, for
+/// cycles from the processor (manual 7.5.8). `off` is the read-off or
+/// data-off setting of the earlier cycle.
+fn ext_gap(before: ExtCycle, off: u64, after: ExtCycle) -> u64 {
+    use ExtCycle::*;
+    match (before, after) {
+        (RamRead, RamRead) => 0,
+        (RamRead, RamWrite) => off.max(1),
+        (RamRead, _) => off.max(2),
+        (RamWrite, RamRead) => 1,
+        (RamWrite, RamWrite) => 0,
+        (RamWrite, _) => 2,
+        (IoRead, RamRead | RamWrite) => off.saturating_sub(1).max(1),
+        (IoRead, IoRead) => 1,
+        (IoRead, IoWrite) => off,
+        (IoWrite, _) => 1,
+    }
+}
+
+/// UART0's transmit side (manual chapter 17, a 16550): a 16-byte FIFO
+/// in front of the shift register when FCR enables it, one holding
+/// register otherwise, each character taking its start, data, parity
+/// and stop bits at the divisor's baud rate.
+#[derive(Default)]
+struct UartTx {
+    fifo: VecDeque<u8>,
+    /// The shift register is busy until this board time.
+    shifting_until: Option<u64>,
+    /// THRE interrupt pending (IIR 02H), when ETHREI allows it.
+    thre_pending: bool,
+}
+
 struct Timer {
     enabled: bool,
     reload: u32,
     overflow: bool,
     next: u64,
+    /// Its clock, APB_CLK.
+    apb_hz: u64,
 }
 
-impl Timer {
-    fn period(&self) -> u64 {
-        (0x1_0000 - (self.reload & 0xFFFF) as u64) * 16
+impl Default for Timer {
+    fn default() -> Self {
+        Timer {
+            enabled: false,
+            reload: 0,
+            overflow: false,
+            next: 0,
+            apb_hz: RING_OSC_HZ,
+        }
     }
 }
 
+impl Timer {
+    /// Board cycles from reload to overflow: APB_CLK/16 counts.
+    fn period(&self) -> u64 {
+        (0x1_0000 - (self.reload & 0xFFFF) as u64) * 16 * CLOCK_HZ / self.apb_hz
+    }
+}
+
+/// The watchdog timer (manual chapter 11): a 16-bit counter clocked
+/// at APB_CLK/32 to /4096 that resets the chip, or raises interrupt 1,
+/// when it overflows.
 #[derive(Default)]
 struct Watchdog {
     running: bool,
+    /// WDHLT, OFINTMODE, WDCKS. Kept across a watchdog reset.
     tbgcon: u8,
     tbg_unlocked: bool,
     cnt_unlocked: bool,
     armed_c3: bool,
-    deadline: u64,
+    /// Counter value at `since`, and the board time it was taken.
+    count: u64,
+    since: u64,
+    /// INTST: RSTSTATUS (bit 0, kept across a watchdog reset) and
+    /// WDTINT (bit 4).
+    intst: u8,
+    intst_unlocked: bool,
+    /// Its clock, APB_CLK; 0 until the board sets it.
+    apb_hz: u64,
 }
 
 impl Watchdog {
+    /// Board cycles per count: APB_CLK/32 to /4096.
     fn tick_cycles(&self) -> u64 {
-        32u64 << (self.tbgcon & 7)
+        (32u64 << (self.tbgcon & 7)) * CLOCK_HZ / self.apb_hz.max(1)
+    }
+
+    fn counting(&self) -> bool {
+        self.running && self.tbgcon & 0x80 == 0
+    }
+
+    /// Fold the time elapsed into the counter (before anything that
+    /// changes its rate, its value or whether it runs).
+    fn settle(&mut self, now: u64) {
+        if self.counting() {
+            let tick = self.tick_cycles();
+            let ticks = (now - self.since) / tick;
+            self.count += ticks;
+            self.since += ticks * tick;
+        } else {
+            self.since = now;
+        }
+    }
+
+    /// Board time of the next overflow, if the counter runs.
+    fn overflow_at(&self) -> Option<u64> {
+        self.counting()
+            .then(|| self.since + (0x1_0000 - self.count.min(0xFFFF)) * self.tick_cycles())
+    }
+
+    fn set_count(&mut self, now: u64, value: u64) {
+        self.settle(now);
+        self.count = value;
+        self.since = now;
     }
 }
 
@@ -161,8 +318,20 @@ pub struct Soc {
     cil: u32,
     timer: Timer,
     i2c: I2c,
+    uart: UartTx,
     wdt: Watchdog,
     flash_ctl: FlashCtl,
+    ext: ExtBus,
+    /// CPU_CLK as the clock registers set it, and the part of a board
+    /// cycle carried over from the last instruction when it is not a
+    /// divisor of 32 MHz.
+    cpu_hz: u64,
+    cpu_cycle_rest: u64,
+    /// Clocks the processor spent waiting on the external bus during
+    /// the instruction being executed; added to its time by `tick`.
+    ext_wait: u64,
+    /// Clocks spent waiting on the external bus since power-on.
+    pub ext_wait_total: u64,
     /// Sector erases and word programs carried out since power-on.
     pub flash_erases: u64,
     pub flash_programs: u64,
@@ -184,7 +353,9 @@ pub struct Soc {
     pub pending_reset: Option<ResetCause>,
     /// Accesses outside every known range, by address.
     pub bus_faults: BTreeSet<u32>,
-    /// Peripheral registers touched without a model, by address.
+    /// Addresses in the peripheral ranges where the chip has no
+    /// register, or registers read before any write whose value after a
+    /// reset is undefined (see [`crate::regmap`]).
     pub unmodelled: BTreeSet<u32>,
 }
 
@@ -209,8 +380,17 @@ impl Soc {
             cil: 0,
             timer: Timer::default(),
             i2c: I2c::default(),
-            wdt: Watchdog::default(),
+            uart: UartTx::default(),
+            wdt: Watchdog {
+                apb_hz: RING_OSC_HZ,
+                ..Watchdog::default()
+            },
             flash_ctl: FlashCtl::default(),
+            ext: ExtBus::default(),
+            cpu_hz: RING_OSC_HZ,
+            cpu_cycle_rest: 0,
+            ext_wait: 0,
+            ext_wait_total: 0,
             flash_erases: 0,
             flash_programs: 0,
             flash_reads_while_busy: 0,
@@ -234,9 +414,21 @@ impl Soc {
         self.cil = 0;
         self.timer = Timer::default();
         self.i2c = I2c::default();
-        self.wdt = Watchdog::default();
+        self.uart = UartTx::default();
+        // Only part of the watchdog goes back to its defaults on its own
+        // reset: its clock setting and reset status stay.
+        self.wdt = Watchdog {
+            tbgcon: self.wdt.tbgcon,
+            intst: self.wdt.intst,
+            apb_hz: RING_OSC_HZ,
+            ..Watchdog::default()
+        };
+        self.cpu_hz = RING_OSC_HZ;
+        self.cpu_cycle_rest = 0;
         self.pending_reset = None;
         self.flash_ctl = FlashCtl::default();
+        self.ext = ExtBus::default();
+        self.ext_wait = 0;
         self.ohci.reset();
         self.board.reset();
     }
@@ -254,7 +446,18 @@ impl Soc {
     /// depends on it.
     #[inline]
     pub fn tick(&mut self, cycles: u32) {
-        self.cycles += cycles as u64;
+        // Instructions and bus waits are in CPU clocks; the board counts
+        // time in cycles of 32 MHz.
+        let spent = cycles as u64 + self.ext_wait;
+        self.ext_wait_total += self.ext_wait;
+        self.ext_wait = 0;
+        if self.cpu_hz == CLOCK_HZ {
+            self.cycles += spent;
+        } else {
+            let scaled = spent * CLOCK_HZ + self.cpu_cycle_rest;
+            self.cycles += scaled / self.cpu_hz;
+            self.cpu_cycle_rest = scaled % self.cpu_hz;
+        }
         if self.timer.enabled && self.cycles >= self.timer.next {
             self.timer.overflow = true;
             self.timer.next += self.timer.period();
@@ -265,13 +468,26 @@ impl Soc {
             let duty =
                 [FTM2GR, FTM2GR + 0x20, FTM2GR + 0x40, FTM2GR + 0x60].map(|r| self.reg(r) as u16);
             self.board.tick_ms(duty, self.millis());
+            if self.uart.shifting_until.is_some() {
+                self.uart_advance();
+            }
             self.ohci.frame(&mut self.usb_ram);
             let irq = self.ohci.irq();
             self.set_line(INT_EXINT2_USB, irq);
         }
-        if self.wdt.running && self.cycles >= self.wdt.deadline {
-            self.wdt.running = false;
-            self.pending_reset = Some(ResetCause::Watchdog);
+        if let Some(at) = self.wdt.overflow_at()
+            && self.cycles >= at
+        {
+            self.wdt.settle(at);
+            self.wdt.count = 0;
+            if self.wdt.tbgcon & 0x40 != 0 {
+                self.wdt.running = false;
+                self.wdt.intst |= 1;
+                self.pending_reset = Some(ResetCause::Watchdog);
+            } else {
+                self.wdt.intst |= 0x10;
+                self.set_line(INT_WDT, true);
+            }
         }
     }
 
@@ -284,7 +500,220 @@ impl Soc {
     }
 
     fn reg(&self, addr: u32) -> u32 {
-        self.regs.get(&addr).copied().unwrap_or(0)
+        match self.regs.get(&addr) {
+            Some(v) => *v,
+            None => crate::regmap::find(addr)
+                .and_then(|(_, reset)| reset)
+                .unwrap_or(0),
+        }
+    }
+
+    /// The processor clock CLKCNT, PLL1 and PLL2 give (manual 4.3), when
+    /// it runs from the crystal; `None` on the ring oscillator or the
+    /// real-time clock.
+    pub fn cpu_clock_hz(&self) -> Option<u64> {
+        let (pll1, pll2, clkcnt) = (self.reg(PLL1), self.reg(PLL2), self.reg(CLKCNT));
+        if (clkcnt >> 8) & 3 != 0 {
+            return None;
+        }
+        self.crystal_clock_hz(pll1, pll2, clkcnt)
+    }
+
+    fn crystal_clock_hz(&self, pll1: u32, pll2: u32, clkcnt: u32) -> Option<u64> {
+        let field = |v: u32, at: u32, bits: u32, zero: u64| match (v >> at) & ((1 << bits) - 1) {
+            0 => zero,
+            n => n as u64,
+        };
+        let (dvcoa, drefa, dvcob, drefb) = (
+            field(pll1, 0, 8, 256),
+            field(pll1, 8, 4, 16),
+            field(pll1, 16, 8, 256),
+            field(pll1, 24, 4, 16),
+        );
+        let (diva, divb, divc) = (
+            field(pll2, 0, 8, 256),
+            field(pll2, 8, 8, 256),
+            field(pll2, 16, 8, 256),
+        );
+        let plla = SYSCLK_HZ * dvcoa / drefa / diva / divb;
+        let source = match clkcnt & 3 {
+            0 => SYSCLK_HZ,
+            1 => plla,
+            2 => plla * dvcob / drefb / divc,
+            _ => return None,
+        };
+        let diva = 1u64 << ((clkcnt >> 2) & 7).min(5);
+        let eighths = [8, 5, 6, 7][((clkcnt >> 5) & 3) as usize];
+        Some(source / diva * eighths / 8)
+    }
+
+    /// Follow a change of the clock registers: the processor, and the
+    /// system timer and watchdog on APB_CLK, run at what they now say.
+    fn check_clock(&mut self) {
+        let clkcnt = self.reg(CLKCNT);
+        let hz = match (clkcnt >> 8) & 3 {
+            0 => self.cpu_clock_hz(),
+            1 => Some(RING_OSC_HZ),
+            2 => Some(RTCCLK_HZ),
+            _ => None,
+        };
+        let Some(hz) = hz.filter(|hz| *hz > 0) else {
+            self.unmodelled.insert(CLKCNT);
+            return;
+        };
+        let apb = match (clkcnt >> 10) & 3 {
+            0 => hz,
+            1 => hz / 2,
+            2 => hz / 4,
+            _ => {
+                self.unmodelled.insert(CLKCNT);
+                hz
+            }
+        };
+        let now = self.cycles;
+        self.wdt.settle(now);
+        self.wdt.apb_hz = apb;
+        if self.timer.enabled && self.timer.apb_hz != apb {
+            // What is left of the period goes at the new pace.
+            let left = self.timer.next.saturating_sub(now);
+            self.timer.next = now + left * self.timer.apb_hz / apb;
+        }
+        self.timer.apb_hz = apb;
+        self.cpu_hz = hz;
+    }
+
+    /// Board cycles one character takes on the line: start bit, 5 to 8
+    /// data bits, parity, 1 or 2 stop bits (1.5 with 5 data bits), at
+    /// APB_CLK / (16 x divisor).
+    fn uart_char_cycles(&self) -> u64 {
+        let lcr = self.reg(UART0 + 0x0C);
+        let divisor = (self.uart_divisor_byte(0) | self.uart_divisor_byte(4) << 8).max(1) as u64;
+        let data = 5 + (lcr & 3) as u64;
+        let parity = (lcr >> 3) & 1;
+        // In half bits, for the 1.5 stop bits.
+        let stop2 = match (lcr & 4 != 0, data) {
+            (false, _) => 2,
+            (true, 5) => 3,
+            (true, _) => 4,
+        };
+        let half_bits = 2 * (1 + data + parity as u64) + stop2;
+        half_bits * 16 * divisor * CLOCK_HZ / self.timer.apb_hz / 2
+    }
+
+    /// DLL (0) or DLM (4); 1 and 0 after a reset.
+    fn uart_divisor_byte(&self, which: u32) -> u32 {
+        let reset = if which == 0 { 1 } else { 0 };
+        self.regs
+            .get(&(UART0_DIVISOR + which))
+            .copied()
+            .unwrap_or(reset)
+    }
+
+    /// Let the transmitter catch up with the board time: characters
+    /// leave the shift register one after the other, the next taken from
+    /// the FIFO the moment the line is free.
+    fn uart_advance(&mut self) {
+        loop {
+            match self.uart.shifting_until {
+                Some(end) if self.cycles >= end => {
+                    self.uart.shifting_until = None;
+                    if let Some(c) = self.uart.fifo.pop_front() {
+                        self.uart_tx.push(c);
+                        self.uart.shifting_until = Some(end + self.uart_char_cycles());
+                        if self.uart.fifo.is_empty() {
+                            self.uart_thre();
+                        }
+                    }
+                }
+                Some(_) => return,
+                None => {
+                    let Some(c) = self.uart.fifo.pop_front() else {
+                        return;
+                    };
+                    self.uart_tx.push(c);
+                    self.uart.shifting_until = Some(self.cycles + self.uart_char_cycles());
+                    if self.uart.fifo.is_empty() {
+                        self.uart_thre();
+                    }
+                }
+            }
+        }
+    }
+
+    fn uart_thre(&mut self) {
+        if self.reg(UART0 + 4) & 2 != 0 {
+            self.uart.thre_pending = true;
+            self.set_line(INT_UART0, true);
+        }
+    }
+
+    /// One access from the processor to the SRAM or the USB controller:
+    /// false if its bank is switched off in BWC, which answers with an
+    /// abort (recorded as a bus fault); otherwise the clocks it costs
+    /// beyond the one the instruction timing already counts are added
+    /// to the processor's wait.
+    fn external(&mut self, addr: u32, size: u32, write: bool) -> bool {
+        let bwc = self.reg(BWC);
+        let io = addr >> 28 == 0xF;
+        let width = if io { (bwc >> 6) & 3 } else { (bwc >> 4) & 3 };
+        let bus_bytes = match width {
+            1 if io => 1,
+            2 => 2,
+            3 => 4,
+            _ => {
+                self.fault(addr);
+                return false;
+            }
+        };
+        let stages = size.div_ceil(bus_bytes) as u64;
+        let (kind, length) = if io {
+            let Some((setup, pulse, _)) = io_timing(self.reg(IO0AC)) else {
+                self.unmodelled.insert(IO0AC);
+                return true;
+            };
+            if write {
+                (ExtCycle::IoWrite, stages * (1 + setup + pulse + 1))
+            } else if stages == 1 {
+                // Address held one clock after a single read.
+                (ExtCycle::IoRead, setup + pulse + 1)
+            } else {
+                (ExtCycle::IoRead, stages * (setup + pulse))
+            }
+        } else {
+            let Some((pulse, _)) = ram_timing(self.reg(RAMAC)) else {
+                self.unmodelled.insert(RAMAC);
+                return true;
+            };
+            if write {
+                // Half a clock of setup and of hold around the pulse.
+                (ExtCycle::RamWrite, stages * (pulse + 1))
+            } else {
+                (ExtCycle::RamRead, stages * pulse)
+            }
+        };
+        let now = self.cycles + self.ext_wait;
+        let start = match self.ext.last {
+            Some(before) => {
+                now.max(self.ext.released_at + ext_gap(before, self.ext_off(before), kind))
+            }
+            None => now,
+        };
+        self.ext.last = Some(kind);
+        self.ext.released_at = start + length;
+        self.ext_wait += (start - now) + length - 1;
+        true
+    }
+
+    /// The off-time setting that applies after a cycle of this kind.
+    fn ext_off(&self, kind: ExtCycle) -> u64 {
+        match kind {
+            ExtCycle::RamRead | ExtCycle::RamWrite => {
+                ram_timing(self.reg(RAMAC)).map_or(0, |(_, off)| off)
+            }
+            ExtCycle::IoRead | ExtCycle::IoWrite => {
+                io_timing(self.reg(IO0AC)).map_or(0, |(_, _, off)| off)
+            }
+        }
     }
 
     fn irq_level(&self, source: u32) -> u32 {
@@ -347,22 +776,69 @@ impl Soc {
             EXIRQA => ((self.irq_lines >> 16) & 0xFFFF) as u32,
             EXIRQB => ((self.irq_lines >> 32) & 0xFFFF) as u32,
             EXIRQC => ((self.irq_lines >> 48) & 0xFFFF) as u32,
-            // Flash sequencer: bit 1 is "command completed", no error bits.
+            // FLWE (0) as written, FWEND (1) latched at the end of an
+            // operation, BUSY (2) and BUSYNVW (3) high while the core
+            // works or while programming is not permitted. Security
+            // released: SEQM (5) reads 0.
             FLACON => {
-                let ready = (self.cycles >= self.flash_ctl.busy_until) as u32;
-                (self.reg(addr) & !0x0E) | ready << 1
+                let busy = self.cycles < self.flash_ctl.busy_until;
+                if self.flash_ctl.started && !busy {
+                    self.flash_ctl.started = false;
+                    self.flash_ctl.ended = true;
+                }
+                let flwe = self.reg(addr) & 1;
+                let busy = (busy || flwe == 0) as u32;
+                flwe | (self.flash_ctl.ended as u32) << 1
+                    | busy << 2
+                    | busy << 3
+                    | (self.reg(addr) & 0x10)
             }
             TMEN => self.timer.enabled as u32,
             TMRLR => self.timer.reload,
             TMOVF => self.timer.overflow as u32,
-            WDTCON | TBGCON | WDTCNT => self.reg(addr),
-            a if a & !0xFFF == UART0 => match a & 0xFFF {
-                // LSR: transmitter always empty, nothing received.
-                0x14 => 0x60,
-                // IIR: no interrupt pending.
-                0x08 => 0x01,
-                _ => self.reg(a),
-            },
+            TBGCON => self.wdt.tbgcon as u32,
+            INTST => self.wdt.intst as u32,
+            WDTCNT => {
+                let now = self.cycles;
+                self.wdt.settle(now);
+                self.wdt.count as u32 & 0xFFFF
+            }
+            a if a & !0xFFF == UART0 => {
+                self.uart_advance();
+                let dlab = self.reg(UART0 + 0x0C) & 0x80 != 0;
+                match a & 0xFFF {
+                    // LSR: THRE when the FIFO (or holding register) is
+                    // empty, TEMT when the shift register is too; the
+                    // receiver is not wired, nothing ever arrives.
+                    0x14 => {
+                        let thre = self.uart.fifo.is_empty();
+                        let temt = thre && self.uart.shifting_until.is_none();
+                        (thre as u32) << 5 | (temt as u32) << 6
+                    }
+                    // IIR: FIFO mode in bits 6-7, then the pending source.
+                    0x08 => {
+                        let fifo = if self.reg(UART0 + 0x08) & 1 != 0 {
+                            0xC0
+                        } else {
+                            0
+                        };
+                        if self.uart.thre_pending {
+                            // Reading IIR clears a THRE interrupt.
+                            self.uart.thre_pending = false;
+                            self.set_line(INT_UART0, false);
+                            fifo | 0x02
+                        } else {
+                            fifo | 0x01
+                        }
+                    }
+                    // Receive buffer: empty.
+                    0x00 if !dlab => 0,
+                    // The divisor latches share their addresses with the
+                    // buffer and IER; they are kept apart.
+                    0x00 | 0x04 if dlab => self.uart_divisor_byte(a & 4),
+                    _ => self.reg(a),
+                }
+            }
             a if a & !0xFFF == SPI0 || a & !0xFFF == SPI1 => match a & 0xFFF {
                 // SPSR: transfer complete, both FIFOs empty.
                 0x08 => 0x0014_0020,
@@ -406,7 +882,10 @@ impl Soc {
             }
             a if a >= USB_BASE => self.ohci.read(a - USB_BASE),
             _ => {
-                if !self.regs.contains_key(&addr) {
+                // A register the chip does not have, or one whose value
+                // after a reset is undefined, read before any write.
+                let known = crate::regmap::find(addr).is_some_and(|(_, r)| r.is_some());
+                if !self.regs.contains_key(&addr) && !known {
                     self.unmodelled.insert(addr);
                 }
                 self.reg(addr)
@@ -440,45 +919,118 @@ impl Soc {
                     self.set_line(INT_SYSTEM_TIMER, false);
                 }
             }
+            PLL1 | PLL2 | CLKCNT => {
+                self.regs.insert(addr, merged);
+                self.check_clock();
+            }
+            FLACON => {
+                let v = val & mask;
+                if v & 2 != 0 {
+                    // Settle a pending end first: writing 1 clears FWEND.
+                    if self.flash_ctl.started && self.cycles >= self.flash_ctl.busy_until {
+                        self.flash_ctl.started = false;
+                    }
+                    self.flash_ctl.ended = false;
+                }
+                // FLWE and SEQMD are kept; FLRST resets the core at once.
+                if v & 0x40 != 0 {
+                    self.flash_ctl.state = FlashState::Idle;
+                }
+                self.regs.insert(addr, v & 0x11);
+            }
             WDTCON => {
                 let v = (val & mask & 0xFF) as u8;
-                if v == 0xC3 {
-                    self.wdt.armed_c3 = true;
-                } else if v == 0x3C {
-                    // First 0x3C starts the counter, 0xC3 then 0x3C clears it.
-                    if !self.wdt.running || self.wdt.armed_c3 {
+                let now = self.cycles;
+                if !self.wdt.running {
+                    // The first 3CH starts the counter from zero.
+                    if v == 0x3C {
+                        self.wdt.set_count(now, 0);
                         self.wdt.running = true;
-                        self.wdt.deadline = self.cycles + 0x1_0000 * self.wdt.tick_cycles();
+                        self.wdt.since = now;
                     }
+                } else if v == 0xC3 {
+                    self.wdt.armed_c3 = true;
+                } else if v == 0x3C && self.wdt.armed_c3 {
+                    // C3H then 3CH clears it.
+                    self.wdt.set_count(now, 0);
+                    self.wdt.armed_c3 = false;
+                } else {
                     self.wdt.armed_c3 = false;
                 }
             }
             TBGCON => {
                 let v = (val & mask & 0xFF) as u8;
                 if self.wdt.tbg_unlocked {
-                    self.wdt.tbgcon = v;
+                    // The counter keeps its value across a change of
+                    // clock, a halt or a resumption.
+                    let now = self.cycles;
+                    self.wdt.settle(now);
+                    self.wdt.tbgcon = v & 0xC7;
+                    self.wdt.since = now;
                     self.wdt.tbg_unlocked = false;
-                    self.regs.insert(addr, v as u32);
                 } else if v == 0x5A {
                     self.wdt.tbg_unlocked = true;
+                }
+            }
+            INTST => {
+                let v = (val & mask & 0xFF) as u8;
+                if v == 0x3C {
+                    self.wdt.intst_unlocked = true;
+                } else {
+                    // Writing 1 is ignored; 0 clears, RSTSTATUS only
+                    // after the unlock.
+                    if v & 0x10 == 0 {
+                        self.wdt.intst &= !0x10;
+                        self.set_line(INT_WDT, false);
+                    }
+                    if v & 1 == 0 && self.wdt.intst_unlocked {
+                        self.wdt.intst &= !1;
+                    }
+                    self.wdt.intst_unlocked = false;
                 }
             }
             WDTCNT => {
                 let v = val & mask & 0xFFFF;
                 if self.wdt.cnt_unlocked {
                     self.wdt.cnt_unlocked = false;
-                    self.wdt.deadline =
-                        self.cycles + (0x1_0000 - v as u64) * self.wdt.tick_cycles();
+                    let now = self.cycles;
+                    self.wdt.set_count(now, v as u64);
                 } else if v == 0x5A5A {
                     self.wdt.cnt_unlocked = true;
                 }
             }
             a if a & !0xFFF == UART0 => {
+                self.uart_advance();
                 let dlab = self.reg(UART0 + 0x0C) & 0x80 != 0;
-                if a & 0xFFF == 0 && !dlab && mask & 0xFF != 0 {
-                    self.uart_tx.push(val as u8);
-                } else {
-                    self.regs.insert(a, merged);
+                match a & 0xFFF {
+                    0x00 if !dlab => {
+                        let depth = if self.reg(UART0 + 0x08) & 1 != 0 {
+                            16
+                        } else {
+                            1
+                        };
+                        // A full FIFO drops what is written to it.
+                        if self.uart.fifo.len() < depth {
+                            self.uart.fifo.push_back(val as u8);
+                        }
+                        self.uart.thre_pending = false;
+                        self.set_line(INT_UART0, false);
+                        self.uart_advance();
+                    }
+                    0x00 | 0x04 if dlab => {
+                        self.regs.insert(UART0_DIVISOR + (a & 4), val & 0xFF);
+                    }
+                    // FCR: bit 2 empties the transmit FIFO; only FIFO
+                    // enable and the trigger level are kept.
+                    0x08 => {
+                        if val & 4 != 0 {
+                            self.uart.fifo.clear();
+                        }
+                        self.regs.insert(a, val & 0xC1);
+                    }
+                    _ => {
+                        self.regs.insert(a, merged);
+                    }
                 }
             }
             a if (a & !0xFFF == SPI0 || a & !0xFFF == SPI1) && a & 0xFFF == 0x0C => {
@@ -533,6 +1085,9 @@ impl Soc {
                 self.regs.insert(addr, merged);
             }
             _ => {
+                if crate::regmap::find(addr).is_none() {
+                    self.unmodelled.insert(addr);
+                }
                 self.regs.insert(addr, merged);
             }
         }
@@ -559,6 +1114,7 @@ impl Soc {
                 self.flash[start..start + SECTOR].fill(0xFF);
                 self.flash_erases += 1;
                 self.flash_ctl.busy_until = self.cycles + ERASE_CYCLES;
+                self.flash_ctl.started = true;
                 Idle
             }
             (Program(left), _, _) => {
@@ -567,6 +1123,7 @@ impl Soc {
                 if left == 1 {
                     self.flash_programs += 1;
                     self.flash_ctl.busy_until = self.cycles + PROGRAM_CYCLES;
+                    self.flash_ctl.started = true;
                     Idle
                 } else {
                     Program(left - 1)
@@ -588,6 +1145,10 @@ impl Soc {
     /// Everything volatile is lost: registers, both RAMs, the USB chip.
     pub fn power_cycle(&mut self) {
         self.reset();
+        self.wdt = Watchdog {
+            apb_hz: RING_OSC_HZ,
+            ..Watchdog::default()
+        };
         self.iram.fill(0);
         self.xram.fill(0);
         self.usb_ram.fill(0);
@@ -636,6 +1197,9 @@ impl Bus for Soc {
         if self.flash_is_away(addr) {
             return !0;
         }
+        if addr >= XRAM_BASE && !self.external(addr, 1, false) {
+            return 0;
+        }
         if let Some(m) = self.mem(addr, 1) {
             return m[0];
         }
@@ -650,6 +1214,9 @@ impl Bus for Soc {
     fn read16(&mut self, addr: u32) -> u16 {
         if self.flash_is_away(addr) {
             return !0;
+        }
+        if addr >= XRAM_BASE && !self.external(addr, 2, false) {
+            return 0;
         }
         if let Some(m) = self.mem(addr, 2) {
             return u16::from_le_bytes([m[0], m[1]]);
@@ -666,6 +1233,9 @@ impl Bus for Soc {
         if self.flash_is_away(addr) {
             return !0;
         }
+        if addr >= XRAM_BASE && !self.external(addr, 4, false) {
+            return 0;
+        }
         if let Some(m) = self.mem(addr, 4) {
             return u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
         }
@@ -678,6 +1248,9 @@ impl Bus for Soc {
 
     #[inline]
     fn write8(&mut self, addr: u32, val: u8) {
+        if addr >= XRAM_BASE && !self.external(addr, 1, true) {
+            return;
+        }
         if addr >> 28 == 0 {
             return self.flash_store(addr, val);
         }
@@ -693,6 +1266,9 @@ impl Bus for Soc {
 
     #[inline]
     fn write16(&mut self, addr: u32, val: u16) {
+        if addr >= XRAM_BASE && !self.external(addr, 2, true) {
+            return;
+        }
         if addr >> 28 == 0 {
             return;
         }
@@ -708,6 +1284,9 @@ impl Bus for Soc {
 
     #[inline]
     fn write32(&mut self, addr: u32, val: u32) {
+        if addr >= XRAM_BASE && !self.external(addr, 4, true) {
+            return;
+        }
         if addr >> 28 == 0 {
             return;
         }

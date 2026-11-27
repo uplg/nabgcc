@@ -13,6 +13,7 @@ pub mod lan;
 pub mod metal;
 pub mod ohci;
 pub mod p256;
+pub mod regmap;
 pub mod rfid;
 pub mod rt2573;
 pub mod sae;

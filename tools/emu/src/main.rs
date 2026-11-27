@@ -153,6 +153,10 @@ fn main() -> ExitCode {
             m.soc.flash_programs
         );
     }
+    println!(
+        "external bus: {:.1} ms spent waiting on the SRAM and the USB controller",
+        m.soc.ext_wait_total as f64 * 1000.0 / nabemu::soc::CLOCK_HZ as f64
+    );
     if !m.soc.bus_faults.is_empty() {
         let list: Vec<String> = m
             .soc

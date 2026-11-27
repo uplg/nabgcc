@@ -147,6 +147,19 @@ pub fn aes_cmac(key: &[u8; 16], message: &[u8]) -> [u8; 16] {
     x
 }
 
+/// MIC of BIP-CMAC-128 (IEEE 802.11-2020 12.5.4) over a management
+/// frame whose management MIC element ends it, MIC field zero or not:
+/// AES-CMAC over the header's frame control (retry, power management
+/// and more data cleared) and three addresses, then the body with the
+/// MIC zeroed; the first 8 bytes.
+pub fn bip_mic(igtk: &[u8; 16], frame: &[u8]) -> [u8; 8] {
+    let mut aad = vec![frame[0], frame[1] & !0x38];
+    aad.extend_from_slice(&frame[4..22]);
+    aad.extend_from_slice(&frame[HEADER_LEN..frame.len() - 8]);
+    aad.extend_from_slice(&[0; 8]);
+    aes_cmac(igtk, &aad)[..8].try_into().unwrap()
+}
+
 pub fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
     hmac(sha1, key, parts)
 }
@@ -598,6 +611,40 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    /// IEEE 802.11-2012 M.9.1: BIP with a broadcast deauthentication.
+    #[test]
+    fn bip_matches_the_standards_vector() {
+        let igtk: [u8; 16] = hex("4ea9543e09cf2b1eca66ffc58bdecbcf").try_into().unwrap();
+        let unsigned = hex("c0000000ffffffffffff020000000000020000000000 0900 0200
+             4c10 0400 040000000000 0000000000000000");
+        assert_eq!(bip_mic(&igtk, &unsigned).to_vec(), hex("48dfbfa7b8278872"));
+        // Retry, power management and more data do not enter the MIC.
+        let mut retried = unsigned.clone();
+        retried[1] |= 0x38;
+        assert_eq!(bip_mic(&igtk, &retried), bip_mic(&igtk, &unsigned));
+    }
+
+    /// IEEE 802.11-2012 M.9.2: CCMP with a unicast deauthentication,
+    /// the management flag in the nonce.
+    #[test]
+    fn ccmp_management_frames_match_the_standards_vector() {
+        let tk = hex("66ed21042f9f26d7115706e40414cf2e");
+        let plain = hex("c0000000020000000100020000000000020000000000 6000 0200");
+        let key = Key {
+            cipher: Cipher::Ccmp,
+            key: &tk,
+            mic: &[0; 8],
+        };
+        let sealed = protect(&key, &plain, 0x2000_0001, 0);
+        assert_eq!(
+            sealed,
+            hex("c0400000020000000100020000000000020000000000 6000
+                 0100002000000000 1d07 cafd0409bb8bafef")
+        );
+        let (opened, _, _) = unprotect(&key, &sealed).unwrap();
+        assert_eq!(opened[24..], plain[24..]);
     }
 
     #[test]

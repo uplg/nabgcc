@@ -6,7 +6,7 @@
 #![no_main]
 
 use lapin_core::sae::{self, vector};
-use lapin_fw::{halt, uart};
+use lapin_fw::{clock, halt, uart};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -22,6 +22,9 @@ fn verdict(name: &[u8], ok: bool) {
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     lapin_fw::start::link();
+    // The chip starts on its ring oscillator: the timings mean nothing
+    // before the PLL gives the 32 MHz the firmware runs at.
+    clock::init();
     uart::init();
     uart::write(b"lapin bench\n");
 

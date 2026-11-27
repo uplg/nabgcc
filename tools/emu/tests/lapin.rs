@@ -28,6 +28,8 @@ fn the_firmware_boots_and_stays_up() {
     m.run_until_ms(10_500);
     assert_eq!(m.events, [], "no reset in ten seconds");
     assert!(m.soc.bus_faults.is_empty(), "{:x?}", m.soc.bus_faults);
+    assert!(m.soc.unmodelled.is_empty(), "{:x?}", m.soc.unmodelled);
+    assert_eq!(m.soc.cpu_clock_hz(), Some(32_000_000));
     // The same amber as the firmware it replaces, on all five leds.
     assert_eq!(m.soc.board.leds, [AMBER; 5]);
     // It found its Wi-Fi stick, read its address, went through the
@@ -286,6 +288,8 @@ fn every_driver_does_its_job() {
     let console = m.console();
     assert_eq!(m.events, [], "{console}");
     assert!(m.soc.bus_faults.is_empty(), "{:x?}", m.soc.bus_faults);
+    assert!(m.soc.unmodelled.is_empty(), "{:x?}", m.soc.unmodelled);
+    assert_eq!(m.soc.cpu_clock_hz(), Some(32_000_000));
 
     // Ears: seventeen teeth between two passes of the gap, both sides.
     assert!(console.contains("ears 17 17\n"), "{console}");

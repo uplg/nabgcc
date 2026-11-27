@@ -12,7 +12,7 @@ Nothing here has been on a real rabbit.
 
 ## Running it
 
-    cd tools/emu && cargo test --release          # 93 tests, about 40 s
+    cd tools/emu && cargo test --release          # 104 tests, about 40 s
     cd lapin && ./build.sh                        # needs the nightly toolchain
     cd tools/emu && cargo run --release -- --ap Terrier ../../lapin/target/thumbv4t-none-eabi/release/lapin
     cd tools/emu && web/build.sh && node web/test.mjs
@@ -65,23 +65,35 @@ CCMP frame is numbered 0 and dropped by Linux access points
 fourth; the Rust firmware already sends it.
 
 **Unverified assumptions.** In the emulator: flash erase and program
-times (from a comment in the C code), ear speed, the stick's power-on
-beacon interval, what the stick reports for a frame it has no key for,
-no bus wait states. The rabbit's Wi-Fi module is an MSI MS-6877
+times (from a comment in the C code, within the manual's maxima), ear
+speed, the stick's power-on beacon interval, what the stick reports
+for a frame it has no key for, the ring oscillator's frequency (the
+first milliseconds of boot), one clock for internal memory and
+peripheral registers (the manual gives no wait for them). The external
+bus is timed from the manual: the C firmware spends about 8 % of its
+time waiting on the SRAM and the USB controller. The rabbit's Wi-Fi module is an MSI MS-6877
 (RT2571WF; USB id 0db0:6877), which exists as "VER:1.0, made in
 Taiwan" (the one in Léonard's rabbit) and "Ver:A, made in China". The
 FCC photos of an MS-6877 without its shield show an RT2528L radio. No
 type has been read from a rabbit's own stick yet: the Rust driver
 tunes the two 2.4 GHz chips (RT2528, RT2527, words as in Linux's
 rt73usb), prints the type at boot (`wifi <address> radio NN`) and
-refuses the two 5 GHz ones. Whether the watchdog can
-really be paused during a flash (the C code tries without the unlock
-sequence) is unknown; a full image takes 1.76 s by the modelled
-timings, against 2.09 s.
+refuses the two 5 GHz ones. The watchdog can be paused (WDHLT in
+TBGCON, after the 5AH unlock); the C code sets the bit without the
+unlock, which the chip ignores, so its flash routines run under the
+watchdog. A full image takes 1.76 s by the modelled timings, against
+2.09 s.
 
-**Not done in the emulator.** Protected broadcast management frames
-(BIP), SA query, SAE anti-clogging tokens, the stick's pairwise key
-table, MP3 and MIDI decoding. The browser page was only looked at
+**Not done in the emulator.** The stick's pairwise key table, MP3 and
+MIDI decoding.
+
+**WPA3 on a real network.** A rabbit that restarts while associated
+with protected management frames (a watchdog reset, say) finds the
+access point still holding its old association: hostapd refuses the
+new one with status 30 and a comeback time of about a second while it
+asks the old keys whether they are still there (SA Query). The
+firmware has to wait and try again. `tests/wpa3.rs` shows the whole
+sequence with the reference station. The browser page was only looked at
 through two screenshots.
 
 **Not exercised by any test yet, in the Rust firmware.** Transmit power

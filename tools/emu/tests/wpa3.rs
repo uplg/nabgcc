@@ -40,7 +40,7 @@ impl World {
             self.ap.poll(&mut self.radio, self.now);
             // Beacons are not for the station's state machine.
             self.radio.rx.retain(|f| f.data[0] != 0x80);
-            self.sta.poll(&mut self.radio);
+            self.sta.poll(&mut self.radio, self.now);
         }
     }
 
@@ -316,4 +316,207 @@ fn replayed_frames_are_dropped() {
     w.run(5);
     assert_eq!(w.ap.uplink.len(), 1);
     assert!(w.ap.events.contains(&ApEvent::Replay { sta: STA }));
+}
+
+fn anti_clogging(method: Method) {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    // hostapd's threshold at 0: every commit needs a token.
+    w.ap.anti_clogging_threshold = 0;
+    w.sta.method = method;
+    w.join();
+    assert_eq!(w.sta.state, State::Connected, "{:?}", w.ap.events);
+    assert_eq!(w.sta.notices, [Notice::TokenSentBack]);
+    assert_eq!(
+        w.ap.events
+            .iter()
+            .filter(|e| matches!(e, ApEvent::SaeTokenRequested { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_busy_access_point_gets_its_token_back_after_hashing_to_the_curve() {
+    anti_clogging(Method::HashToElement);
+}
+
+#[test]
+fn a_busy_access_point_gets_its_token_back_after_hunting_and_pecking() {
+    anti_clogging(Method::HuntingAndPecking);
+}
+
+#[test]
+fn tokens_are_only_asked_for_once_enough_exchanges_are_open() {
+    // hostapd's default of 5: a lone station is not bothered.
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    assert_eq!(w.ap.anti_clogging_threshold, 5);
+    w.join();
+    assert!(w.sta.is_connected());
+    assert!(
+        !w.ap
+            .events
+            .iter()
+            .any(|e| matches!(e, ApEvent::SaeTokenRequested { .. }))
+    );
+}
+
+#[test]
+fn a_made_up_token_is_dropped_without_an_answer() {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    w.ap.anti_clogging_threshold = 0;
+    w.sta.method = Method::HuntingAndPecking;
+    w.sta.connect(&mut w.radio, BSSID, 6);
+    w.now += 1;
+    w.ap.poll(&mut w.radio, w.now);
+    // The token request is in the air for the station; swap the token
+    // the station will copy for a forged one.
+    let reply = w.radio.rx.iter_mut().find(|f| f.data[0] == 0xB0).unwrap();
+    let n = reply.data.len();
+    reply.data[n - 1] ^= 1;
+    w.run(50);
+    assert_eq!(w.sta.state, State::Committed, "{:?}", w.ap.events);
+    assert!(
+        w.ap.events
+            .contains(&ApEvent::SaeTokenRejected { sta: STA })
+    );
+    assert!(!w.ap.is_authorized(STA));
+}
+
+#[test]
+fn a_station_that_lost_its_keys_gets_back_in_after_the_sa_query_times_out() {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    w.join();
+    assert!(w.sta.is_connected());
+    // The station restarts: no keys any more, the access point does not
+    // know.
+    w.sta.forget();
+    let restarted = w.now;
+    w.join();
+    // The password exchange went through, the association was refused
+    // for now and the old association asked whether it is still there.
+    assert!(
+        w.ap.events.contains(&ApEvent::AssocRejected {
+            sta: STA,
+            status: 30
+        }),
+        "{:?}",
+        w.ap.events
+    );
+    assert!(w.ap.events.contains(&ApEvent::SaQueryStarted { sta: STA }));
+    assert!(
+        matches!(w.sta.notices[..], [Notice::ComeBackIn { tu: 990..=1001 }]),
+        "{:?}",
+        w.sta.notices
+    );
+    // Nobody answers the queries (the keys are gone): after the time
+    // given, the station is let in.
+    while !w.sta.is_connected() && w.now < restarted + 2000 {
+        w.run(1);
+    }
+    let took = w.now - restarted;
+    w.run(2);
+    assert!(w.ap.events.contains(&ApEvent::SaQueryTimedOut { sta: STA }));
+    assert_eq!(w.sta.state, State::Connected, "{:?}", w.ap.events);
+    assert!(w.ap.is_authorized(STA));
+    // hostapd's 1000 time units are 1024 ms.
+    assert!((1024..1100).contains(&took), "back after {took} ms");
+}
+
+#[test]
+fn a_station_still_there_keeps_its_association_against_an_impostor() {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    w.join();
+    // Somebody else, with the station's address, associates in clear.
+    let mut assoc = vec![0x00, 0, 0, 0];
+    assoc.extend_from_slice(&BSSID);
+    assoc.extend_from_slice(&STA);
+    assoc.extend_from_slice(&BSSID);
+    assoc.extend_from_slice(&[0x10, 0, 0x31, 0x04, 10, 0, 0, 7]);
+    assoc.extend_from_slice(b"Terrier");
+    assoc.extend_from_slice(&[
+        48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 8, 0xC0, 0,
+    ]);
+    w.radio.tx.push_back(TxFrame {
+        data: assoc,
+        channel: 6,
+    });
+    w.run(10);
+    // Refused for now; the real station answers the query with its keys.
+    assert!(w.ap.events.contains(&ApEvent::AssocRejected {
+        sta: STA,
+        status: 30
+    }));
+    assert!(w.ap.events.contains(&ApEvent::SaQueryAnswered { sta: STA }));
+    assert!(w.sta.notices.contains(&Notice::SaQueryAnswered));
+    assert!(w.sta.is_connected());
+    assert!(w.ap.is_authorized(STA));
+    // And traffic still flows on the old keys.
+    let up = ethernet([2, 0, 0, 0, 0, 1], STA, b"toujours la");
+    w.sta.send(&mut w.radio, &up);
+    w.run(5);
+    assert_eq!(w.ap.uplink.pop_front(), Some(up));
+}
+
+#[test]
+fn robust_action_frames_in_clear_are_dropped() {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    w.join();
+    let mut query = vec![0xD0, 0, 0, 0];
+    query.extend_from_slice(&BSSID);
+    query.extend_from_slice(&STA);
+    query.extend_from_slice(&BSSID);
+    query.extend_from_slice(&[0, 0, 8, 0, 0x12, 0x34]);
+    w.radio.tx.push_back(TxFrame {
+        data: query,
+        channel: 6,
+    });
+    w.run(5);
+    assert!(
+        w.ap.events
+            .contains(&ApEvent::UnprotectedActionDropped { sta: STA })
+    );
+}
+
+#[test]
+fn a_shut_down_is_believed_only_with_its_integrity_code() {
+    let mut w = World::new(Wpa3::Only, PASSWORD);
+    w.join();
+    // A forged deauthentication to everyone, no management MIC element.
+    let mut forged = vec![0xC0, 0, 0, 0];
+    forged.extend_from_slice(&[0xFF; 6]);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&[0, 0, 3, 0]);
+    w.radio.rx.push_back(RxFrame::new(forged));
+    w.run(2);
+    assert!(w.sta.is_connected());
+    assert_eq!(w.sta.notices, [Notice::ForgedDeauthIgnored]);
+
+    // The genuine one, after a group key renewal (new integrity key,
+    // new identifier).
+    w.ap.rekey_group(&mut w.radio);
+    w.run(10);
+    w.ap.shut_down(&mut w.radio);
+    let genuine = w.radio.rx.back().unwrap().clone();
+    w.run(2);
+    assert_eq!(w.sta.state, State::Idle);
+    assert_eq!(
+        w.sta.notices.last(),
+        Some(&Notice::Deauthenticated { reason: 3 })
+    );
+    let n = genuine.data.len();
+    assert_eq!(
+        genuine.data[n - 18..n - 14],
+        [76, 16, 5, 0],
+        "key 5 after the renewal"
+    );
+
+    // Replayed to a station that came back: refused by its packet number.
+    let mut w2 = World::new(Wpa3::Only, PASSWORD);
+    w2.join();
+    w2.ap.shut_down(&mut w2.radio);
+    let first = w2.radio.rx.back().unwrap().clone();
+    w2.run(2);
+    assert_eq!(w2.sta.state, State::Idle);
+    let _ = first;
 }

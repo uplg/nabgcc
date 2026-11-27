@@ -23,6 +23,14 @@ fn boots_finds_its_wifi_stick_and_scans() {
         m.soc.bus_faults
     );
     assert_eq!(m.soc.ohci.errors, 0);
+    // Every register it touched exists on the chip, with a known value
+    // after reset, and it set the clocks the board is modelled at.
+    assert!(
+        m.soc.unmodelled.is_empty(),
+        "registers without a model: {:08x?}",
+        m.soc.unmodelled
+    );
+    assert_eq!(m.soc.cpu_clock_hz(), Some(32_000_000));
 
     let console = m.console();
     assert!(
@@ -34,6 +42,12 @@ fn boots_finds_its_wifi_stick_and_scans() {
         "it read the stick's MAC:\n{console}"
     );
 
+    // The receiver is off for a moment at every change of channel:
+    // it has to come back within the next step of the scan.
+    let limit = m.soc.millis() + 500;
+    while !m.radio.borrow().rx_enabled && m.soc.millis() < limit {
+        m.run_until_ms(m.soc.millis() + 10);
+    }
     let radio = m.radio.borrow();
     assert!(
         radio.firmware_loaded,

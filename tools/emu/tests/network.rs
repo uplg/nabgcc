@@ -52,7 +52,16 @@ fn boots_its_bytecode(wifi: Wifi, security: Security) -> Machine {
     assert_eq!(m.events, [], "no reset on the way");
 
     let lan = m.lan.as_ref().unwrap();
-    assert_eq!(lan.dhcp_messages[..2], [1, 3], "discover, then request");
+    // Discover until an offer gets through, then request. With WPA the
+    // first discover can leave while the group key handshake is still
+    // on (the port is open, as on hostapd): the broadcast offer is then
+    // lost to a rabbit that has no group key yet, and it asks again.
+    let request = lan.dhcp_messages.iter().position(|m| *m == 3);
+    assert!(
+        request.is_some_and(|i| i >= 1 && lan.dhcp_messages[..i].iter().all(|m| *m == 1)),
+        "discover, then request: {:?}",
+        lan.dhcp_messages
+    );
     assert_eq!(lan.leased_to, Some(DEFAULT_MAC));
     assert_eq!(lan.dns_queries[0], "r.nabaztag.com");
     let request = &lan.requests[0];

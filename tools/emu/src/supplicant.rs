@@ -45,6 +45,17 @@ pub enum Notice {
     },
     /// A frame failed to decrypt or repeated an old packet number.
     Dropped,
+    /// The access point asked for an anti-clogging token; the commit
+    /// went again with it.
+    TokenSentBack,
+    /// The association was refused for now (status 30): another
+    /// attempt after this many time units.
+    ComeBackIn {
+        tu: u32,
+    },
+    /// The access point checked that we are still here (SA Query); we
+    /// answered.
+    SaQueryAnswered,
 }
 
 pub struct Supplicant {
@@ -68,7 +79,18 @@ pub struct Supplicant {
     ptk: [u8; 48],
     snonce: [u8; 32],
     gtk: Option<(u8, [u8; 16])>,
-    igtk: Option<[u8; 16]>,
+    /// Key identifier (4 or 5) and key of the integrity group key.
+    igtk: Option<(u16, [u8; 16])>,
+    /// Last packet number of a BIP-protected frame.
+    igtk_rx_ipn: u64,
+    /// Last packet number of a protected management frame from the
+    /// access point (kept apart from data frames).
+    mgmt_rx_pn: u64,
+    /// The commit body, kept to send again with a token.
+    commit: Vec<u8>,
+    /// Board time of the next association attempt after a status 30.
+    retry_assoc_at: Option<u64>,
+    now: u64,
     tx_pn: u64,
     rx_pn: u64,
     group_rx_pn: u64,
@@ -102,6 +124,11 @@ impl Supplicant {
             snonce: [0; 32],
             gtk: None,
             igtk: None,
+            igtk_rx_ipn: 0,
+            mgmt_rx_pn: 0,
+            commit: Vec::new(),
+            retry_assoc_at: None,
+            now: 0,
             tx_pn: 0,
             rx_pn: 0,
             group_rx_pn: 0,
@@ -194,9 +221,20 @@ impl Supplicant {
         let mut body = vec![3, 0, 1, 0];
         body.extend_from_slice(&status.to_le_bytes());
         body.extend_from_slice(&session.commit().to_bytes());
+        self.commit = body.clone();
         self.session = Some(session);
         self.transmit(radio, 0xB0, 0, bssid, &body, false);
         self.state = State::Committed;
+    }
+
+    /// Lose everything, as a station that restarts: keys, counters,
+    /// state. The access point is not told.
+    pub fn forget(&mut self) {
+        let fresh = Supplicant::new(self.mac, &self.ssid, &self.password);
+        let (method, protect) = (self.method, self.protect_management);
+        *self = fresh;
+        self.method = method;
+        self.protect_management = protect;
     }
 
     /// Send an Ethernet frame through the access point.
@@ -218,8 +256,13 @@ impl Supplicant {
         self.state = State::Idle;
     }
 
-    /// Handle everything that arrived.
-    pub fn poll(&mut self, radio: &mut Radio) {
+    /// Handle everything that arrived; `now_ms` is the board time.
+    pub fn poll(&mut self, radio: &mut Radio, now_ms: u64) {
+        self.now = now_ms;
+        if self.retry_assoc_at.is_some_and(|at| now_ms >= at) {
+            self.retry_assoc_at = None;
+            self.associate(radio);
+        }
         while let Some(frame) = radio.rx.pop_front() {
             let f = frame.data;
             if f.len() < 24 || f[10..16] != self.bssid {
@@ -231,6 +274,7 @@ impl Supplicant {
                 0xB0 if mine => self.on_authentication(radio, &f[24..]),
                 0x10 if mine => self.on_association(&f[24..]),
                 0xC0 | 0xA0 if mine || group => self.on_deauthentication(&f),
+                0xD0 if mine => self.on_action(radio, &f),
                 0x08 if (mine || group) && f[1] & 3 == 2 => self.on_data(radio, &f),
                 _ => {}
             }
@@ -244,6 +288,37 @@ impl Supplicant {
         let seq = u16::from_le_bytes([body[2], body[3]]);
         let status = u16::from_le_bytes([body[4], body[5]]);
         match (self.state, seq) {
+            (State::Committed, 1) if status == 76 => {
+                // Anti-clogging: the same commit again, with the token
+                // (in a container element after hash-to-element, right
+                // after the group otherwise).
+                let h2e = self.method == Method::HashToElement;
+                let token = if h2e {
+                    let ies = &body[8..];
+                    match ies {
+                        [255, len, 93, rest @ ..] if rest.len() + 1 >= *len as usize => {
+                            rest[..*len as usize - 1].to_vec()
+                        }
+                        _ => {
+                            self.state = State::Failed("token request without a token");
+                            return;
+                        }
+                    }
+                } else {
+                    body[8..].to_vec()
+                };
+                let mut again = self.commit[..8].to_vec();
+                if h2e {
+                    again.extend_from_slice(&self.commit[8..]);
+                    again.extend_from_slice(&[255, 1 + token.len() as u8, 93]);
+                    again.extend_from_slice(&token);
+                } else {
+                    again.extend_from_slice(&token);
+                    again.extend_from_slice(&self.commit[8..]);
+                }
+                self.transmit(radio, 0xB0, 0, self.bssid, &again, false);
+                self.notices.push(Notice::TokenSentBack);
+            }
             (State::Committed, 1) => {
                 if status != 0 && status != 126 {
                     self.state = State::Failed("the access point refused the commit");
@@ -274,22 +349,42 @@ impl Supplicant {
                 }
                 self.pmk = session.pmk;
                 self.pmkid = session.pmkid;
-                let mut request = vec![0x31, 0x04, 10, 0, 0, self.ssid.len() as u8];
-                request.extend_from_slice(self.ssid.as_bytes());
-                request.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8B, 0x96]);
-                request.extend_from_slice(&self.own_element());
-                self.transmit(radio, 0x00, 0, self.bssid, &request, false);
-                self.state = State::Associating;
+                self.associate(radio);
             }
             _ => {}
         }
+    }
+
+    fn associate(&mut self, radio: &mut Radio) {
+        let mut request = vec![0x31, 0x04, 10, 0, 0, self.ssid.len() as u8];
+        request.extend_from_slice(self.ssid.as_bytes());
+        request.extend_from_slice(&[1, 4, 0x82, 0x84, 0x8B, 0x96]);
+        request.extend_from_slice(&self.own_element());
+        self.transmit(radio, 0x00, 0, self.bssid, &request, false);
+        self.state = State::Associating;
     }
 
     fn on_association(&mut self, body: &[u8]) {
         if self.state != State::Associating || body.len() < 4 {
             return;
         }
-        self.state = match u16::from_le_bytes([body[2], body[3]]) {
+        let status = u16::from_le_bytes([body[2], body[3]]);
+        if status == 30 {
+            // Come back after the time the timeout interval element
+            // (type 3) gives, in units of 1024 µs.
+            let ies = body.get(6..).unwrap_or(&[]);
+            let tu = element(ies, 56)
+                .filter(|e| e.len() == 5 && e[0] == 3)
+                .map(|e| u32::from_le_bytes([e[1], e[2], e[3], e[4]]));
+            let Some(tu) = tu else {
+                self.state = State::Failed("status 30 without a comeback time");
+                return;
+            };
+            self.notices.push(Notice::ComeBackIn { tu });
+            self.retry_assoc_at = Some(self.now + (tu as u64 * 1024).div_ceil(1000));
+            return;
+        }
+        self.state = match status {
             0 => State::Handshake,
             31 => State::Failed("refused: management frame protection policy"),
             43 => State::Failed("refused: key management"),
@@ -300,18 +395,20 @@ impl Supplicant {
     fn on_deauthentication(&mut self, frame: &[u8]) {
         let keyed = matches!(self.state, State::Connected) && self.protect_management;
         let mut body = frame[24..].to_vec();
-        if keyed {
+        if keyed && frame[4] & 1 != 0 {
+            // To everyone: only believed with a valid management MIC
+            // element made with the integrity group key.
+            match self.check_bip(frame) {
+                Some(clear) => body = clear,
+                None => return self.notices.push(Notice::ForgedDeauthIgnored),
+            }
+        } else if keyed {
             // Only the access point holds the key: a clear frame, or one
             // that does not decrypt, is somebody else's.
-            let key = Key {
-                cipher: Cipher::Ccmp,
-                key: &self.ptk[32..48],
-                mic: &[0; 8],
-            };
             let genuine = frame[1] & 0x40 != 0 && frame[4..10] == self.mac;
-            match crypto::unprotect(&key, frame).ok().filter(|_| genuine) {
-                Some((clear, iv, eiv)) if self.fresh(iv, eiv, false) => body = clear[24..].to_vec(),
-                _ => return self.notices.push(Notice::ForgedDeauthIgnored),
+            match self.open_management(frame).filter(|_| genuine) {
+                Some(clear) => body = clear[24..].to_vec(),
+                None => return self.notices.push(Notice::ForgedDeauthIgnored),
             }
         }
         let reason = body
@@ -319,6 +416,59 @@ impl Supplicant {
             .map_or(0, |r| u16::from_le_bytes([r[0], r[1]]));
         self.notices.push(Notice::Deauthenticated { reason });
         self.state = State::Idle;
+    }
+
+    /// The body of a group-addressed management frame without its
+    /// management MIC element, if BIP vouches for it.
+    fn check_bip(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (key_id, igtk) = self.igtk?;
+        let n = frame.len();
+        if n < 24 + 18 || frame[n - 18..n - 16] != [76, 16] || frame[1] & 0x40 != 0 {
+            return None;
+        }
+        let mme = &frame[n - 16..];
+        if u16::from_le_bytes([mme[0], mme[1]]) != key_id {
+            return None;
+        }
+        let mut ipn = [0u8; 8];
+        ipn[..6].copy_from_slice(&mme[2..8]);
+        let ipn = u64::from_le_bytes(ipn);
+        if ipn <= self.igtk_rx_ipn || crypto::bip_mic(&igtk, frame) != mme[8..] {
+            return None;
+        }
+        self.igtk_rx_ipn = ipn;
+        Some(frame[24..n - 18].to_vec())
+    }
+
+    /// A protected management frame from the access point, opened with
+    /// the pairwise key, its packet number checked on its own counter.
+    fn open_management(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let key = Key {
+            cipher: Cipher::Ccmp,
+            key: &self.ptk[32..48],
+            mic: &[0; 8],
+        };
+        let (clear, iv, eiv) = crypto::unprotect(&key, frame).ok()?;
+        let pn = (eiv as u64) << 16 | (iv & 0xFFFF) as u64;
+        if pn <= self.mgmt_rx_pn {
+            return None;
+        }
+        self.mgmt_rx_pn = pn;
+        Some(clear)
+    }
+
+    /// An action frame for us: an SA Query gets its answer, protected.
+    fn on_action(&mut self, radio: &mut Radio, frame: &[u8]) {
+        if self.state != State::Connected || !self.protect_management || frame[1] & 0x40 == 0 {
+            return;
+        }
+        let Some(clear) = self.open_management(frame) else {
+            return self.notices.push(Notice::Dropped);
+        };
+        if let [8, 0, a, b, ..] = clear[24..] {
+            self.transmit(radio, 0xD0, 0, self.bssid, &[8, 1, a, b], true);
+            self.notices.push(Notice::SaQueryAnswered);
+        }
     }
 
     /// Check and record a received packet number.
@@ -470,7 +620,15 @@ impl Supplicant {
                     1 if body.len() >= 22 => {
                         gtk = Some((body[4] & 3, body[6..22].try_into().unwrap()))
                     }
-                    9 if body.len() >= 28 => igtk = Some(body[12..28].try_into().unwrap()),
+                    9 if body.len() >= 28 => {
+                        let mut ipn = [0u8; 8];
+                        ipn[..6].copy_from_slice(&body[6..12]);
+                        igtk = Some((
+                            u16::from_le_bytes([body[4], body[5]]),
+                            body[12..28].try_into().unwrap(),
+                            u64::from_le_bytes(ipn),
+                        ))
+                    }
                     _ => {}
                 }
             }
@@ -488,7 +646,10 @@ impl Supplicant {
                 return;
             }
             self.gtk = gtk;
-            self.igtk = igtk;
+            if let Some((id, key, ipn)) = igtk {
+                self.igtk = Some((id, key));
+                self.igtk_rx_ipn = ipn;
+            }
             self.send_key(
                 radio,
                 INFO_PAIRWISE | INFO_MIC | INFO_SECURE,
@@ -503,6 +664,10 @@ impl Supplicant {
                 self.gtk = Some((index, key));
                 self.group_rx_pn = 0;
                 self.notices.push(Notice::GroupKeyRenewed { index });
+            }
+            if let Some((id, key, ipn)) = igtk {
+                self.igtk = Some((id, key));
+                self.igtk_rx_ipn = ipn;
             }
             self.send_key(radio, INFO_MIC | INFO_SECURE, &replay, &[0; 32], &[]);
         }
