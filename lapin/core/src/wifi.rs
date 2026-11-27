@@ -308,10 +308,23 @@ const SA_QUERY_QUIET_MS: u32 = 10_000;
 #[derive(Clone)]
 struct SaeRun {
     session: sae::Session,
-    /// The commit, to send again with an anti-clogging token.
+    /// The commit, to send again (with the anti-clogging token, if the
+    /// access point asked for one).
     commit: [u8; 6 + sae::COMMIT_LEN],
+    token: [u8; 64],
+    token_len: u8,
+    /// Our confirm went, with this send-confirm counter.
     confirmed: bool,
+    send_confirm: u16,
+    /// Frames sent again so far (802.11's Sync), and ticks since the
+    /// last went without an answer.
+    sync: u8,
+    quiet: u8,
 }
+
+/// How many times a commit or confirm is sent again (hostapd's
+/// dot11RSNASAESync).
+const SAE_SYNC: u8 = 5;
 
 #[derive(Clone)]
 pub struct Station {
@@ -1306,6 +1319,18 @@ impl Station {
     #[inline(never)]
     pub fn tick(&mut self, link: &mut impl Link) {
         if self.mode == Mode::Managed {
+            if self.state == State::Auth
+                && let Some(run) = self.sae.as_mut()
+            {
+                // No answer for a tick (802.11's retransmission timer):
+                // send it again, a few times.
+                run.quiet += 1;
+                if run.quiet >= 2 && run.sync < SAE_SYNC {
+                    run.sync += 1;
+                    run.quiet = 0;
+                    self.sae_send_again(link);
+                }
+            }
             if self.timeout > 0 {
                 self.timeout -= 1;
             }
@@ -2551,7 +2576,12 @@ impl Station {
         self.sae = Some(SaeRun {
             session,
             commit,
+            token: [0; 64],
+            token_len: 0,
             confirmed: false,
+            send_confirm: 0,
+            sync: 0,
+            quiet: 0,
         });
         self.send_sae(link, &commit, &[]);
         self.timeout = AUTH_TIMEOUT;
@@ -2580,6 +2610,36 @@ impl Station {
         self.send_management(link, n, false);
     }
 
+    /// Our commit again, and once confirmed our confirm after it, under
+    /// the next send-confirm counter (802.11-2020 12.4.8.6.5).
+    fn sae_send_again(&mut self, link: &mut impl Link) {
+        let Some(run) = self.sae.as_mut() else { return };
+        let (commit, token, n) = (run.commit, run.token, run.token_len as usize);
+        let confirm = if run.confirmed {
+            run.send_confirm = run.send_confirm.saturating_add(1);
+            let sc = run.send_confirm;
+            run.session.confirm(sc).map(|c| (sc, c))
+        } else {
+            None
+        };
+        self.send_sae(link, &commit, &token[..n]);
+        if let Some((sc, c)) = confirm {
+            self.send_confirm(link, sc, &c);
+        }
+    }
+
+    fn send_confirm(&mut self, link: &mut impl Link, sc: u16, value: &[u8; 32]) {
+        let mut reply = [0u8; 8 + 32];
+        let [s0, s1] = sc.to_le_bytes();
+        reply[..8].copy_from_slice(&[3, 0, 2, 0, 0, 0, s0, s1]);
+        reply[8..].copy_from_slice(value);
+        self.send_sae(link, &reply, &[]);
+    }
+
+    /// A frame of the password exchange from the access point. What does
+    /// not fit (another algorithm, our own commit reflected, values out
+    /// of range, a confirm that does not check) is dropped silently, as
+    /// 802.11 says: going idle on it let anyone end the exchange.
     #[inline(never)]
     fn input_sae(
         &mut self,
@@ -2591,16 +2651,17 @@ impl Station {
         len: usize,
     ) {
         if algorithm != 3 {
-            self.state = State::Idle;
             return;
         }
         let Some(run) = self.sae.as_mut() else { return };
+        run.quiet = 0;
         let body = &frame[30..len];
+        // Our commit's status: 126 when hashing to the curve.
+        let ours = run.commit[4] as u16;
         match seq {
             1 if status == 76 && !run.confirmed => {
                 // Anti-clogging: the same commit again, with the token.
                 let h2e = matches!(self.security, Security::Sae { h2e: true });
-                let mut token = [0u8; 64];
                 let t: &[u8] = if h2e {
                     match body.get(2..) {
                         Some([255, l, 93, rest @ ..])
@@ -2608,40 +2669,46 @@ impl Station {
                         {
                             &rest[..*l as usize - 1]
                         }
-                        _ => {
-                            self.state = State::Idle;
-                            return;
-                        }
+                        _ => return,
                     }
                 } else {
                     body.get(2..).unwrap_or(&[])
                 };
                 let n = t.len().min(64);
-                token[..n].copy_from_slice(&t[..n]);
-                let commit = run.commit;
+                run.token[..n].copy_from_slice(&t[..n]);
+                run.token_len = n as u8;
+                let (commit, token) = (run.commit, run.token);
                 self.send_sae(link, &commit, &token[..n]);
             }
-            1 if !run.confirmed => {
-                if (status != 0 && status != 126) || body.len() < 2 {
-                    self.state = State::Idle;
-                    return;
+            1 if status != ours => {
+                // Refused (wrong group, unknown identifier...), or an
+                // answer in the other method: hunting and pecking to a
+                // hash-to-element commit is a downgrade.
+                self.state = State::Idle;
+            }
+            1 if run.confirmed => {
+                // The access point sends its commit again: it missed our
+                // confirm. Both go again, a few times.
+                if run.sync < SAE_SYNC {
+                    run.sync += 1;
+                    self.sae_send_again(link);
                 }
+            }
+            1 => {
                 let Some(theirs) = sae::Commit::from_bytes(body) else {
-                    self.state = State::Idle;
                     return;
                 };
-                let ok = run.session.process_commit(&theirs).is_ok();
+                if run.session.process_commit(&theirs).is_err() {
+                    return;
+                }
                 link.pause();
                 let run = self.sae.as_mut().unwrap();
-                let Some(confirm) = run.session.confirm(1).filter(|_| ok) else {
-                    self.state = State::Idle;
+                let Some(confirm) = run.session.confirm(1) else {
                     return;
                 };
                 run.confirmed = true;
-                let mut reply = [0u8; 8 + 32];
-                reply[..8].copy_from_slice(&[3, 0, 2, 0, 0, 0, 1, 0]);
-                reply[8..].copy_from_slice(&confirm);
-                self.send_sae(link, &reply, &[]);
+                run.send_confirm = 1;
+                self.send_confirm(link, 1, &confirm);
                 self.timeout = AUTH_TIMEOUT;
             }
             2 if run.confirmed => {
@@ -2649,7 +2716,6 @@ impl Station {
                     && body.len() >= 34
                     && run.session.check_confirm(le16(body, 0), &body[2..34]);
                 if !ok {
-                    self.state = State::Idle;
                     return;
                 }
                 self.pmk = run.session.pmk;

@@ -663,12 +663,7 @@ fn wpa3_keeps_the_link_when_the_access_point_answers_the_query() {
     w.radio.rx.push_back(nabemu::rt2573::RxFrame::new(forged));
     run(&mut w, &mut sta, 3000, &mut Vec::new());
     assert_eq!(sta.net_state(), wifi::S_CONNECTED);
-    let queries = w
-        .radio
-        .tx
-        .iter()
-        .filter(|f| f.data[0] == 0xD0)
-        .count();
+    let queries = w.radio.tx.iter().filter(|f| f.data[0] == 0xD0).count();
     assert!(queries >= 1);
     w.aps[0].uplink.clear();
     talks(&mut w, &mut sta);
@@ -697,6 +692,66 @@ fn a_lost_message_4_is_sent_again() {
         talks(&mut w, &mut sta);
         assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
     }
+}
+
+/// The first frame of the station's password exchange with this
+/// sequence number, lost on the air (once per test thread).
+fn lose_first_sae(f: &[u8], seq: u16) -> bool {
+    thread_local!(static LOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    let sae = f[0] == 0xB0 && f[24..26] == [3, 0] && u16::from_le_bytes([f[26], f[27]]) == seq;
+    sae && !LOST.with(|l| l.replace(true))
+}
+
+/// A commit, or a confirm, lost on the air: the station never sent it
+/// again, and the exchange died when its time ran out. 802.11 has both
+/// sent again on a timer (and on the access point's commit sent again,
+/// which says our confirm did not arrive).
+#[test]
+fn a_lost_commit_or_confirm_is_sent_again() {
+    for seq in [1, 2] {
+        std::thread::spawn(move || {
+            let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Only);
+            w.lose = Some(if seq == 1 {
+                |f| lose_first_sae(f, 1)
+            } else {
+                |f| lose_first_sae(f, 2)
+            });
+            let mut sta = Station::new();
+            join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+            assert_eq!(
+                sta.net_state(),
+                wifi::S_CONNECTED,
+                "{seq}: {:?}",
+                w.ap().events
+            );
+            assert!(sta.is_wpa3());
+            talks(&mut w, &mut sta);
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+/// The access point's commit in hunting and pecking (status 0) to our
+/// hash-to-element one (status 126): the station took it, though it
+/// is a downgrade from what both sides announced.
+#[test]
+fn a_commit_in_the_other_method_is_refused() {
+    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Only);
+    w.rewrite = Some(|f| {
+        if f[0] == 0xB0 && f[24..30] == [3, 0, 1, 0, 126, 0] {
+            f[28] = 0;
+        }
+    });
+    let mut sta = Station::new();
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert_ne!(sta.net_state(), wifi::S_CONNECTED);
+    assert!(
+        !w.ap()
+            .events
+            .iter()
+            .any(|e| matches!(e, ApEvent::SaeComplete { .. }))
+    );
 }
 
 #[test]

@@ -242,6 +242,9 @@ struct Station {
     pmf: bool,
     /// The password exchange in progress chose hash-to-element.
     sae_h2e: bool,
+    /// The station's last commit: the same one again is a
+    /// retransmission (it missed our answer), not a new exchange.
+    sae_peer: Vec<u8>,
     /// Last packet number of a protected management frame from the
     /// station: a counter of its own, apart from data frames.
     rx_mgmt_pn: u64,
@@ -813,6 +816,15 @@ impl AccessPoint {
                 } else {
                     (rest.to_vec(), None)
                 };
+                if let Some(s) = self.stations.get(&sta).filter(|s| s.sae_peer == commit) {
+                    // As hostapd: our own commit again while the
+                    // exchange is open, nothing once it is through.
+                    if let Some(session) = &s.sae {
+                        let ours = session.commit().to_bytes();
+                        self.reply_auth(radio, sta, 3, 1, status, &ours);
+                    }
+                    return;
+                }
                 let Some(theirs) = sae::Commit::from_bytes(&commit) else {
                     // Status 77: unsupported finite cyclic group.
                     self.reply_auth(radio, sta, 3, 1, 77, &[]);
@@ -870,6 +882,7 @@ impl AccessPoint {
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.sae = Some(session);
                 s.sae_h2e = h2e;
+                s.sae_peer = commit;
                 self.reply_auth(radio, sta, 3, 1, status, &ours);
             }
             2 => {
@@ -1207,6 +1220,7 @@ impl AccessPoint {
             akm: 2,
             pmf: false,
             sae_h2e: false,
+            sae_peer: Vec::new(),
             rx_mgmt_pn: 0,
             sa_query: Vec::new(),
             sa_query_start: 0,
