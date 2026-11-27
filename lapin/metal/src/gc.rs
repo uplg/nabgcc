@@ -34,25 +34,29 @@ impl<H: Host> Vm<'_, H> {
         self.start = start;
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
     fn used(&self, p: i32) -> bool {
-        self.w(p.wrapping_add(HEADER_GC)) & 1 != 0
+        self.wf(p.wrapping_add(HEADER_GC)) & 1 != 0
     }
 
-    #[inline]
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
     fn mark(&mut self, p: i32) {
         let i = p.wrapping_add(HEADER_GC);
-        self.set(i, self.w(i) | 1);
+        self.setf(i, self.wf(i) | 1);
     }
 
     /// Mark `k`, if it points to a block not marked yet, and chain it.
-    #[inline]
+    // ARM like its callers, or it could not be inlined into them.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
     fn reach(&mut self, k: i32, first: &mut i32) {
         if k & 1 != 0 && k != NIL {
             let k = val(k);
             if !self.used(k) {
                 self.mark(k);
-                self.set(k.wrapping_add(HEADER_LIST), *first);
+                self.setf(k.wrapping_add(HEADER_LIST), *first);
                 *first = k;
             }
         }
@@ -61,30 +65,34 @@ impl<H: Host> Vm<'_, H> {
     /// Mark everything reachable from the stack. With `relocate`, also
     /// rewrite every pointer met to where its block is going
     /// (`vmemGCfirst` and `vmemGCthird`).
+    // A collection walks every word of the heap: ARM code, accessors
+    // inline, as the hot loop of the interpreter.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(never)]
     fn gc_mark(&mut self, relocate: bool) {
         let mut first = -1;
         let mut i = self.stack;
         while i < 0 {
-            let k = self.top(i);
+            let k = self.wf((VMEM_LENGTH as i32).wrapping_add(i));
             if relocate && k & 1 != 0 && k != NIL {
-                let to = self.w(val(k).wrapping_add(HEADER_GC)) | 1;
-                self.set_top(i, to);
+                let to = self.wf(val(k).wrapping_add(HEADER_GC)) | 1;
+                self.setf((VMEM_LENGTH as i32).wrapping_add(i), to);
             }
             self.reach(k, &mut first);
             i += 1;
         }
         while first != -1 {
             let k = first;
-            first = self.w(k.wrapping_add(HEADER_LIST));
-            if self.w(k) & 1 != 0 {
-                let n = self.size_tab(k);
+            first = self.wf(k.wrapping_add(HEADER_LIST));
+            if self.wf(k) & 1 != 0 {
+                let n = self.size_tab_f(k);
                 let j = k.wrapping_add(HEADER_LENGTH);
                 for i in 0..n.max(0) {
                     let at = j.wrapping_add(i);
-                    let v = self.w(at);
+                    let v = self.wf(at);
                     if relocate && v & 1 != 0 && v != NIL {
-                        let to = self.w(val(v).wrapping_add(HEADER_GC)) | 1;
-                        self.set(at, to);
+                        let to = self.wf(val(v).wrapping_add(HEADER_GC)) | 1;
+                        self.setf(at, to);
                     }
                     self.reach(v, &mut first);
                 }
@@ -93,20 +101,25 @@ impl<H: Host> Vm<'_, H> {
     }
 
     /// The size of the block at `pos`, header included.
-    #[inline]
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
     fn real_size(&self, pos: i32) -> i32 {
-        self.size_tab(pos) + HEADER_LENGTH
+        self.size_tab_f(pos) + HEADER_LENGTH
     }
 
     /// `vmemGCsecond`: give every marked block its new place, and
     /// unmark it.
+    // A collection walks every word of the heap: ARM code, accessors
+    // inline, as the hot loop of the interpreter.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(never)]
     fn gc_place(&mut self) {
         let mut pos = self.start;
         let mut newpos = self.start;
         while pos < self.heapindex {
             let realsize = self.real_size(pos);
             if self.used(pos) {
-                self.set(pos + HEADER_GC, newpos << 1);
+                self.setf(pos + HEADER_GC, newpos << 1);
                 newpos = newpos.wrapping_add(realsize);
             }
             pos = pos.wrapping_add(realsize);
@@ -119,6 +132,10 @@ impl<H: Host> Vm<'_, H> {
     }
 
     /// `vmemGCfourth`: move the marked blocks down.
+    // A collection walks every word of the heap: ARM code, accessors
+    // inline, as the hot loop of the interpreter.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(never)]
     fn gc_move(&mut self) {
         let mut pos = self.start;
         let mut newpos = self.start;
@@ -128,11 +145,19 @@ impl<H: Host> Vm<'_, H> {
                 break;
             }
             if self.used(pos) {
-                self.set(pos + HEADER_GC, 0);
+                self.setf(pos + HEADER_GC, 0);
                 if newpos != pos {
                     let (from, to, n) = (pos as usize, newpos as usize, realsize as usize);
                     if from.saturating_add(n) <= VMEM_LENGTH {
-                        self.mem.heap.copy_within(from..from + n, to);
+                        // Down the heap, word by word from the start: the
+                        // block never lands above where it was (a call to
+                        // `memcpy` costs more than this loop, measured).
+                        let heap = self.mem.heap.as_mut_ptr();
+                        for k in 0..n {
+                            // SAFETY: `from + n` is inside the heap, checked
+                            // above, and `to` is below `from`.
+                            unsafe { *heap.add(to + k) = *heap.add(from + k) };
+                        }
                     }
                     newpos += realsize;
                     pos += realsize;

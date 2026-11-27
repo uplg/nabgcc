@@ -61,7 +61,16 @@ extern "C" fn main() -> ! {
         (
             (*(&raw mut STATION)).write(Station::new()),
             &mut *(&raw mut FRAME),
-            (*(&raw mut SCAN)).write([lapin_fw::host::SCAN_NONE; SCAN_RESULTS]),
+            {
+                // One by one, in place: the whole array is too big for the
+                // stack it would be built on.
+                let slot = &mut *(&raw mut SCAN);
+                let first = slot.as_mut_ptr().cast::<ScanResult>();
+                for i in 0..SCAN_RESULTS {
+                    first.add(i).write(lapin_fw::host::SCAN_NONE);
+                }
+                slot.assume_init_mut()
+            },
             &mut *(&raw mut STICK),
             &mut *(&raw mut MEMORY),
         )

@@ -304,6 +304,11 @@ impl Watchdog {
 }
 
 pub struct Soc {
+    /// Longest time, in board clocks, the watchdog ran without being
+    /// fed (a bite counts as the end of such a time), and when it was
+    /// last fed or started.
+    pub watchdog_longest: u64,
+    watchdog_fed_at: u64,
     pub flash: Vec<u8>,
     pub iram: Vec<u8>,
     pub xram: Vec<u8>,
@@ -368,6 +373,8 @@ impl Default for Soc {
 impl Soc {
     pub fn new() -> Self {
         Soc {
+            watchdog_longest: 0,
+            watchdog_fed_at: 0,
             flash: vec![0xFF; FLASH_SIZE],
             iram: vec![0; IRAM_SIZE],
             xram: vec![0; XRAM_SIZE],
@@ -408,7 +415,18 @@ impl Soc {
 
     /// Hardware reset: registers go back to their defaults, memories keep
     /// their content (the SRAM is not cleared by a watchdog reset).
+    /// How long the watchdog has gone unfed now, in board clocks (zero
+    /// while it is stopped).
+    pub fn watchdog_unfed(&self) -> u64 {
+        if self.wdt.running {
+            self.cycles - self.watchdog_fed_at
+        } else {
+            0
+        }
+    }
+
     pub fn reset(&mut self) {
+        self.watchdog_fed_at = self.cycles;
         self.regs.clear();
         self.irq_lines = 0;
         self.cil = 0;
@@ -947,11 +965,14 @@ impl Soc {
                         self.wdt.set_count(now, 0);
                         self.wdt.running = true;
                         self.wdt.since = now;
+                        self.watchdog_fed_at = now;
                     }
                 } else if v == 0xC3 {
                     self.wdt.armed_c3 = true;
                 } else if v == 0x3C && self.wdt.armed_c3 {
                     // C3H then 3CH clears it.
+                    self.watchdog_longest = self.watchdog_longest.max(now - self.watchdog_fed_at);
+                    self.watchdog_fed_at = now;
                     self.wdt.set_count(now, 0);
                     self.wdt.armed_c3 = false;
                 } else {

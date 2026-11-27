@@ -360,6 +360,31 @@ impl<'m, H: Host> Vm<'m, H> {
         }
     }
 
+    /// [`Self::w`] and [`Self::set`] inline, for the collector's loops.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
+    fn wf(&self, i: i32) -> i32 {
+        match self.mem.heap.get(i as usize) {
+            Some(v) => *v,
+            None => 0,
+        }
+    }
+
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
+    fn setf(&mut self, i: i32, v: i32) {
+        if let Some(w) = self.mem.heap.get_mut(i as usize) {
+            *w = v;
+        }
+    }
+
+    /// `VSIZE`, inline.
+    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+    #[inline(always)]
+    fn size_tab_f(&self, p: i32) -> i32 {
+        ((self.wf(p) >> 8) + 4) >> 2
+    }
+
     /// `_vmem_top[i]`: the stack counts down from the end of the heap.
     #[inline]
     fn top(&self, i: i32) -> i32 {

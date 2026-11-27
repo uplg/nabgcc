@@ -53,6 +53,15 @@ pub struct Machine {
     next_air: u64,
     pub events: Vec<Event>,
     pub resets: u32,
+    /// The lowest stack pointer seen in each processor mode (indexed by
+    /// the mode's low five bits), since power-on, inside the internal RAM:
+    /// how deep the stacks went.
+    pub stack_low: [u32; 32],
+    /// Where the program was when each of those lows was reached.
+    pub stack_low_pc: [u32; 32],
+    /// The program stack's words at its deepest, from the top of the
+    /// stack pointer up: the return addresses in it say how it got there.
+    pub stack_low_words: Vec<u32>,
 }
 
 impl Machine {
@@ -72,6 +81,9 @@ impl Machine {
             next_air: 0,
             events: Vec::new(),
             resets: 0,
+            stack_low: [u32::MAX; 32],
+            stack_low_pc: [0; 32],
+            stack_low_words: Vec::new(),
         }
     }
 
@@ -124,6 +136,24 @@ impl Machine {
     pub fn step(&mut self) {
         self.cpu.irq_line = self.soc.irq_asserted();
         let cycles = self.cpu.step(&mut self.soc);
+        // Before the firmware sets a stack, the register holds anything.
+        let sp = self.cpu.r[13];
+        if (soc::IRAM_BASE..soc::IRAM_BASE + soc::IRAM_SIZE as u32).contains(&sp) {
+            let mode = (self.cpu.mode() & 0x1F) as usize;
+            if sp < self.stack_low[mode] {
+                self.stack_low[mode] = sp;
+                self.stack_low_pc[mode] = self.cpu.pc();
+                if mode == 0x1F {
+                    let at = (sp - soc::IRAM_BASE) as usize;
+                    self.stack_low_words = self.soc.iram[at..]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|w| u32::from_le_bytes(*w))
+                        .collect();
+                }
+            }
+        }
         if let Trap::Undefined { addr, opcode } = self.cpu.last_trap {
             self.events.push(Event::Undefined { addr, opcode });
         }

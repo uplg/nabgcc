@@ -11,7 +11,9 @@ MEMORY
 ENTRY(_start)
 
 /* Stacks grow down from the top of the internal RAM: 1 KB for
-   interrupts, the rest of the top 5 KB for the program. */
+   interrupts, then up to 12 KB for the program (measured at most 6.9 KB
+   in the emulator, tools/emu/tests/limits.rs). The data must end below
+   both, with room to spare. */
 __stack_top = ORIGIN(RAM) + LENGTH(RAM);
 __irq_stack_size = 0x400;
 
@@ -54,6 +56,9 @@ SECTIONS
   {
     *(.vmem .vmem.*)
   } > XRAM
+
+  ASSERT(__bss_end <= __stack_top - __irq_stack_size - 12K - 2K,
+         "the internal RAM's data leaves too little room for the stacks")
 
   /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }
 }

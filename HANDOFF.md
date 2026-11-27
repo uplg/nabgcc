@@ -56,6 +56,15 @@ loop of 500 000 opcodes, 0.68 s against 1.26 s on `fib 20`
 code (`#[instruction_set(arm::a32)]`): Thumb's eight registers could
 not hold the machine's state.
 
+**Limits.** `tools/emu/tests/limits.rs` measures, under the heaviest
+work (WPA3 with garenne and rekeys, the setup page deriving a key, the
+factory test, a collection over an 85 % full heap): the program stack
+at most 6.8 KB of its 12 KB (asserted by the linker against the data),
+the interrupt stack 196 bytes of 1 KB, the watchdog at most 664 ms
+unfed (an SAE step) against a budget of half its 2.09 s. The first
+measurement found 12.8 KB of stack, 5.4 KB of it a scan array built on
+the stack, and a collection three times slower than the C one's.
+
 **Randomness.** The chip has no generator. SAE's numbers come from a
 pool (`lapin/core/src/rng.rs`) stirred with the volume wheel's noise,
 the arrival times, strengths and first bytes of received frames, and
