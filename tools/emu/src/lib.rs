@@ -19,6 +19,7 @@ pub mod rt2573;
 pub mod sae;
 pub mod soc;
 pub mod supplicant;
+pub mod testing;
 pub mod visitor;
 pub mod vs1003;
 #[cfg(target_arch = "wasm32")]

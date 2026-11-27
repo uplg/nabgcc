@@ -13,11 +13,7 @@ use nabemu::vs1003::{Format, adpcm_decode};
 const GREEN: [u8; 3] = [0, 126, 0];
 
 fn in_factory_test() -> Machine {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let mut m = Machine::from_file(&std::fs::read(path).unwrap()).0;
+    let mut m = Machine::from_file(&nabemu::testing::image()).0;
     m.soc.board.button = true;
     m.run_until_ms(8000);
     m.soc.board.button = false;

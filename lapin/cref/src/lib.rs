@@ -653,9 +653,10 @@ pub fn run_rust(world: World, bytecode: &[u8], turns: usize) -> Outcome {
     }));
     let run = |vm: &mut Vm<'_, World>, f: &dyn Fn(&mut Vm<'_, World>)| {
         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(vm)))
-            && e.downcast_ref::<Rebooted>().is_none() {
-                std::panic::resume_unwind(e);
-            }
+            && e.downcast_ref::<Rebooted>().is_none()
+        {
+            std::panic::resume_unwind(e);
+        }
     };
     run(&mut vm, &|vm| vm.boot(bytecode));
     while done < turns && !(vm.host.done() || vm.host.rebooted) {

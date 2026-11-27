@@ -3,11 +3,7 @@
 use nabemu::{DEFAULT_MAC, Machine};
 
 fn released() -> Machine {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let image = std::fs::read(path).expect("the r3 release image is in artifacts/");
+    let image = nabemu::testing::image();
     Machine::from_file(&image).0
 }
 

@@ -11,6 +11,7 @@ pub mod clock;
 pub mod codec;
 pub mod ears;
 pub mod flash;
+pub mod host;
 pub mod i2c;
 pub mod irq;
 pub mod led;

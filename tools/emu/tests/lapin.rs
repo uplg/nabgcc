@@ -17,12 +17,11 @@ fn image(name: &str) -> Option<Vec<u8>> {
 }
 
 const AMBER: [u8; 3] = [126, 16, 0];
-const BLUE: [u8; 3] = [0, 0, 126];
 
-/// Clock, interrupts, timer, watchdog, leds: the board comes up, says
-/// so, and keeps its watchdog fed.
+/// The board comes up, finds its stick, and hands over to the boot
+/// bytecode, which keeps the watchdog fed and looks for a network.
 #[test]
-fn the_firmware_boots_and_stays_up() {
+fn the_firmware_boots_its_bytecode_and_stays_up() {
     let Some(image) = image("lapin") else { return };
     let mut m = Machine::from_file(&image).0;
     m.run_until_ms(10_500);
@@ -30,97 +29,33 @@ fn the_firmware_boots_and_stays_up() {
     assert!(m.soc.bus_faults.is_empty(), "{:x?}", m.soc.bus_faults);
     assert!(m.soc.unmodelled.is_empty(), "{:x?}", m.soc.unmodelled);
     assert_eq!(m.soc.cpu_clock_hz(), Some(32_000_000));
-    // The same amber as the firmware it replaces, on all five leds.
-    assert_eq!(m.soc.board.leds, [AMBER; 5]);
-    // It found its Wi-Fi stick, read its address, went through the
-    // channels, then one dot a second, counted by the timer interrupt.
     let console = m.console();
     assert!(
-        console.starts_with("lapin 0.1\nrun\nwifi 00:19:db:00:00:01 radio 02\n...."),
+        console.starts_with("lapin 0.1\nwifi 00:19:db:00:00:01 radio 02\n"),
         "{console}"
     );
-    assert_eq!(console.matches('.').count(), 10, "{console}");
+    assert!(console.contains("wifi state="), "{console}");
+    // The bytecode's amber: no network found yet.
+    assert_eq!(m.soc.board.leds, [AMBER; 5]);
     assert_eq!(m.soc.ohci.errors, 0);
     let radio = m.radio.borrow();
     assert!(radio.firmware_loaded && radio.rx_enabled);
-    assert_eq!(radio.mac, nabemu::DEFAULT_MAC);
 }
 
-/// With the stick up, the firmware probes every channel and names the
-/// networks it hears. Its probe requests carry the network name
-/// element the C firmware leaves out, so access points answer them.
-#[test]
-fn the_firmware_finds_the_networks_around() {
-    use nabemu::air::{AccessPoint, Security};
-
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::wpa2("carotte-violette"),
-    ));
-    m.air.push(AccessPoint::new(
-        "Garenne",
-        [2, 0, 0, 0, 0, 0xA2],
-        11,
-        Security::Open,
-    ));
-    m.run_until_ms(4000);
-    let console = m.console();
-    assert!(console.contains("answer Terrier channel 06\n"), "{console}");
-    assert!(console.contains("beacon Terrier channel 06\n"), "{console}");
-    assert!(console.contains("answer Garenne channel 0b\n"), "{console}");
-    assert!(!console.contains("Terrier channel 0b"), "{console}");
-    for ap in &m.air {
-        assert_eq!(
-            (ap.probes_answered, ap.probes_ignored),
-            (1, 0),
-            "{}",
-            ap.ssid
-        );
-    }
-    // One probe a channel, from its own address, in clear.
-    let radio = m.radio.borrow();
-    let channels: Vec<u8> = radio.tx.iter().map(|f| f.channel).collect();
-    assert_eq!(channels, (1..=13).collect::<Vec<u8>>());
-    assert!(
-        radio
-            .tx
-            .iter()
-            .all(|f| f.data[0] == 0x40 && f.data[10..16] == nabemu::DEFAULT_MAC)
-    );
-    assert_eq!(m.events, []);
-}
-
-#[test]
-fn the_button_at_power_on_asks_for_setup() {
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
-    m.soc.board.button = true;
-    m.run_until_ms(500);
-    assert!(
-        m.console().starts_with("lapin 0.1\nsetup\n"),
-        "{}",
-        m.console()
-    );
-    assert_eq!(m.soc.board.leds, [BLUE; 5]);
-}
-
-/// Without its Wi-Fi stick the firmware says so and carries on.
+/// Without its Wi-Fi stick the firmware says so and carries on: the
+/// bytecode runs, the network stays broken.
 #[test]
 fn a_missing_wifi_stick_is_reported() {
     let Some(image) = image("lapin") else { return };
     let mut m = Machine::from_file(&image).0;
     m.soc.ohci.device = None;
-    m.run_until_ms(6000);
+    m.run_until_ms(10_000);
+    let console = m.console();
     assert!(
-        m.console()
-            .starts_with("lapin 0.1\nrun\nwifi: no stick\n.."),
-        "{}",
-        m.console()
+        console.starts_with("lapin 0.1\nwifi: no stick\n"),
+        "{console}"
     );
+    assert!(console.contains("started"), "{console}");
     assert_eq!(m.events, []);
 }
 
@@ -134,66 +69,38 @@ fn a_stick_with_a_radio_it_cannot_tune_is_refused() {
     m.radio.borrow_mut().rf_chip = 3;
     m.run_until_ms(6000);
     assert!(
-        m.console()
-            .starts_with("lapin 0.1\nrun\nwifi: radio 03\n.."),
+        m.console().starts_with("lapin 0.1\nwifi: radio 03\n"),
         "{}",
         m.console()
     );
+    assert_eq!(m.events, []);
 }
 
 /// A stick with the RT2527 radio is tuned with that chip's own words:
-/// the firmware still lands on every channel and hears the networks.
+/// the rabbit finds its network and joins it.
 #[test]
-fn a_stick_with_the_rt2527_radio_finds_the_networks_too() {
-    use nabemu::air::{AccessPoint, Security};
+fn a_stick_with_the_rt2527_radio_joins_too() {
+    use nabemu::air::{AccessPoint, ApEvent, Security};
+    use nabemu::config::{Config, Wifi};
 
     let Some(image) = image("lapin") else { return };
     let mut m = Machine::from_file(&image).0;
     m.radio.borrow_mut().rf_chip = 4;
+    Config::new("Garenne", Wifi::Open).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(
         "Garenne",
         [2, 0, 0, 0, 0, 0xA2],
         11,
         Security::Open,
     ));
-    m.run_until_ms(4000);
-    let console = m.console();
-    assert!(console.contains(" radio 04\n"), "{console}");
-    assert!(console.contains("answer Garenne channel 0b\n"), "{console}");
-    let radio = m.radio.borrow();
-    let channels: Vec<u8> = radio.tx.iter().map(|f| f.channel).collect();
-    assert_eq!(channels, (1..=13).collect::<Vec<u8>>());
-}
-
-/// A firmware that stops feeding its watchdog is restarted by it.
-#[test]
-fn the_watchdog_restarts_a_hung_firmware() {
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
-    // Once it is up and idling, hold the button until it notices.
-    m.run_until_ms(4500);
-    m.soc.board.button = true;
-    while !m.console().ends_with("hang\n") {
-        assert!(m.soc.millis() < 6000, "{}", m.console());
-        m.run_until_ms(m.soc.millis() + 10);
-    }
-    m.soc.board.button = false;
-    let hung_at = m.soc.millis();
-    while m.events.is_empty() {
-        assert!(m.soc.millis() < hung_at + 3000, "the watchdog never bit");
-        m.run_until_ms(m.soc.millis() + 10);
-    }
-    assert_eq!(
-        m.events,
-        [nabemu::Event::Reset(nabemu::soc::ResetCause::Watchdog)]
-    );
-    let waited = m.soc.millis() - hung_at;
-    assert!((2000..=2200).contains(&waited), "bit after {waited} ms");
-    m.run_until_ms(m.soc.millis() + 500);
+    m.run_until_ms(15_000);
+    assert!(m.console().contains(" radio 04\n"), "{}", m.console());
     assert!(
-        m.console().ends_with("hang\nlapin 0.1\nrun\n"),
-        "{}",
-        m.console()
+        m.air[0].events.contains(&ApEvent::Associated {
+            sta: nabemu::DEFAULT_MAC
+        }),
+        "{:?}",
+        m.air[0].events
     );
 }
 
@@ -357,147 +264,99 @@ fn every_driver_does_its_job() {
     assert_eq!(m.soc.board.leds, [[0, 126, 0]; 5], "green at the end");
 }
 
-/// Joining with the settings the setup page saved, as the boot
-/// bytecode will have it do: the rabbit's own processor runs the
-/// handshakes (and, on WPA3, the password exchange and the cipher).
-mod joins {
+/// WPA3 on the rabbit's own processor: the password exchange, its
+/// timing against the watchdog, and the restart that finds the access
+/// point still holding the old association.
+mod wpa3 {
     use super::image;
     use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
     use nabemu::config::{Config, Wifi};
     use nabemu::{DEFAULT_MAC, Machine};
 
-    const BSSID: [u8; 6] = [0x02, 0, 0, 0, 0, 0xA1];
     const PASSPHRASE: &str = "carotte-violette";
 
-    /// Run until connected; returns the time it took, in board ms.
-    fn connect(wifi: Wifi, security: Security, wpa3: Wpa3) -> Option<(Machine, u64)> {
+    fn rabbit() -> Option<Machine> {
         let image = image("lapin")?;
         let mut m = Machine::from_file(&image).0;
-        Config::new("Terrier", wifi).install(&mut m.soc.flash);
-        let mut ap = AccessPoint::new("Terrier", BSSID, 6, security);
-        ap.wpa3 = wpa3;
-        m.air.push(ap);
-        while !m.console().contains("state 04") {
-            assert!(
-                m.soc.millis() < 30_000,
-                "not connected:\n{}\n{:?}",
-                m.console(),
-                m.air[0].events
-            );
-            m.run_until_ms(m.soc.millis() + 20);
-        }
-        let at = m.soc.millis();
-        // The first frame up must reach the wire.
-        while !m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]) {
-            assert!(
-                m.soc.millis() < at + 2000,
-                "nothing came up: {:?}",
-                m.air[0].events
-            );
-            m.run_until_ms(m.soc.millis() + 20);
-        }
-        assert!(m.air[0].is_authorized(DEFAULT_MAC));
-        assert_eq!(m.events, [], "no reset");
-        assert!(m.soc.bus_faults.is_empty());
-        assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
-        let trouble: Vec<_> = m.air[0]
-            .events
-            .iter()
-            .filter(|e| {
-                !matches!(
-                    e,
-                    ApEvent::Authenticated { .. }
-                        | ApEvent::Associated { .. }
-                        | ApEvent::HandshakeComplete { .. }
-                        | ApEvent::GroupKeyInstalled { .. }
-                        | ApEvent::SaeComplete { .. }
-                )
-            })
-            .collect();
-        assert!(trouble.is_empty(), "{trouble:?}\n{}", m.console());
-        Some((m, at))
-    }
-
-    fn wpa2() -> Wifi {
-        Wifi::Wpa2 {
-            passphrase: PASSPHRASE.into(),
-        }
-    }
-
-    #[test]
-    fn open() {
-        connect(Wifi::Open, Security::Open, Wpa3::Off);
-    }
-
-    #[test]
-    fn wpa2_with_no_known_defect_left() {
-        let Some((m, _)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Off) else {
-            return;
-        };
-        assert!(!m.console().contains("wpa3"));
-    }
-
-    #[test]
-    fn wpa_tkip() {
-        connect(
-            Wifi::Wpa {
+        Config::new(
+            "Terrier",
+            Wifi::Wpa2 {
                 passphrase: PASSPHRASE.into(),
             },
-            Security::wpa(PASSPHRASE),
-            Wpa3::Off,
+        )
+        .install(&mut m.soc.flash);
+        let mut ap = AccessPoint::new(
+            "Terrier",
+            [2, 0, 0, 0, 0, 0xA1],
+            6,
+            Security::wpa2(PASSPHRASE),
         );
+        ap.wpa3 = Wpa3::Only;
+        m.air.push(ap);
+        Some(m)
+    }
+
+    fn until(m: &mut Machine, limit: u64, done: impl Fn(&Machine) -> bool) -> u64 {
+        while !done(m) {
+            assert!(
+                m.soc.millis() < limit,
+                "not by {limit} ms: {:?}\n{}",
+                m.air[0].events,
+                m.console()
+            );
+            m.run_until_ms(m.soc.millis() + 5);
+        }
+        m.soc.millis()
+    }
+
+    fn authorized(m: &Machine) -> bool {
+        m.air[0].is_authorized(DEFAULT_MAC)
     }
 
     #[test]
-    fn mixed_mode() {
-        connect(wpa2(), Security::wpa2_tkip_group(PASSPHRASE), Wpa3::Off);
+    fn joins_and_its_watchdog_never_bites() {
+        let Some(mut m) = rabbit() else { return };
+        let asked = until(&mut m, 30_000, |m| {
+            !m.radio.borrow().tx.is_empty() && m.console().contains("## SCAN")
+        });
+        let done = until(&mut m, 30_000, authorized);
+        eprintln!("authorized {} ms after the scan ended", done - asked);
+        assert!(done - asked < 3000, "{} ms", done - asked);
+        m.run_until_ms(done + 5000);
+        assert_eq!(m.events, []);
+        assert!(m.console().contains("-------------dhcp"));
+        assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
     }
 
     #[test]
-    fn wep_104() {
-        connect(
-            Wifi::Wep {
-                key: "thirteenchars".into(),
-                shared_auth: false,
-            },
-            Security::Wep {
-                key: b"thirteenchars".to_vec(),
-                shared_auth: false,
-            },
-            Wpa3::Off,
+    fn after_a_power_cut_it_waits_out_the_old_association() {
+        let Some(mut m) = rabbit() else { return };
+        let first = until(&mut m, 30_000, authorized);
+        m.run_until_ms(first + 1000);
+        m.power_cycle();
+        let again = until(&mut m, first + 40_000, |m| {
+            m.air[0]
+                .events
+                .iter()
+                .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
+                .count()
+                == 2
+        });
+        assert!(authorized(&m));
+        let events = &m.air[0].events;
+        assert!(
+            events.contains(&ApEvent::SaQueryStarted { sta: DEFAULT_MAC }),
+            "{events:?}"
         );
-    }
-
-    #[test]
-    fn wep_shared_key() {
-        connect(
-            Wifi::Wep {
-                key: "carot".into(),
-                shared_auth: true,
-            },
-            Security::Wep {
-                key: b"carot".to_vec(),
-                shared_auth: true,
-            },
-            Wpa3::Off,
+        assert!(
+            events.contains(&ApEvent::AssocRejected {
+                sta: DEFAULT_MAC,
+                status: 30
+            }),
+            "{events:?}"
         );
-    }
-
-    #[test]
-    fn wpa3_transition_network() {
-        let Some((m, at)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Transition) else {
-            return;
-        };
-        assert!(m.console().contains("wpa3"), "{}", m.console());
-        eprintln!("{}", m.console());
-        eprintln!("connected at {at} ms");
-    }
-
-    #[test]
-    fn wpa3_only() {
-        let Some((m, _)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Only) else {
-            return;
-        };
-        assert!(m.console().contains("wpa3"), "{}", m.console());
+        eprintln!("back {} ms after the power came back", again - first - 1000);
+        m.run_until_ms(again + 3000);
+        assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
     }
 }

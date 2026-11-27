@@ -7,11 +7,7 @@ use nabemu::{DEFAULT_MAC, Machine};
 const BSSID: [u8; 6] = [0x02, 0, 0, 0, 0, 0xA1];
 
 fn rabbit(ssid: &str, wifi: Wifi, security: Security) -> Machine {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let image = std::fs::read(path).expect("the r3 release image is in artifacts/");
+    let image = nabemu::testing::image();
     let mut m = Machine::from_file(&image).0;
     Config::new(ssid, wifi).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(ssid, BSSID, 6, security));
@@ -57,6 +53,7 @@ fn trouble(m: &Machine) -> Vec<&ApEvent> {
                     | ApEvent::Associated { .. }
                     | ApEvent::HandshakeComplete { .. }
                     | ApEvent::GroupKeyInstalled { .. }
+                    | ApEvent::SaeComplete { .. }
             )
         })
         .collect()
@@ -64,9 +61,13 @@ fn trouble(m: &Machine) -> Vec<&ApEvent> {
 
 /// r3 numbers its first CCMP frame 0, where the standard starts at 1:
 /// an access point that follows the standard drops that frame as a
-/// replay. Known defect, to be removed from here once fixed.
-fn first_frame_replay() -> ApEvent {
-    ApEvent::Replay { sta: DEFAULT_MAC }
+/// replay. Known defect of r3; lapin starts at 1.
+fn first_frame_replay() -> Vec<ApEvent> {
+    if nabemu::testing::is_lapin() {
+        vec![]
+    } else {
+        vec![ApEvent::Replay { sta: DEFAULT_MAC }]
+    }
 }
 
 fn join(wifi: Wifi, security: Security) -> Machine {
@@ -103,7 +104,7 @@ fn joins_a_wpa2_network() {
         },
         Security::wpa2(PASSPHRASE),
     );
-    assert_eq!(trouble(&m), [&first_frame_replay()]);
+    assert_eq!(trouble(&m), first_frame_replay().iter().collect::<Vec<_>>());
 }
 
 #[test]
@@ -126,8 +127,19 @@ fn joins_a_wpa_tkip_network() {
 /// pairwise cipher CCMP ("mixed mode"), message 2 of the handshake names
 /// CCMP for both, while the association request said TKIP and CCMP. An
 /// access point that compares the two, as hostapd does, throws it out.
+/// lapin names the same ciphers in both, and gets in.
 #[test]
 fn mixed_mode_is_refused_because_message_2_misnames_the_group_cipher() {
+    if nabemu::testing::is_lapin() {
+        let m = join(
+            Wifi::Wpa2 {
+                passphrase: PASSPHRASE.into(),
+            },
+            Security::wpa2_tkip_group(PASSPHRASE),
+        );
+        assert_eq!(trouble(&m), Vec::<&ApEvent>::new());
+        return;
+    }
     let mut m = rabbit(
         "Terrier",
         Wifi::Wpa2 {
@@ -173,13 +185,24 @@ fn joins_a_wep_network_with_open_authentication() {
 /// `strlen((char*)&key)`, the length of the pointer's own bytes, so a
 /// 13-character key is installed as its first 5 characters. The rabbit
 /// cannot talk to a 104-bit WEP network, and does talk to a 40-bit one
-/// keyed with the first five characters.
+/// keyed with the first five characters. lapin keeps the whole key.
 #[test]
 fn a_104_bit_wep_key_is_cut_down_to_40_bits() {
     let typed = Wifi::Wep {
         key: "thirteenchars".into(),
         shared_auth: false,
     };
+    if nabemu::testing::is_lapin() {
+        let m = join(
+            typed,
+            Security::Wep {
+                key: b"thirteenchars".to_vec(),
+                shared_auth: false,
+            },
+        );
+        assert_eq!(trouble(&m), Vec::<&ApEvent>::new());
+        return;
+    }
 
     let real = Security::Wep {
         key: b"thirteenchars".to_vec(),
@@ -248,7 +271,7 @@ fn a_wrong_passphrase_never_gets_in() {
 }
 
 /// The kind of network most home routers offer today: WPA2 and WPA3
-/// side by side. The rabbit gets in as a WPA2 station.
+/// side by side. r3 gets in as a WPA2 station, lapin with WPA3.
 #[test]
 fn joins_a_wpa2_wpa3_transition_network_as_a_wpa2_station() {
     let mut m = rabbit(
@@ -270,13 +293,35 @@ fn joins_a_wpa2_wpa3_transition_network_as_a_wpa2_station() {
         m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]),
         "its DHCP request came through"
     );
-    assert_eq!(trouble(&m), [&first_frame_replay()]);
+    assert_eq!(trouble(&m), first_frame_replay().iter().collect::<Vec<_>>());
     assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
 }
 
 /// r3 has no WPA3: a network that offers nothing else turns it away.
+/// lapin joins it.
 #[test]
 fn a_wpa3_only_network_turns_it_away() {
+    if nabemu::testing::is_lapin() {
+        let mut m = rabbit(
+            "Terrier",
+            Wifi::Wpa2 {
+                passphrase: PASSPHRASE.into(),
+            },
+            Security::wpa2(PASSPHRASE),
+        );
+        m.air[0].wpa3 = Wpa3::Only;
+        run_until_event(
+            &mut m,
+            &ApEvent::HandshakeComplete { sta: DEFAULT_MAC },
+            20_000,
+        );
+        m.run_until_ms(m.soc.millis() + 6000);
+        assert!(m.air[0].is_authorized(DEFAULT_MAC));
+        assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
+        assert!(m.console().contains("-------------dhcp"));
+        assert_eq!(trouble(&m), Vec::<&ApEvent>::new());
+        return;
+    }
     let mut m = rabbit(
         "Terrier",
         Wifi::Wpa2 {

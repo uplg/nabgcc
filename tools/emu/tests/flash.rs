@@ -21,7 +21,7 @@ fn artifact(name: &str) -> Vec<u8> {
 /// bytecode that flashes `new_image`, and the following ones with a
 /// program that prints 4242.
 fn rabbit_about_to_flash(new_image: &[u8]) -> Machine {
-    let mut m = Machine::new(&artifact("Nab-wpa23-gtk-r3.sim"));
+    let mut m = Machine::from_file(&nabemu::testing::image()).0;
     Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(
         "Terrier",
@@ -107,7 +107,9 @@ fn a_power_cut_during_the_flash_leaves_a_dead_rabbit() {
     // A third of the way through: sectors erased, the image half written.
     m.soc.cut_power_after_flash_ops = Some(8000);
     run_until(&mut m, 90_000, "the power cut", |m| !m.events.is_empty());
-    assert_eq!(m.events, [Event::Reset(ResetCause::PowerLoss)]);
+    // What the half-written image does next varies: it may never run,
+    // or run into an undefined instruction. It never comes back.
+    assert_eq!(m.events[0], Event::Reset(ResetCause::PowerLoss));
 
     let said = m.soc.uart_tx.len();
     let asked = m.lan.as_ref().unwrap().requests.len();

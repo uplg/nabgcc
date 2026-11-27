@@ -172,6 +172,7 @@ name = "lapin-fw"
 version = "0.1.0"
 dependencies = [
  "lapin-core",
+ "lapin-metal",
 ]
 
 [[package]]

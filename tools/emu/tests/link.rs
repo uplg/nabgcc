@@ -11,11 +11,7 @@ const PASS: &str = "carotte-violette";
 /// A rabbit that joined, got its address, and keeps running the boot
 /// bytecode (the server has no bytecode for it), so its IP stack is up.
 fn connected(wifi: Wifi, security: Security) -> Machine {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let image = std::fs::read(path).expect("the r3 release image is in artifacts/");
+    let image = nabemu::testing::image();
     let mut m = Machine::from_file(&image).0;
     Config::new("Terrier", wifi).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(

@@ -35,6 +35,12 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo test --release
+      - name: The same acceptance tests, on the Rust firmware
+        env:
+          NABEMU_FIRMWARE: lapin
+        run: >
+          cargo test --release --test boot --test board --test join --test link
+          --test network --test setup --test rfid --test factory --test flash --test garenne
       - name: Build for the browser and test that build under Node
         run: |
           rustup target add wasm32-unknown-unknown

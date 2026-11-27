@@ -4,11 +4,7 @@ use nabemu::board::{LED_BOTTOM, LED_NOSE};
 use nabemu::{DEFAULT_MAC, Machine};
 
 fn released() -> Machine {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    Machine::from_file(&std::fs::read(path).expect("the r3 release image is in artifacts/")).0
+    Machine::from_file(&nabemu::testing::image()).0
 }
 
 const AMBER: [u8; 3] = [126, 16, 0];

@@ -29,3 +29,4 @@ bench = false
 
 [dependencies]
 lapin-core = { path = "../core" }
+lapin-metal = { path = "../metal" }

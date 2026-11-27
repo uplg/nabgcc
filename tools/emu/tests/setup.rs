@@ -18,7 +18,7 @@ fn artifact(name: &str) -> Vec<u8> {
 
 /// A rabbit started with its button held, and a phone looking for it.
 fn in_setup_mode() -> Machine {
-    let mut m = Machine::from_file(&artifact("Nab-wpa23-gtk-r3.sim")).0;
+    let mut m = Machine::from_file(&nabemu::testing::image()).0;
     m.soc.board.button = true;
     m.run_until_ms(2000);
     m.soc.board.button = false;

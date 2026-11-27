@@ -28,7 +28,8 @@ fn wait_ready() {
     }
 }
 
-fn read(register: u8) -> u16 {
+/// Read one of the chip's control registers.
+pub fn read(register: u8) -> u16 {
     wait_ready();
     board::port2_clear(board::AUDIO_CONTROL_SELECT);
     spi::CODEC.transfer(READ);
@@ -39,7 +40,8 @@ fn read(register: u8) -> u16 {
     (high as u16) << 8 | low as u16
 }
 
-fn write(register: u8, value: u16) {
+/// Write one of the chip's control registers.
+pub fn write(register: u8, value: u16) {
     wait_ready();
     board::port2_clear(board::AUDIO_CONTROL_SELECT);
     spi::CODEC.transfer(WRITE);
@@ -95,6 +97,15 @@ pub fn init() {
 pub fn set_volume(attenuation: u8) {
     write(VOLUME, (attenuation as u16) << 8 | attenuation as u16);
     board::amplifier(attenuation < 0x7F);
+}
+
+/// Whether the chip takes data now.
+pub fn ready() -> bool {
+    board::codec_wants_data()
+}
+
+pub fn amplifier(on: bool) {
+    board::amplifier(on);
 }
 
 /// Get ready to play a new stream.

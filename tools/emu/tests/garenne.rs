@@ -23,11 +23,7 @@ fn garenne_wakes_up_and_reports_every_two_seconds() {
         eprintln!("skipped: no garenne build around");
         return;
     };
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let mut m = Machine::from_file(&std::fs::read(path).unwrap()).0;
+    let mut m = Machine::from_file(&nabemu::testing::image()).0;
     Config::new(
         "Terrier",
         Wifi::Wpa2 {

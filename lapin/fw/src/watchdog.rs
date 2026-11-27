@@ -7,6 +7,7 @@ reg! {
     TBGCON: u8 = 0xB7E0_0004;
     INTST: u8 = 0xB7E0_0008;
     OVFAST: u8 = 0xB7E0_000C;
+    WDTCNT: u16 = 0xB7E0_0010;
 }
 
 /// Time the firmware has between two feeds.
@@ -31,4 +32,19 @@ pub fn start() {
 pub fn feed() {
     WDTCON.write(0xC3);
     WDTCON.write(0x3C);
+}
+
+/// Restart the board now, as the C firmware's `reset_uc` does: the
+/// watchdog set to overflow in a quarter of a millisecond.
+pub fn reset_now() -> ! {
+    INTST.write(0x3C);
+    INTST.write(0x00);
+    // Clock divided by 32: a microsecond a count.
+    TBGCON.write(0x5A);
+    TBGCON.write(0x40);
+    OVFAST.write(0x63);
+    WDTCON.write(0x3C);
+    WDTCNT.write(0x5A5A);
+    WDTCNT.write(0xFF00);
+    crate::halt()
 }

@@ -48,5 +48,12 @@ SECTIONS
     *(.xram .xram.*)
   } > XRAM
 
+  /* The bytecode's memory, where the C firmware put it: its address
+     shows in the collector's reports. */
+  .vmem 0xD0010000 (NOLOAD) : ALIGN(4)
+  {
+    *(.vmem .vmem.*)
+  } > XRAM
+
   /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }
 }

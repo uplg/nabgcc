@@ -7,11 +7,7 @@ const UID: [u8; 8] = [0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F];
 
 /// Boot a one-function program and return what it printed.
 fn run(function: &[u8], strings: &[&[u8]], tags: Vec<Tag>) -> (Machine, Vec<u8>) {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    );
-    let mut m = Machine::from_file(&std::fs::read(path).unwrap()).0;
+    let mut m = Machine::from_file(&nabemu::testing::image()).0;
     m.soc.board.rfid.tags = tags;
     let mut code = metal::FUNCTION_HEADER.to_vec();
     code.extend_from_slice(function);
