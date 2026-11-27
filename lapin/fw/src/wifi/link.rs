@@ -4,7 +4,12 @@ use lapin_core::rng::Pool;
 use lapin_core::wifi::{HwCipher, Link, Mac, Rx, Tx};
 
 use super::rt2573::{Cipher, Rate, Stick, TxOptions};
-use crate::{sync::Shared, timer, watchdog};
+use crate::{sync::Shared, timer, usb, watchdog};
+
+/// How long a frame handed to the stick may take to leave it: message
+/// 4 of a rekey (150 bytes, 1.4 ms at 1 Mb/s with its preamble) sent
+/// up to seven times, with backoffs.
+const AIR_MS: u32 = 15;
 
 /// What the random pool must have taken in before a draw.
 const ENOUGH: u32 = 512;
@@ -119,6 +124,17 @@ impl Link for Radio<'_> {
 
     fn pause(&mut self) {
         watchdog::feed();
+    }
+
+    fn flush(&mut self) {
+        // The transfer to the stick first; then the frame's time on the
+        // air, retries included, at the lowest rate (the RT2573 reports
+        // no transmit status over USB: the time is waited out).
+        let start = timer::millis();
+        while usb::tx_busy() && timer::millis().wrapping_sub(start) <= TX_WAIT_MS {
+            watchdog::feed();
+        }
+        timer::delay_ms(AIR_MS);
     }
 
     fn random(&mut self, out: &mut [u8]) {

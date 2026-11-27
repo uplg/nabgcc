@@ -80,6 +80,11 @@ pub trait Link {
     fn set_answer_rates(&mut self, mask: u16);
     /// Called during long computations and waits: feed the watchdog.
     fn pause(&mut self);
+    /// Wait until the frames handed over have left the stick: it
+    /// encrypts a frame as it sends it, with the key in its table then,
+    /// so a key changed before would reach a frame queued under the old
+    /// one.
+    fn flush(&mut self) {}
     fn random(&mut self, out: &mut [u8]);
 }
 
@@ -2366,6 +2371,11 @@ impl Station {
             false,
         );
         self.renew_snonce = true;
+        if !self.is_wpa3() {
+            // Message 4 must leave under the current key: the stick
+            // encrypts as it sends, not as it is given the frame.
+            link.flush();
+        }
         if let Some(ptk) = self.next_ptk.take() {
             self.ptk = ptk;
         }
@@ -2756,6 +2766,8 @@ mod tests {
         pn: u64,
         /// Random numbers drawn.
         drawn: u8,
+        /// Frames sent (t), keys set (k), waits for the stick (f).
+        calls: Vec<char>,
     }
 
     impl Link for Air {
@@ -2767,7 +2779,11 @@ mod tests {
         }
         fn transmit(&mut self, frame: &[u8], _: &Tx) -> bool {
             self.sent.push(frame.to_vec());
+            self.calls.push('t');
             true
+        }
+        fn flush(&mut self) {
+            self.calls.push('f');
         }
         fn receive(&mut self, _: &mut [u8]) -> Option<Rx> {
             None
@@ -2776,6 +2792,7 @@ mod tests {
         fn set_bssid(&mut self, _: &Mac) {}
         fn set_key(&mut self, i: u8, _: HwCipher, key: &[u8], _: &[u8; 8], _: &[u8; 8]) {
             self.keys.push((i, key.to_vec()));
+            self.calls.push('k');
         }
         fn set_beacon(&mut self, _: Option<&[u8]>) {}
         fn set_answer_rates(&mut self, _: u16) {}
@@ -3347,6 +3364,33 @@ mod tests {
         s.pmksa_proven = true;
         air.now = PMKSA_LIFETIME_MS;
         assert!(commit_sent(&mut s, &mut air));
+    }
+
+    /// The rekey's message 4 was handed to the stick, and the new key
+    /// put in its table straight after; the stick encrypts as it sends,
+    /// so on a busy channel message 4 could leave under the new key,
+    /// which the access point does not use yet. It now waits for the
+    /// frame to leave.
+    #[test]
+    fn a_rekey_installs_its_key_once_message_4_has_left() {
+        let mut s = running(WPA2_TKIP);
+        s.ptk = [0x5C; 64];
+        s.bss = Offer::from_elements(AP, &AP_RSN);
+        s.bss_known = true;
+        let mut air = Air::default();
+        let msg1 = eapol_key(&s, 0x0088, 1, &[0x66; 32], &[]);
+        input(&mut s, &mut air, &msg1, true);
+        let mut signer = s.clone();
+        signer.ptk = s.next_ptk.unwrap();
+        let mut data = AP_RSN.to_vec();
+        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
+        data.extend_from_slice(&[0x47; 16]);
+        let msg3 = eapol_key(&signer, MSG3, 2, &[0x66; 32], &data);
+        air.calls.clear();
+        input(&mut s, &mut air, &msg3, true);
+        assert_eq!(air.calls.first(), Some(&'t'), "{:?}", air.calls);
+        let key = air.calls.iter().position(|c| *c == 'k').unwrap();
+        assert!(air.calls[..key].contains(&'f'), "{:?}", air.calls);
     }
 
     /// The access point mode answers an authentication of any sequence
