@@ -13,7 +13,7 @@ global_asm!(
     .global _start
 _start:
     ldr pc, =reset
-    ldr pc, =trap
+    ldr pc, =undefined
     ldr pc, =trap
     ldr pc, =trap
     ldr pc, =trap
@@ -53,8 +53,16 @@ reset:
     ldr r0, =main
     bx r0
 
-    /* Undefined instruction, abort, fast interrupt: none should happen.
-       Stop there; the watchdog restarts the rabbit. */
+    /* A panic ends on an undefined instruction (panics abort on the
+       spot, see .cargo/config.toml): say so on the serial port, from
+       a stack of its own, and stop. */
+undefined:
+    ldr sp, =__stack_top
+    ldr r0, =panicked
+    bx r0
+
+    /* Abort, fast interrupt: none should happen. Stop there; the
+       watchdog restarts the rabbit. */
 trap:
     b trap
     .ltorg

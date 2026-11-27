@@ -33,3 +33,12 @@ pub fn halt() -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// Where a panic ends: from the undefined instruction it is built as
+/// (see `start.rs`), or from the panic handler. Tell the serial port,
+/// then [`halt`].
+#[unsafe(no_mangle)]
+pub extern "C" fn panicked() -> ! {
+    uart::write(b"PANIC\n");
+    halt()
+}

@@ -10,8 +10,7 @@ use lapin_fw::{clock, halt, uart};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    uart::write(b"PANIC\n");
-    halt()
+    lapin_fw::panicked()
 }
 
 fn verdict(name: &[u8], ok: bool) {

@@ -10,13 +10,12 @@ use lapin_core::rng::Pool;
 use lapin_core::wifi::Station;
 use lapin_fw::host::{Board, SCAN_RESULTS};
 use lapin_fw::wifi::rt2573::{self, Stick};
-use lapin_fw::{board, clock, codec, ears, halt, i2c, irq, led, spi, timer, uart, usb, watchdog};
+use lapin_fw::{board, clock, codec, ears, i2c, irq, led, spi, timer, uart, usb, watchdog};
 use lapin_metal::{Memory, ScanResult, Vm};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    uart::write(b"PANIC\n");
-    halt()
+    lapin_fw::panicked()
 }
 
 /// The bytecode every rabbit starts with, as the r3 firmware carries it.

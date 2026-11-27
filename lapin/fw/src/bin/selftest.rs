@@ -8,14 +8,11 @@
 use core::cell::UnsafeCell;
 
 use lapin_fw::ears::Turn;
-use lapin_fw::{
-    board, clock, codec, ears, flash, halt, i2c, irq, led, rfid, spi, timer, uart, watchdog,
-};
+use lapin_fw::{board, clock, codec, ears, flash, i2c, irq, led, rfid, spi, timer, uart, watchdog};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    uart::write(b"PANIC\n");
-    halt()
+    lapin_fw::panicked()
 }
 
 fn hex(bytes: &[u8]) {
