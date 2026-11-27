@@ -40,6 +40,14 @@ const HW_BEACON_BASE0: usize = 0x2400;
 const BEACON_DEFAULT: u32 = 100 * 16;
 const SEC_CSR0: usize = 0x30A0;
 const SEC_CSR1: usize = 0x30A4;
+/// Pairwise key table valid bits, entries 0-31 and 32-63.
+const SEC_CSR2: usize = 0x30A8;
+const SEC_CSR3: usize = 0x30AC;
+/// Pairwise key lookup on, one bit per BSS.
+const SEC_CSR4: usize = 0x30B0;
+/// Transmitter addresses of the pairwise keys: address, cipher, spare.
+const PAIRWISE_TA_TABLE: usize = 0x1A00;
+const PAIRWISE_ENTRIES: usize = 64;
 
 /// A frame on the air, exactly as transmitted (without its FCS).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,23 +359,52 @@ impl Rt2573 {
         });
     }
 
-    /// Decrypt a protected frame with the shared key its header names.
-    /// Returns the frame to hand over and the descriptor's cipher
-    /// fields: algorithm, error code, key index, IV, EIV.
+    /// The pairwise key entry for frames from this transmitter, when
+    /// pairwise lookup is on for BSS 0 and a valid entry holds its
+    /// address (as Linux's rt73usb programs the table).
+    fn pairwise_entry(&self, ta: &[u8]) -> Option<(usize, u32)> {
+        if self.word(SEC_CSR4) & 1 == 0 {
+            return None;
+        }
+        (0..PAIRWISE_ENTRIES).find_map(|i| {
+            let bits = if i < 32 {
+                self.word(SEC_CSR2)
+            } else {
+                self.word(SEC_CSR3)
+            };
+            let entry = &self.mem[PAIRWISE_TA_TABLE + i * 8..][..8];
+            (bits & (1 << (i % 32)) != 0 && entry[..6] == *ta).then_some((i, entry[6] as u32 & 7))
+        })
+    }
+
+    /// Decrypt a protected data frame: with the pairwise key of its
+    /// transmitter when the pairwise table has one (frames to us alone),
+    /// otherwise with the shared key its header names. Management frames
+    /// are left alone: the chip cannot protect them. Returns the frame to
+    /// hand over and the descriptor's cipher fields: algorithm, error
+    /// code, key index, IV, EIV.
     fn decrypt(&self, mpdu: Vec<u8>) -> (Vec<u8>, u32, u32, u32, u32, u32) {
         let protected =
             mpdu.len() > crypto::HEADER_LEN + 4 && mpdu[1] & 0x40 != 0 && mpdu[0] & 0x0C == 0x08;
         if !protected {
             return (mpdu, 0, 0, 0, 0, 0);
         }
-        let index = (mpdu[27] >> 6) as usize;
-        let alg = (self.word(SEC_CSR1) >> (index * 4)) & 7;
-        let valid = self.word(SEC_CSR0) & (1 << index) != 0;
+        let unicast = mpdu[4] & 1 == 0;
+        let (base, index, alg, valid) = match self.pairwise_entry(&mpdu[10..16]).filter(|_| unicast)
+        {
+            Some((i, alg)) => (PAIRWISE_KEY_TABLE, i, alg, true),
+            None => {
+                let index = (mpdu[27] >> 6) as usize;
+                let alg = (self.word(SEC_CSR1) >> (index * 4)) & 7;
+                let valid = self.word(SEC_CSR0) & (1 << index) != 0;
+                (SHARED_KEY_TABLE, index, alg, valid)
+            }
+        };
         let Some((cipher, key_len)) = cipher_of(alg).filter(|_| valid) else {
             // No usable key: the frame goes up as it came, flagged.
             return (mpdu, 0, 3, index as u32, 0, 0);
         };
-        let entry = &self.mem[SHARED_KEY_TABLE + index * KEY_ENTRY_SIZE..][..KEY_ENTRY_SIZE];
+        let entry = &self.mem[base + index * KEY_ENTRY_SIZE..][..KEY_ENTRY_SIZE];
         let key = Key {
             cipher,
             key: &entry[..key_len],
@@ -535,5 +572,83 @@ impl UsbDevice for Rt2573 {
             }
             _ => Xfer::Stall,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AP: [u8; 6] = [2, 0, 0, 0, 0, 0xA1];
+    const ME: [u8; 6] = [0, 0x19, 0xDB, 0, 0, 1];
+    const TK: [u8; 16] = [0x5A; 16];
+
+    fn sealed(to: [u8; 6], fc0: u8, key_id: u8) -> Vec<u8> {
+        let mut f = vec![fc0, 0x02, 0, 0];
+        f.extend_from_slice(&to);
+        f.extend_from_slice(&AP);
+        f.extend_from_slice(&AP);
+        f.extend_from_slice(&[0x10, 0]);
+        f.extend_from_slice(b"\xAA\xAA\x03\x00\x00\x00\x08\x00bonjour");
+        let key = Key {
+            cipher: Cipher::Ccmp,
+            key: &TK,
+            mic: &[0; 8],
+        };
+        crypto::protect(&key, &f, 0x2000_0001 | (key_id as u32) << 30, 0)
+    }
+
+    /// A stick with a CCMP pairwise key for the access point in entry 3,
+    /// as Linux's rt73usb loads one.
+    fn stick_with_pairwise_key() -> Rt2573 {
+        let (mut s, _) = Rt2573::new(ME);
+        s.mem[PAIRWISE_KEY_TABLE + 3 * KEY_ENTRY_SIZE..][..16].copy_from_slice(&TK);
+        let ta = PAIRWISE_TA_TABLE + 3 * 8;
+        s.mem[ta..ta + 6].copy_from_slice(&AP);
+        s.mem[ta + 6] = 4;
+        s.mem[SEC_CSR2..SEC_CSR2 + 4].copy_from_slice(&(1u32 << 3).to_le_bytes());
+        s.mem[SEC_CSR4..SEC_CSR4 + 4].copy_from_slice(&1u32.to_le_bytes());
+        s
+    }
+
+    #[test]
+    fn frames_to_us_are_opened_with_their_transmitters_pairwise_key() {
+        let s = stick_with_pairwise_key();
+        let (clear, alg, err, index, iv, _) = s.decrypt(sealed(ME, 0x08, 0));
+        assert_eq!((alg, err, index), (4, 0, 3));
+        assert_eq!(iv & 0xFFFF, 1);
+        assert!(clear.ends_with(b"bonjour"));
+    }
+
+    #[test]
+    fn without_pairwise_lookup_the_shared_table_is_used() {
+        let mut s = stick_with_pairwise_key();
+        s.mem[SEC_CSR4..SEC_CSR4 + 4].fill(0);
+        let (_, _, err, index, _, _) = s.decrypt(sealed(ME, 0x08, 0));
+        assert_eq!((err, index), (3, 0), "no valid shared key 0");
+        // An invalid entry is not looked at either.
+        let mut s = stick_with_pairwise_key();
+        s.mem[SEC_CSR2..SEC_CSR2 + 4].fill(0);
+        assert_eq!(s.decrypt(sealed(ME, 0x08, 0)).2, 3);
+    }
+
+    #[test]
+    fn group_frames_use_the_shared_key_their_header_names() {
+        let mut s = stick_with_pairwise_key();
+        s.mem[SHARED_KEY_TABLE + KEY_ENTRY_SIZE..][..16].copy_from_slice(&TK);
+        s.mem[SEC_CSR0..SEC_CSR0 + 4].copy_from_slice(&2u32.to_le_bytes());
+        s.mem[SEC_CSR1..SEC_CSR1 + 4].copy_from_slice(&(4u32 << 4).to_le_bytes());
+        let (clear, alg, err, index, _, _) = s.decrypt(sealed([0xFF; 6], 0x08, 1));
+        assert_eq!((alg, err, index), (4, 0, 1));
+        assert!(clear.ends_with(b"bonjour"));
+    }
+
+    #[test]
+    fn protected_management_frames_are_handed_over_as_they_came() {
+        let s = stick_with_pairwise_key();
+        let frame = sealed(ME, 0xC0, 0);
+        let (out, alg, err, ..) = s.decrypt(frame.clone());
+        assert_eq!((alg, err), (0, 0));
+        assert_eq!(out, frame);
     }
 }

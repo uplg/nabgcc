@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::air::{AccessPoint, Security, Wpa3};
 use crate::config::{Config, Wifi};
 use crate::lan::{Lan, Response};
-use crate::vs1003::{ADPCM_BLOCK_BYTES, Format, adpcm_decode};
+use crate::vs1003::{ADPCM_BLOCK_BYTES, Format, PCM_RATE, adpcm_decode};
 use crate::{DEFAULT_MAC, Machine};
 
 const SSID: &str = "Terrier";
@@ -294,6 +294,16 @@ pub unsafe extern "C" fn nab_audio(world: *mut World) -> usize {
                 sample_rate,
                 track.data[from..].to_vec(),
                 track.data.len(),
+            ),
+            // MIDI comes rendered; `from` counts samples here.
+            Format::Midi => (
+                1,
+                PCM_RATE,
+                track.pcm[from.min(track.pcm.len())..]
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect(),
+                track.pcm.len(),
             ),
             _ => (3, 0, Vec::new(), track.data.len()),
         };

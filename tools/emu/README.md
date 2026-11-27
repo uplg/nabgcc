@@ -28,18 +28,20 @@ Two examples show both sides of a link:
 | Internal RAM; external SRAM and the USB controller on the external bus | yes, with the bus timing BWC, RAMAC and IO0AC set, and an abort when a bank is switched off |
 | UART0 | transmitter: baud rate, 16-byte FIFO, status and interrupt; the receiver is not wired on the rabbit |
 | ML60842 USB host controller (OHCI) | control and bulk lists, one port |
-| RT2573 Wi-Fi stick | enumeration, firmware upload, registers, EEPROM, shared key table, WEP/TKIP/CCMP encryption and decryption, beacon generation |
+| RT2573 Wi-Fi stick | enumeration, firmware upload, registers, EEPROM, shared and pairwise key tables (the pairwise one looked up by transmitter address, as Linux's rt73usb programs it), WEP/TKIP/CCMP encryption and decryption of data frames, management frames handed over as they came, beacon generation |
 | Leds, head button, volume wheel (`board`) | yes |
 | Ears: motors and encoders | yes, with an estimated speed |
-| Audio codec (`vs1003`) | control registers, the stream sent to the decoder split into tracks and drained at its own pace, the microphone recorded as IMA ADPCM; no decoding of MP3 or MIDI |
+| Audio codec (`vs1003`) | control registers; the stream walked as the decoder does: WAV at its byte rate, MP3 layer III frame by frame (variable bit rates, lost sync), format 0 MIDI event by event at its tempo, anything else skipped; SCI_HDAT0/1, SCI_DECODE_TIME, SCI_AUDATA and SM_OUTOFWAV as the data sheet gives them; MIDI rendered to samples with a plain synthesiser (timing exact, timbre not the chip's); the microphone recorded as IMA ADPCM |
 | RFID reader and tags (`rfid`), I2C master | identifiers, anticollision slots, memory blocks read and written |
 | Access points (`air`) | beacons, probes, open and shared-key authentication, association, WPA and WPA2 pre-shared-key handshakes, group key renewal, replay checks, hidden networks, WPA3 (SAE by hunting and pecking or hash-to-element, anti-clogging tokens, key management 8, protected management frames, SA Query, BIP for broadcasts, integrity group key renewal), WPA2/WPA3 transition; timers and thresholds as hostapd's defaults |
 | A phone joining the rabbit in setup mode (`visitor`) | open association, DHCP client, HTTP client |
 | A WPA3 station written from the standard (`supplicant`) | what the next firmware has to do; the access point's opposite number in tests |
 | Wired network (`lan`) | DHCP, DNS, HTTP server, UDP capture and injection |
 
-Not there yet: the pairwise key table of the stick, MP3 and MIDI
-decoding.
+MP3 is not decoded to samples: the browser page hands the frames to
+the browser. What the stick does with the key index of a frame
+decrypted with a pairwise key (the receive descriptor reports the
+entry number here) is not checked.
 
 ## In a browser
 
@@ -91,7 +93,7 @@ real chip reports in that case has not been checked.
 |---|---|
 | `src/crypto.rs` | hashes, PSK, PRF, KDF, HKDF, AES key wrap, AES-CMAC, RC4, Michael, TKIP mixing, CCMP, BIP and CCMP on management frames against published vectors |
 | `src/p256.rs`, `src/sae.rs` | the curve against published points; SAE against the IEEE 802.11-2020 J.10 vectors, both methods |
-| `src/rfid.rs`, `src/vs1003.rs`, `src/board.rs` | the tag reader, the codec, leds and ears on their own |
+| `src/rfid.rs`, `src/vs1003.rs`, `src/board.rs`, `src/rt2573.rs` | the tag reader, the codec (WAV, MP3 frames, MIDI timing, header registers), leds and ears, the stick's key tables, on their own |
 | `tests/cpu_roms.rs` | the instruction test ROMs |
 | `tests/boot.rs` | boot, Wi-Fi stick bring-up, scan, settings in flash, reproducibility |
 | `tests/join.rs` | joining every kind of network, wrong passphrase |

@@ -12,7 +12,7 @@ Nothing here has been on a real rabbit.
 
 ## Running it
 
-    cd tools/emu && cargo test --release          # 104 tests, about 40 s
+    cd tools/emu && cargo test --release          # 112 tests, about 40 s
     cd lapin && ./build.sh                        # needs the nightly toolchain
     cd tools/emu && cargo run --release -- --ap Terrier ../../lapin/target/thumbv4t-none-eabi/release/lapin
     cd tools/emu && web/build.sh && node web/test.mjs
@@ -84,8 +84,9 @@ unlock, which the chip ignores, so its flash routines run under the
 watchdog. A full image takes 1.76 s by the modelled timings, against
 2.09 s.
 
-**Not done in the emulator.** The stick's pairwise key table, MP3 and
-MIDI decoding.
+**Not done in the emulator.** MP3 decoding to samples (the browser
+does it); MIDI is rendered with a plain synthesiser, not the chip's
+instruments.
 
 **WPA3 on a real network.** A rabbit that restarts while associated
 with protected management frames (a watchdog reset, say) finds the
