@@ -175,6 +175,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lapin-metal"
+version = "0.1.0"
+
+[[package]]
+name = "lapin-metal-cref"
+version = "0.1.0"
+dependencies = [
+ "lapin-metal",
+ "nabemu",
+]
+
+[[package]]
 name = "lapin-p256"
 version = "0.1.0"
 

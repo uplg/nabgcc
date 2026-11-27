@@ -1,0 +1,1131 @@
+//! The interpreter (`src/vm/vinterp.c`).
+//!
+//! A call frame on the stack, from the top: the four words saved by the
+//! call (return pc, pc base, caller frame, caller result slot), the
+//! locals, the arguments. `callstack` indexes the first argument;
+//! positive, it says the frame is the outermost of this run, and `ret`
+//! then ends the run.
+
+use crate::op::*;
+use crate::{Host, NIL, SYS_CBLOOP, SYS_CBPLAY, SYS_CBREC, SYS_CBTCP, SYS_ENV, Vm, int, pnt, val};
+
+/// `<<` as the ARM shifts: by the low byte of the count, nothing left
+/// from 32 on.
+fn shl(a: i32, b: i32) -> i32 {
+    let s = (b as u32) & 0xFF;
+    if s >= 32 { 0 } else { a << s }
+}
+
+/// `>>`, arithmetic: from 32 on, only the sign is left.
+fn shr(a: i32, b: i32) -> i32 {
+    let s = (b as u32) & 0xFF;
+    if s >= 32 { a >> 31 } else { a >> s }
+}
+
+/// `/` as libgcc divides on the rabbit: by zero, the largest number of
+/// the dividend's sign, or zero.
+fn div(a: i32, b: i32) -> i32 {
+    if b == 0 {
+        return match a {
+            0 => 0,
+            a if a > 0 => i32::MAX,
+            _ => i32::MIN,
+        };
+    }
+    a.wrapping_div(b)
+}
+
+/// `%`: libgcc's remainder by zero is zero.
+fn rem(a: i32, b: i32) -> i32 {
+    if b == 0 { 0 } else { a.wrapping_rem(b) }
+}
+
+impl<H: Host> Vm<'_, H> {
+    /// `TFCtest`: does the code at `p` only jump to a `ret`? Then the
+    /// call before it is a tail call.
+    fn tail_call(&self, mut p: i32, pbase: i32) -> bool {
+        while self.b(p) as i32 != RET {
+            if self.b(p) as i32 == GOTO {
+                p += 1;
+                p = pbase.wrapping_add(self.short(p));
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The `len` argument of the string natives: nil means "the rest".
+    #[inline]
+    fn len_or(&self, len: i32, rest: i32) -> i32 {
+        if len == NIL { rest } else { val(len) }
+    }
+
+    /// `interpGo`: run the function on top of the stack, its arguments
+    /// below it, until it returns.
+    pub fn interp_go(&mut self) {
+        let mut pc: i32 = -1;
+        let mut pcbase: i32 = -1;
+        let mut callstack: i32 = 1;
+        let mut callstackres: i32 = 1;
+        let mut op = EXEC;
+
+        if self.broken {
+            return;
+        }
+        loop {
+            loop {
+                let mut cont = false;
+                self.currentop = op;
+                self.host.watchdog();
+                match op {
+                    EXEC => {
+                        let mut p = self.sget(0);
+                        let fun;
+                        if p & 1 != 0 {
+                            p = val(p);
+                            fun = val(self.fetch(p, 0));
+                            self.sset(0, self.fetch(p, 1));
+                            while self.sget(0) != NIL {
+                                self.push(self.fetch(val(self.sget(0)), 1));
+                                self.sset(1, self.fetch(val(self.sget(1)), 0));
+                            }
+                        } else {
+                            fun = val(p);
+                        }
+                        self.pull();
+                        if fun < 0 {
+                            op = fun.wrapping_neg();
+                            cont = true;
+                        } else {
+                            let mut npc = self.fun_start(fun);
+                            let narg = self.b(npc) as i32;
+                            let nloc = self.short(npc + 1);
+                            npc += 3;
+
+                            if callstack <= 0 && self.tail_call(pc, pcbase) {
+                                pc = val(self.cget(callstackres, -3));
+                                pcbase = val(self.cget(callstackres, -2));
+                                let ncall = val(self.cget(callstackres, -1));
+                                callstackres = val(self.cget(callstackres, 0));
+                                for i in 0..narg {
+                                    self.cset(callstack, i, self.sget(narg - i - 1));
+                                }
+                                self.stack = callstack - narg + 1;
+                                callstack = ncall;
+                            }
+
+                            for _ in 0..nloc {
+                                self.push(NIL);
+                            }
+                            self.push(int(pc));
+                            self.push(int(pcbase));
+                            self.push(int(callstack));
+                            self.push(int(callstackres));
+                            callstack = self.stack + 3 + nloc + narg;
+                            callstackres = self.stack;
+                            pc = npc;
+                            pcbase = npc;
+                        }
+                    }
+                    RET => {
+                        pc = val(self.sget(4));
+                        pcbase = val(self.sget(3));
+                        let ncall = val(self.sget(2));
+                        callstackres = val(self.sget(1));
+                        self.cset(callstack, 0, self.sget(0));
+                        self.stack = callstack;
+                        callstack = ncall;
+                    }
+                    INTB => {
+                        let v = self.b(pc) as i32;
+                        pc += 1;
+                        self.push(int(v));
+                    }
+                    INT => {
+                        let v = self.int32(pc);
+                        pc += 4;
+                        self.push(int(v));
+                    }
+                    NIL_ => {
+                        self.push(NIL);
+                    }
+                    DROP => self.drop_n(1),
+                    DUP => {
+                        self.push(self.sget(0));
+                    }
+                    GETLOCALB => {
+                        let i = self.b(pc) as i32;
+                        pc += 1;
+                        self.push(self.cget(callstack, i));
+                    }
+                    GETLOCAL => {
+                        let v = self.cget(callstack, val(self.sget(0)));
+                        self.sset(0, v);
+                    }
+                    ADD..=SHR => {
+                        let (a, b) = (val(self.sget(1)), val(self.sget(0)));
+                        let r = match op {
+                            ADD => a.wrapping_add(b),
+                            SUB => a.wrapping_sub(b),
+                            MUL => a.wrapping_mul(b),
+                            DIV => div(a, b),
+                            MOD => rem(a, b),
+                            AND => a & b,
+                            OR => a | b,
+                            EOR => a ^ b,
+                            SHL => shl(a, b),
+                            _ => shr(a, b),
+                        };
+                        self.sset(1, int(r));
+                        self.drop_n(1);
+                    }
+                    NEG => self.sset(0, int(val(self.sget(0)).wrapping_neg())),
+                    NOT => self.sset(0, int(!val(self.sget(0)))),
+                    NON => self.sset(0, int((val(self.sget(0)) == 0) as i32)),
+                    EQ | NE => {
+                        let same = self.sget(1) == self.sget(0);
+                        self.sset(1, int((same == (op == EQ)) as i32));
+                        self.drop_n(1);
+                    }
+                    LT..=GE => {
+                        let (a, b) = (val(self.sget(1)), val(self.sget(0)));
+                        let r = match op {
+                            LT => a < b,
+                            GT => a > b,
+                            LE => a <= b,
+                            _ => a >= b,
+                        };
+                        self.sset(1, int(r as i32));
+                        self.drop_n(1);
+                    }
+                    GOTO => pc = pcbase.wrapping_add(self.short(pc)),
+                    ELSE => {
+                        if self.pull() == 0 {
+                            pc = pcbase.wrapping_add(self.short(pc));
+                        } else {
+                            pc += 2;
+                        }
+                    }
+                    MKTABB => {
+                        let n = self.b(pc) as i32;
+                        pc += 1;
+                        let p = self.alloc_tab_clear(n);
+                        self.push(pnt(p));
+                    }
+                    MKTAB => {
+                        let n = val(self.pull());
+                        let p = self.alloc_tab_clear(n);
+                        self.push(pnt(p));
+                    }
+                    DEFTABB => {
+                        let n = self.b(pc) as i32;
+                        pc += 1;
+                        self.stack_to_tab(n);
+                    }
+                    DEFTAB => {
+                        let n = val(self.pull());
+                        self.stack_to_tab(n);
+                    }
+                    FETCHB => {
+                        let i = self.b(pc) as i32;
+                        pc += 1;
+                        let p = self.sget(0);
+                        if p != NIL {
+                            self.sset(0, self.fetch(val(p), i));
+                        }
+                    }
+                    FETCH => {
+                        let i = self.pull();
+                        let p = self.sget(0);
+                        if p == NIL || i == NIL {
+                            self.sset(0, NIL);
+                        } else {
+                            let (i, p) = (val(i), val(p));
+                            if i < 0 || i >= self.size_tab(p) {
+                                self.sset(0, NIL);
+                            } else {
+                                self.sset(0, self.fetch(p, i));
+                            }
+                        }
+                    }
+                    GETGLOBALB => {
+                        let i = self.b(pc) as i32;
+                        pc += 1;
+                        self.push(self.cget(self.global_start, i));
+                    }
+                    GETGLOBAL => {
+                        let v = self.cget(self.global_start, val(self.sget(0)));
+                        self.sset(0, v);
+                    }
+                    SECHO => self.secho(self.sget(0), false),
+                    IECHO => self.iecho(self.sget(0), false),
+                    SETLOCALB => {
+                        let i = self.b(pc) as i32;
+                        pc += 1;
+                        let v = self.pull();
+                        self.cset(callstack, i, v);
+                    }
+                    SETLOCAL => {
+                        let i = val(self.pull());
+                        let v = self.pull();
+                        self.cset(callstack, i, v);
+                    }
+                    SETGLOBAL => {
+                        self.cset(self.global_start, val(self.sget(1)), self.sget(0));
+                        self.sset(1, self.sget(0));
+                        self.pull();
+                    }
+                    SETSTRUCTB => {
+                        // The C checks `i >= 0 || i < size`, which always
+                        // holds: the store happens whatever the index.
+                        let i = self.b(pc) as i32;
+                        pc += 1;
+                        let v = self.pull();
+                        let p = self.sget(0);
+                        if p != NIL {
+                            self.store(val(p), i, v);
+                        }
+                    }
+                    SETSTRUCT => {
+                        let i = self.pull();
+                        let v = self.pull();
+                        let p = self.sget(0);
+                        if p != NIL && i != NIL {
+                            self.store(val(p), val(i), v);
+                        }
+                    }
+                    HD | TL => {
+                        let p = self.sget(0);
+                        if p != NIL {
+                            self.sset(0, self.fetch(val(p), (op == TL) as i32));
+                        }
+                    }
+                    SETLOCAL2 => {
+                        self.cset(callstack, val(self.sget(1)), self.sget(0));
+                        self.sset(1, self.sget(0));
+                        self.pull();
+                    }
+                    STORE => {
+                        let v = self.pull();
+                        let i = self.pull();
+                        let p = self.sget(0);
+                        if p != NIL && i != NIL {
+                            self.store(val(p), val(i), v);
+                        }
+                        self.sset(0, v);
+                    }
+                    CALL => {
+                        let p = self.sget(0);
+                        if p == NIL {
+                            self.sset(1, NIL);
+                            self.pull();
+                        } else {
+                            let n = self.size_tab(val(p));
+                            if n == 0 {
+                                self.pull();
+                            } else {
+                                for _ in 1..n {
+                                    self.push(NIL);
+                                }
+                                let p = val(self.sget(n - 1));
+                                for i in 0..n {
+                                    self.sset(n - 1 - i, self.fetch(p, i));
+                                }
+                            }
+                            self.push(int(n));
+                            op = CALLR;
+                            cont = true;
+                        }
+                    }
+                    CALLRB | CALLR => {
+                        let n = if op == CALLRB {
+                            let n = self.b(pc) as i32;
+                            pc += 1;
+                            n
+                        } else {
+                            val(self.pull())
+                        };
+                        let valn = self.sget(n);
+                        if valn == NIL {
+                            self.drop_n(n);
+                        } else {
+                            let mut i = n;
+                            while i > 0 {
+                                self.sset(i, self.sget(i - 1));
+                                i -= 1;
+                            }
+                            self.sset(0, valn);
+                            op = EXEC;
+                            cont = true;
+                        }
+                    }
+                    FIRST => {
+                        let p = self.sget(0);
+                        let v = if p != NIL { self.fetch(val(p), 0) } else { NIL };
+                        self.push(v);
+                    }
+                    TIME_MS => {
+                        let t = self.host.time_ms() as i32;
+                        self.push(int(t));
+                    }
+                    TABNEW => {
+                        let v = self.pull();
+                        if v == NIL {
+                            self.sset(0, NIL);
+                        } else {
+                            let v = val(v);
+                            let p = self.alloc_tab(v);
+                            let v0 = self.sget(0);
+                            for i in 0..v {
+                                self.store(p, i, v0);
+                            }
+                            self.sset(0, pnt(p));
+                        }
+                    }
+                    FIXARG => {
+                        let v = self.sget(1);
+                        if v == NIL {
+                            self.pull();
+                        } else {
+                            if v & 1 != 0 {
+                                self.push(self.fetch(val(v), 1));
+                                self.sset(2, self.fetch(val(self.sget(2)), 0));
+                            } else {
+                                self.push(NIL);
+                            }
+                            self.stack_to_tab(2);
+                            self.stack_to_tab(2);
+                        }
+                    }
+                    ABS => {
+                        let v = val(self.sget(0));
+                        self.sset(0, int(if v < 0 { v.wrapping_neg() } else { v }));
+                    }
+                    MAX | MIN => {
+                        let v = val(self.pull());
+                        let w = val(self.sget(0));
+                        let r = if op == MAX {
+                            if v < w { w } else { v }
+                        } else if v > w {
+                            w
+                        } else {
+                            v
+                        };
+                        self.sset(0, int(r));
+                    }
+                    RAND => {
+                        let r = self.rand();
+                        self.push(int(r));
+                    }
+                    SRAND => self.srand(val(self.sget(0))),
+                    TIME => {
+                        let t = self.host.time_s() as i32;
+                        self.push(int(t));
+                    }
+                    STRNEW => {
+                        let n = val(self.sget(0));
+                        if n < 0 {
+                            self.sset(0, NIL);
+                        } else {
+                            let p = self.alloc_bin(n);
+                            self.sset(0, pnt(p));
+                        }
+                    }
+                    STRSET => {
+                        let v = val(self.pull());
+                        let n = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && n >= 0 && n < self.size_bin(p) {
+                            self.set_b(Self::start_bin(p) + n, v as u8);
+                        }
+                    }
+                    STRCPY => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.pull());
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let len = self.len_or(len, self.size_bin(q).wrapping_sub(start));
+                            let (lp, lq) = (self.size_bin(p), self.size_bin(q));
+                            self.sys_cpy(
+                                Self::start_bin(p),
+                                index,
+                                lp,
+                                Self::start_bin(q),
+                                start,
+                                lq,
+                                len,
+                            );
+                        }
+                    }
+                    VSTRCMP => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.pull());
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let (lp, lq) = (self.size_bin(p), self.size_bin(q));
+                            let len = if len == NIL {
+                                let l = lq.wrapping_sub(start);
+                                if l < lp.wrapping_sub(index) {
+                                    lp.wrapping_sub(index)
+                                } else {
+                                    l
+                                }
+                            } else {
+                                val(len)
+                            };
+                            let r = self.sys_cmp(
+                                Self::start_bin(p),
+                                index,
+                                lp,
+                                Self::start_bin(q),
+                                start,
+                                lq,
+                                len,
+                            );
+                            self.sset(0, int(r));
+                        } else {
+                            let r = if p != NIL {
+                                1
+                            } else if q != NIL {
+                                -1
+                            } else {
+                                0
+                            };
+                            self.sset(0, int(r));
+                        }
+                    }
+                    STRFIND | STRFINDREV => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.pull());
+                        let index = self.pull();
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let (lp, lq) = (self.size_bin(p), self.size_bin(q));
+                            let len = self.len_or(len, lq.wrapping_sub(start));
+                            let r = if op == STRFIND {
+                                self.sys_find(
+                                    Self::start_bin(p),
+                                    val(index),
+                                    lp,
+                                    Self::start_bin(q),
+                                    start,
+                                    lq,
+                                    len,
+                                )
+                            } else {
+                                let index = if index == NIL { lp - 1 } else { val(index) };
+                                self.sys_findrev(
+                                    Self::start_bin(p),
+                                    index,
+                                    lp,
+                                    Self::start_bin(q),
+                                    start,
+                                    lq,
+                                    len,
+                                )
+                            };
+                            self.sset(0, r);
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    STRLEN => {
+                        let p = val(self.sget(0));
+                        if p != NIL {
+                            self.sset(0, int(self.size_bin(p)));
+                        }
+                    }
+                    STRGET => {
+                        let n = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p == NIL || n < 0 || n >= self.size_bin(p) {
+                            self.sset(0, NIL);
+                        } else {
+                            let c = self.b(Self::start_bin(p) + n);
+                            self.sset(0, int(c as i32));
+                        }
+                    }
+                    STRSUB => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.sget(0));
+                        if q != NIL {
+                            let lq = self.size_bin(q);
+                            let mut len = self.len_or(len, lq.wrapping_sub(start));
+                            if start.wrapping_add(len) > lq {
+                                len = lq - start;
+                            }
+                            if start >= 0 && len >= 0 {
+                                let p = self.alloc_bin(len);
+                                let from = Self::start_bin(val(self.sget(0))) + start;
+                                self.copy_bytes(Self::start_bin(p), from, len);
+                                self.sset(0, pnt(p));
+                            } else {
+                                self.sset(0, NIL);
+                            }
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    STRCAT => {
+                        let q = val(self.sget(0));
+                        let p = val(self.sget(1));
+                        let mut len = 0;
+                        if p != NIL {
+                            len += self.size_bin(p);
+                        }
+                        if q != NIL {
+                            len += self.size_bin(q);
+                        }
+                        let r = self.alloc_bin(len);
+                        let q = val(self.pull());
+                        let p = val(self.sget(0));
+                        let mut len = 0;
+                        if p != NIL {
+                            len = self.size_bin(p);
+                            self.copy_bytes(Self::start_bin(r), Self::start_bin(p), len);
+                        }
+                        if q != NIL {
+                            let lq = self.size_bin(q);
+                            self.copy_bytes(Self::start_bin(r) + len, Self::start_bin(q), lq);
+                        }
+                        self.sset(0, pnt(r));
+                    }
+                    TABLEN => {
+                        let p = val(self.sget(0));
+                        if p != NIL {
+                            self.sset(0, int(self.size_tab(p)));
+                        }
+                    }
+                    STRCATLIST => {
+                        let mut len = 0;
+                        let mut p = val(self.sget(0));
+                        while p != NIL {
+                            let q = val(self.fetch(p, 0));
+                            if q != NIL {
+                                len += self.size_bin(q);
+                            }
+                            p = val(self.fetch(p, 1));
+                        }
+                        let r = self.alloc_bin(len);
+                        if r < 0 {
+                            return;
+                        }
+                        let mut len = 0;
+                        let mut p = val(self.sget(0));
+                        while p != NIL {
+                            let q = val(self.fetch(p, 0));
+                            if q != NIL {
+                                let lq = self.size_bin(q);
+                                self.copy_bytes(Self::start_bin(r) + len, Self::start_bin(q), lq);
+                                len += lq;
+                            }
+                            p = val(self.fetch(p, 1));
+                        }
+                        self.sset(0, pnt(r));
+                    }
+                    LED => {
+                        self.host
+                            .led(val(self.sget(1)) as u8, val(self.sget(0)) as u32);
+                        self.pull();
+                    }
+                    MOTORSET => {
+                        self.motor_set(val(self.sget(1)), val(self.sget(0)));
+                        self.pull();
+                    }
+                    MOTORGET => {
+                        let m = 1 + (val(self.sget(0)) & 1) as u8;
+                        let v = self.host.motor_position(m) as i32;
+                        self.sset(0, int(v));
+                    }
+                    BUTTON2 => {
+                        let v = self.host.button() as i32;
+                        self.push(int(v));
+                    }
+                    BUTTON3 => {
+                        let v = 255 - self.host.adc() as i32;
+                        self.push(int(v));
+                    }
+                    PLAYSTART => {
+                        let cb = self.pull();
+                        self.cset(self.sys_start, SYS_CBPLAY, cb);
+                        let k = val(self.pull());
+                        self.push(int(0));
+                        self.play_start(k);
+                    }
+                    PLAYFEED => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.sget(0));
+                        if q != NIL {
+                            let lq = self.size_bin(q);
+                            let mut len = self.len_or(len, lq.wrapping_sub(start));
+                            if start.wrapping_add(len) > lq {
+                                len = lq - start;
+                            }
+                            if start >= 0 && len >= 0 {
+                                let n = self.play_feed(Some((Self::start_bin(q) + start, len)));
+                                self.sset(0, int(n));
+                            } else {
+                                self.sset(0, NIL);
+                            }
+                        } else {
+                            self.play_feed(None);
+                            self.sset(0, NIL);
+                        }
+                    }
+                    PLAYSTOP => {
+                        self.play_stop();
+                        self.push(int(0));
+                    }
+                    RECSTART => {
+                        let cb = self.pull();
+                        self.cset(self.sys_start, SYS_CBREC, cb);
+                        let gain = val(self.pull());
+                        let freq = val(self.pull());
+                        self.push(int(0));
+                        self.rec_start(freq, gain);
+                    }
+                    RECSTOP => {
+                        self.rec_stop();
+                        self.push(int(0));
+                    }
+                    RECVOL => {
+                        let start = val(self.pull());
+                        let q = val(self.sget(0));
+                        if q != NIL {
+                            let v = self.rec_vol(Self::start_bin(q), self.size_bin(q), start);
+                            self.sset(0, int(v));
+                        }
+                    }
+                    LOAD | SAVE => {
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.pull());
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let lp = self.size_bin(p);
+                            let len = self.len_or(len, lp.wrapping_sub(index));
+                            let n = if op == LOAD {
+                                self.sys_load(Self::start_bin(p), index, lp, start, len)
+                            } else {
+                                self.sys_save(Self::start_bin(p), index, lp, start, len)
+                            };
+                            self.sset(0, int(n));
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    GC => {
+                        self.gc();
+                        let used = self.used_percent();
+                        self.push(int(used));
+                    }
+                    BYTECODE => {
+                        if self.sget(0) != NIL {
+                            let mut env = -1;
+                            let p = val(self.cget(self.sys_start, SYS_ENV));
+                            self.play_stop();
+                            self.rec_stop();
+                            if p != NIL {
+                                // The C copies the whole environment into
+                                // the 4 KB audio buffer; this keeps what
+                                // fits.
+                                env = self.size_bin(p).min(crate::AUDIO_FIFOPLAY as i32);
+                                let from = Self::start_bin(p);
+                                for k in 0..env.max(0) {
+                                    self.mem.fifo[k as usize] = self.b(from + k);
+                                }
+                            }
+                            let q = Self::start_bin(val(self.sget(0)));
+                            self.load_heap(q);
+                            if env >= 0 {
+                                let p = self.alloc_bin(env);
+                                for k in 0..env {
+                                    let v = self.mem.fifo[k as usize];
+                                    self.set_b(Self::start_bin(p) + k, v);
+                                }
+                                self.cset(self.sys_start, SYS_ENV, pnt(p));
+                            }
+                            self.push(int(0));
+                            self.interp_go();
+                            self.pull();
+                            return;
+                        }
+                    }
+                    LOOPCB => self.cset(self.sys_start, SYS_CBLOOP, self.sget(0)),
+                    SECHOLN => self.secho(self.sget(0), true),
+                    IECHOLN => self.iecho(self.sget(0), true),
+                    ENVGET => {
+                        self.push(self.cget(self.sys_start, SYS_ENV));
+                    }
+                    ENVSET => self.cset(self.sys_start, SYS_ENV, self.sget(0)),
+                    SNDVOL => self.volume(val(self.sget(0))),
+                    RFIDGET => match self.host.rfid_first() {
+                        None => {
+                            self.push(NIL);
+                        }
+                        Some(id) => {
+                            let p = self.alloc_str(&id);
+                            self.push(pnt(p));
+                        }
+                    },
+                    PLAYTIME => {
+                        let t = self.play_time();
+                        self.push(int(t));
+                    }
+                    NETCB => self.cset(self.sys_start, SYS_CBTCP, self.sget(0)),
+                    NETSEND => {
+                        let speed = val(self.pull());
+                        let indmac = val(self.pull());
+                        let q = val(self.pull());
+                        let len = self.pull();
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let lp = self.size_bin(p);
+                            let len = self.len_or(len, lp.wrapping_sub(index));
+                            let lq = self.size_bin(q);
+                            let r = self.net_send(
+                                Self::start_bin(p),
+                                index,
+                                len,
+                                lp,
+                                Self::start_bin(q),
+                                indmac,
+                                lq,
+                                speed,
+                            );
+                            self.sset(0, int(r));
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    NETSTATE => {
+                        let s = self.host.net_state();
+                        self.push(int(s));
+                    }
+                    NETMAC => {
+                        let mac = self.host.net_mac();
+                        let p = self.alloc_str(&mac);
+                        self.push(pnt(p));
+                    }
+                    NETCHK => {
+                        let v = val(self.pull());
+                        let len = self.pull();
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL {
+                            let lp = self.size_bin(p);
+                            let len = self.len_or(len, lp.wrapping_sub(index));
+                            let r = self.net_chk(Self::start_bin(p), index, len, lp, v as u32);
+                            self.sset(0, int(r as i32));
+                        } else {
+                            self.sset(0, int(v));
+                        }
+                    }
+                    NETSETMODE => {
+                        let chn = val(self.pull());
+                        let p = val(self.pull());
+                        let md = val(self.sget(0));
+                        let heap = crate::bytes(&self.mem.heap);
+                        let ssid =
+                            (p != NIL).then(|| crate::natives::cstr(heap, Self::start_bin(p)));
+                        self.host.net_set_mode(md, ssid, chn as u8);
+                    }
+                    NETSCAN => {
+                        let p = val(self.pull());
+                        self.net_scan(p);
+                    }
+                    NETAUTH => {
+                        let key = val(self.pull());
+                        let encrypt = val(self.pull());
+                        let authmode = val(self.pull());
+                        let scan = val(self.sget(0));
+                        self.net_auth(scan, authmode, encrypt, key);
+                    }
+                    NETSEQADD => {
+                        let inc = val(self.pull());
+                        let seq = val(self.pull());
+                        if seq == NIL || self.size_bin(seq) < 4 {
+                            self.push(NIL);
+                        } else {
+                            self.net_seq_add(Self::start_bin(seq), inc);
+                        }
+                    }
+                    STRGETWORD => {
+                        let ind = val(self.pull());
+                        let src = val(self.sget(0));
+                        if src != NIL {
+                            let v = self.strgetword(Self::start_bin(src), self.size_bin(src), ind);
+                            self.sset(0, int(v));
+                        }
+                    }
+                    STRPUTWORD => {
+                        let v = val(self.pull());
+                        let ind = val(self.pull());
+                        let src = val(self.sget(0));
+                        if src != NIL {
+                            self.strputword(Self::start_bin(src), self.size_bin(src), ind, v);
+                        }
+                    }
+                    ATOI | HTOI => {
+                        let src = val(self.sget(0));
+                        if src != NIL {
+                            let v = if op == ATOI {
+                                self.atoi(Self::start_bin(src))
+                            } else {
+                                self.htoi(Self::start_bin(src))
+                            };
+                            self.sset(0, int(v));
+                        }
+                    }
+                    ITOA => {
+                        let v = val(self.pull());
+                        self.itoa(v);
+                    }
+                    CTOA => {
+                        let v = val(self.pull());
+                        self.ctoa(v);
+                    }
+                    ITOH => {
+                        let v = val(self.pull());
+                        self.itoh(v);
+                    }
+                    CTOH => {
+                        let v = val(self.pull());
+                        self.ctoh(v);
+                    }
+                    ITOBIN2 => {
+                        let v = val(self.pull());
+                        self.itobin2(v);
+                    }
+                    LISTSWITCH => {
+                        let key = self.pull();
+                        let p = val(self.sget(0));
+                        let v = self.listswitch(p, key);
+                        self.sset(0, v);
+                    }
+                    LISTSWITCHSTR => {
+                        let key = self.pull();
+                        let p = val(self.sget(0));
+                        let v = if key == NIL {
+                            self.listswitch(p, key)
+                        } else {
+                            self.listswitchstr(p, Self::start_bin(val(key)))
+                        };
+                        self.sset(0, v);
+                    }
+                    SNDREFRESH => {
+                        self.play_check(false);
+                        self.rec_check();
+                        self.push(NIL);
+                    }
+                    SNDWRITE => {
+                        let v = val(self.pull());
+                        let reg = val(self.sget(0));
+                        self.host.codec_write(reg as u8, v as u16);
+                    }
+                    SNDREAD => {
+                        let reg = val(self.sget(0));
+                        let v = if reg == -1 {
+                            self.host.codec_ready() as i32
+                        } else {
+                            self.host.codec_read(reg as u8) as i32
+                        };
+                        self.sset(0, int(v));
+                    }
+                    SNDFEED => {
+                        let len = self.pull();
+                        let start = self.pull();
+                        let q = val(self.sget(0));
+                        let start = if start == NIL { 0 } else { val(start) };
+                        if q != NIL {
+                            let lq = self.size_bin(q);
+                            let mut len = self.len_or(len, lq.wrapping_sub(start));
+                            if start.wrapping_add(len) > lq {
+                                len = lq - start;
+                            }
+                            if start >= 0 && len >= 0 {
+                                let heap = crate::bytes(&self.mem.heap);
+                                let data =
+                                    crate::natives::clip(heap, Self::start_bin(q) + start, len);
+                                let k = self.host.codec_feed(data) as i32;
+                                self.sset(0, int(k));
+                            } else {
+                                self.sset(0, NIL);
+                            }
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    SNDAMPLI => {
+                        let on = val(self.sget(0)) as u8;
+                        self.host.amplifier(on != 0);
+                    }
+                    COREPP => {
+                        self.push(int(self.stack));
+                    }
+                    COREPUSH => {
+                        self.push(self.sget(0));
+                    }
+                    COREPULL => {
+                        self.sset(1, self.sget(0));
+                        self.pull();
+                    }
+                    COREBIT0 => {
+                        let v = val(self.pull());
+                        self.sset(0, (self.sget(0) & !1) | (v & 1));
+                    }
+                    REBOOT => {
+                        let w = val(self.pull());
+                        let v = val(self.sget(0));
+                        if v == 0x0407FE58 && w == 0x13fb6754 {
+                            self.host.reboot();
+                        }
+                    }
+                    STRCMP => {
+                        let q = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let (pl, ql) = (self.size_bin(p), self.size_bin(q));
+                            let r = self.memcmp(Self::start_bin(p), Self::start_bin(q), pl.max(ql));
+                            self.sset(0, int(r));
+                        } else {
+                            let r = if p != NIL {
+                                1
+                            } else if q != NIL {
+                                -1
+                            } else {
+                                0
+                            };
+                            self.sset(0, int(r));
+                        }
+                    }
+                    ADP2WAV | WAV2ADP | ALAW2WAV | WAV2ALAW => {
+                        let mu = if op == ALAW2WAV || op == WAV2ALAW {
+                            val(self.pull()) != 0
+                        } else {
+                            false
+                        };
+                        let len = self.pull();
+                        let start = val(self.pull());
+                        let q = val(self.pull());
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL && q != NIL {
+                            let (lp, lq) = (self.size_bin(p), self.size_bin(q));
+                            let len = self.len_or(len, lq.wrapping_sub(start));
+                            let (dp, dq) = (Self::start_bin(p), Self::start_bin(q));
+                            match op {
+                                ADP2WAV => self.adp2wav(dp, index, lp, dq, start, lq, len),
+                                WAV2ADP => self.wav2adp(dp, index, lp, dq, start, lq, len),
+                                ALAW2WAV => self.alaw2wav(dp, index, lp, dq, start, lq, len, mu),
+                                _ => self.wav2alaw(dp, index, lp, dq, start, lq, len, mu),
+                            }
+                        }
+                    }
+                    NETPMK => {
+                        let key = val(self.pull());
+                        let ssid = val(self.pull());
+                        if key == NIL || ssid == NIL {
+                            self.push(NIL);
+                        } else {
+                            let heap = crate::bytes(&self.mem.heap);
+                            let ssid = crate::natives::cstr(heap, Self::start_bin(ssid));
+                            let key = crate::natives::cstr(heap, Self::start_bin(key));
+                            let pmk = self.host.net_pmk(ssid, key);
+                            let p = self.alloc_str(&pmk);
+                            self.push(pnt(p));
+                        }
+                    }
+                    FLASHFIRMWARE => {
+                        let w = val(self.pull());
+                        let v = val(self.pull());
+                        let firmware = val(self.sget(0));
+                        if firmware != NIL && v == 0x13fb6754 && w == 0x0407FE58 {
+                            let len = self.size_bin(firmware);
+                            self.flash_firmware(Self::start_bin(firmware), len);
+                        }
+                    }
+                    CRYPT | UNCRYPT => {
+                        let alpha = val(self.pull());
+                        let key = val(self.pull());
+                        let len = self.pull();
+                        let index = val(self.pull());
+                        let p = val(self.sget(0));
+                        if p != NIL {
+                            let lp = self.size_bin(p);
+                            let len = self.len_or(len, lp.wrapping_sub(index));
+                            let r = if op == CRYPT {
+                                self.crypt(Self::start_bin(p), index, len, lp, key, alpha)
+                            } else {
+                                self.uncrypt(Self::start_bin(p), index, len, lp, key, alpha)
+                            };
+                            self.sset(0, int(r));
+                        } else {
+                            self.sset(0, NIL);
+                        }
+                    }
+                    NETRSSI => {
+                        let r = self.host.net_rssi();
+                        self.push(int(r));
+                    }
+                    RFIDGETLIST => self.rfid_list(),
+                    RFIDREAD => {
+                        let block = val(self.pull());
+                        let p = val(self.pull());
+                        if p != NIL {
+                            self.rfid_read(Self::start_bin(p), block);
+                        } else {
+                            self.push(NIL);
+                        }
+                    }
+                    RFIDWRITE => {
+                        let q = val(self.pull());
+                        let block = val(self.pull());
+                        let p = val(self.pull());
+                        if p != NIL && q != NIL {
+                            let id = self.slice_padded::<8>(Self::start_bin(p));
+                            let data = self.slice_padded::<4>(Self::start_bin(q));
+                            let r = self.host.rfid_write(&id, block, &data);
+                            self.push(int(r));
+                        } else {
+                            self.push(NIL);
+                        }
+                    }
+                    I2CREAD => {
+                        let size = val(self.pull());
+                        let address = val(self.pull()) as u8;
+                        self.i2c_read(address, size);
+                    }
+                    I2CWRITE => {
+                        let len = val(self.pull());
+                        let data = val(self.pull());
+                        let address = val(self.pull()) as u8;
+                        self.i2c_write(address, Self::start_bin(data), len);
+                    }
+                    // Unknown, or one of the opcodes this firmware never
+                    // implemented (udp*, tcp*): nothing happens.
+                    _ => {}
+                }
+                if !cont {
+                    break;
+                }
+            }
+            self.currentop = -1;
+            if callstack > 0 {
+                return;
+            }
+            op = self.b(pc) as i32;
+            pc = pc.wrapping_add(1);
+        }
+    }
+}

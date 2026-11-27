@@ -1,0 +1,8 @@
+[package]
+name = "lapin-metal"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The Metal virtual machine that runs the rabbit's bytecode, as the C firmware runs it"
+
+[dependencies]

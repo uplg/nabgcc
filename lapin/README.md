@@ -11,6 +11,8 @@ in this repository. It is developed against the emulator in
 |---|---|
 | `p256` | the NIST P-256 curve: field, points, constant-time scalar multiplication |
 | `core` | everything portable: SHA-256, HMAC, key derivation, the WPA3 password exchange (SAE) |
+| `metal` | the Metal virtual machine that runs the bytecode, as the C firmware runs it |
+| `cref` | tests only: the C firmware's machine built for the host, to check `metal` against word for word |
 | `fw` | the firmware itself, for the ARM7TDMI (`thumbv4t-none-eabi`) |
 
 `p256` and `core` have no dependency and no allocation, and are tested
