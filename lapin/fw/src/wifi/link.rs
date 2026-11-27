@@ -6,6 +6,9 @@ use lapin_core::wifi::{HwCipher, Link, Mac, Rx, Tx};
 use super::rt2573::{Cipher, Rate, Stick, TxOptions};
 use crate::{sync::Shared, timer, watchdog};
 
+/// What the random pool must have taken in before a draw.
+const ENOUGH: u32 = 512;
+
 /// How long a frame may wait for the previous one to leave.
 const TX_WAIT_MS: u32 = 50;
 
@@ -119,6 +122,11 @@ impl Link for Radio<'_> {
     }
 
     fn random(&mut self, out: &mut [u8]) {
+        // Nothing drawn for a key before the pool has had its fill
+        // (the boot's readings, the stick's arrival, frames heard).
+        while self.pool.mixes() < ENOUGH {
+            self.pool.mix(crate::board::noise());
+        }
         self.pool.stir(&[&timer::millis().to_le_bytes()]);
         self.pool.fill(out);
     }

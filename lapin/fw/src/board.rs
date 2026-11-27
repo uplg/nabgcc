@@ -138,6 +138,25 @@ pub fn button() -> bool {
     PI3.read() & BUTTON == 0
 }
 
+/// A sample of noise for the random pool, taking a millisecond: how
+/// many conversions of the volume wheel's ADC fit before the next tick
+/// (it varies with the interrupts that come and the flash's waits), and
+/// the readings themselves, all ten bits (the last ones wander).
+pub fn noise() -> u32 {
+    const START: u16 = 0x10;
+    let tick = crate::timer::millis();
+    let mut x = 0u32;
+    let mut n = 0u32;
+    while crate::timer::millis() == tick && n < 100_000 {
+        ADCON1.set(START | 2);
+        while ADCON1.read() & START != 0 {}
+        x = x.rotate_left(3) ^ ADR2.read() as u32;
+        n += 1;
+    }
+    crate::watchdog::feed();
+    x ^ n << 16
+}
+
 /// The volume wheel, 0 to 255.
 pub fn volume() -> u8 {
     const START: u16 = 0x10;

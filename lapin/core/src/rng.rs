@@ -3,6 +3,13 @@
 //! stirred into (analogue noise, the moments frames arrive, their
 //! contents and signal strength, the jitter of the main loop), and
 //! output drawn from it through SHA-256.
+//!
+//! What it is not: a source of entropy. On the rabbit the inputs are a
+//! volume wheel's ADC readings, the jitter of a busy loop against the
+//! millisecond tick, and what the radio hears, much of which an
+//! onlooker hears too. The firmware counts what went in (`mixes`) and
+//! draws nothing for a key exchange before enough has (see the board's
+//! `Radio::random`); it cannot measure how unpredictable it was.
 
 use crate::sha256::{Sha256, sha256};
 
@@ -12,6 +19,7 @@ pub struct Pool {
     /// Cheap mixing of frequent events, hashed in at the next draw.
     acc: [u32; 8],
     at: usize,
+    mixes: u32,
 }
 
 impl Default for Pool {
@@ -27,6 +35,7 @@ impl Pool {
             counter: 0,
             acc: [0; 8],
             at: 0,
+            mixes: 0,
         }
     }
 
@@ -38,6 +47,12 @@ impl Pool {
             h.update(p);
         }
         self.state = h.finish();
+        self.mixes = self.mixes.saturating_add(1);
+    }
+
+    /// How many things were mixed or stirred in so far.
+    pub fn mixes(&self) -> u32 {
+        self.mixes
     }
 
     /// Mix a word in, at the cost of a few instructions: for events
@@ -46,6 +61,7 @@ impl Pool {
         let a = &mut self.acc[self.at];
         *a = a.rotate_left(7) ^ x.wrapping_mul(0x9E37_79B1);
         self.at = (self.at + 1) & 7;
+        self.mixes = self.mixes.saturating_add(1);
     }
 
     /// Fill `out`; the pool moves on, so that what came out cannot be
@@ -82,5 +98,14 @@ mod tests {
         assert_ne!(x, y);
         assert_ne!(x, z);
         assert_ne!(x[..32], x[8..]);
+    }
+
+    #[test]
+    fn what_went_in_is_counted() {
+        let mut a = Pool::new();
+        assert_eq!(a.mixes(), 0);
+        a.mix(1);
+        a.stir(&[b"x"]);
+        assert_eq!(a.mixes(), 2);
     }
 }

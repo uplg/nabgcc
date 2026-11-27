@@ -414,6 +414,12 @@ impl Host for Board {
                 uart::write(b"\n");
                 let m = stick.mac;
                 self.pool.mix(u32::from_le_bytes([m[2], m[3], m[4], m[5]]));
+                // The 64 readings at boot came within a millisecond: a
+                // quarter of a second more, spread over the ticks,
+                // before the radio is of any use.
+                for _ in 0..256 {
+                    self.pool.mix(board::noise());
+                }
                 self.stick = Some(slot.write(stick));
             }
             Err(rt2573::Error::Radio(radio)) => {
