@@ -70,11 +70,19 @@ wpa_key_mgmt=SAE
 rsn_pairwise=CCMP
 ieee80211w=2
 sae_pwe=2"
+  # Hash-to-element only: the association has to carry the RSN
+  # extension element that says so.
+  [wpa3h2e]="wpa=2
+sae_password=carotte-violette
+wpa_key_mgmt=SAE
+rsn_pairwise=CCMP
+ieee80211w=2
+sae_pwe=1"
 )
-declare -A config=([open]=open [wpa]=wpa [wpa2]=wpa2 [transition]=wpa2 [wpa3]=wpa2)
+declare -A config=([open]=open [wpa]=wpa [wpa2]=wpa2 [transition]=wpa2 [wpa3]=wpa2 [wpa3h2e]=wpa2)
 
 status=0
-for kind in ${KINDS:-open wpa wpa2 transition wpa3}; do
+for kind in ${KINDS:-open wpa wpa2 transition wpa3 wpa3h2e}; do
     pkill -x hostapd || true; pkill -x dnsmasq || true; pkill -f serve.py || true
     modprobe -r mac80211_hwsim 2>/dev/null || true
     modprobe mac80211_hwsim radios=1
