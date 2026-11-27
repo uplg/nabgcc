@@ -75,6 +75,22 @@ gets its address, fetches the served bytecode and runs it. The access
 point's ciphers there are the kernel's. Not in CI (it needs root and
 the module); run it by hand after touching the station.
 
+**Fuzzing.** `lapin/fuzz` (cargo-fuzz, its own workspace) drives the
+station into every state through a scripted access point and feeds it
+frames, and runs the machine on arbitrary bytecode and against the C
+one. About 10 CPU-hours found seven station bugs (a short EAPOL frame
+halting the rabbit, clear text accepted on a keyed link, a forged
+rekey message locking it out until power-off, among them), all fixed
+with regression tests; the machine showed no panic and no divergence,
+only hangs the C one has too on hostile bytecode.
+
+**Soak.** Two hours of garenne with sound on command, dances, ears,
+tags, group rekeys every 30 s, pairwise rekeys every 10 minutes and an
+access point restart every quarter of an hour: no reset, 23 sounds
+asked, 23 played. The first run, before the fuzzing's fixes, rebooted
+three times: a rekey cut by an access point restart left its key
+pending and every rejoin failed, the bug the fuzzer had found too.
+
 **Randomness.** The chip has no generator. SAE's numbers come from a
 pool (`lapin/core/src/rng.rs`) stirred with the volume wheel's noise,
 the arrival times, strengths and first bytes of received frames, and

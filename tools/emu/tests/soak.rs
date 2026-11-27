@@ -160,8 +160,34 @@ fn garenne_lives_through_everything() {
     let end = minutes * 60_000;
     let mut before_last_minute = 0;
     let mut restarts = 0;
+    let mut resets_seen = 0;
+    let mut plays = 0;
+    let mut unfed_before = 0;
     while m.soc.millis() < end {
+        unfed_before = unfed_before.max(m.soc.watchdog_unfed());
         m.run_until_ms(m.soc.millis() + 1000);
+        if m.events.len() > resets_seen {
+            resets_seen = m.events.len();
+            let console = m.console();
+            let tail: Vec<&str> = console
+                .lines()
+                .rev()
+                .take(25)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let lg = log(&m);
+            eprintln!(
+                "RESET {:?} at {} ms, watchdog unfed up to {} ms before; log tail {:?}\nconsole tail:\n{}",
+                m.events.last(),
+                m.soc.millis(),
+                unfed_before * 1000 / nabemu::soc::CLOCK_HZ,
+                &lg[lg.len().saturating_sub(5)..],
+                tail.join("\n")
+            );
+        }
+        unfed_before = 0;
         let t = m.soc.millis();
         let minute = t / 60_000;
         let second = (t / 1000) % 60;
@@ -180,6 +206,9 @@ fn garenne_lives_through_everything() {
             restarts += 1;
         }
         if t >= 30_000 && second == 10 {
+            if minute.is_multiple_of(5) {
+                plays += 1;
+            }
             let command: &[u8] = match minute % 5 {
                 0 => b"grn1 play /vl/stream.mp3",
                 1 => b"grn1 dance",
@@ -201,9 +230,15 @@ fn garenne_lives_through_everything() {
         }
     }
     let log = log(&m);
-    let consumed = m.soc.board.codec.consumed;
+    if std::env::var("SOAK_LOG").is_ok() {
+        for l in log.iter().filter(|l| !l.contains("link=4")) {
+            eprintln!("LOG {l}");
+        }
+    }
+    let played = log.iter().filter(|l| l.contains("audio: done")).count();
+    let tracks = m.soc.board.codec.tracks.len();
     eprintln!(
-        "{minutes} minutes: {} log lines, {restarts} access point restarts, {consumed} bytes of sound played",
+        "{minutes} minutes: {} log lines, {restarts} access point restarts, {plays} sounds asked, {played} played to the end, {tracks} tracks at the codec",
         log.len()
     );
     assert_eq!(m.events, [], "no reset");
@@ -216,7 +251,7 @@ fn garenne_lives_through_everything() {
         "{late} pulses in the last minute: {:?}",
         &log[before_last_minute..]
     );
-    assert!(consumed > 0, "no sound was played: {log:#?}");
+    assert_eq!(played, plays, "sounds asked and played: {log:#?}");
     let unfed = m.soc.watchdog_longest * 1000 / nabemu::soc::CLOCK_HZ;
     assert!(unfed <= 1045, "watchdog unfed {unfed} ms");
     assert!(m.stack_low[0x1F] >= 0x1000_4000 - 0x400 - 12 * 1024);
