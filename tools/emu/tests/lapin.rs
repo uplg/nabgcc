@@ -40,8 +40,14 @@ fn the_firmware_boots_its_bytecode_and_stays_up() {
     assert!(leds.iter().all(|l| *l == AMBER || *l == [0; 3]), "{leds:?}");
     assert!(leds.contains(&AMBER), "{leds:?}");
     assert_eq!(m.soc.ohci.errors, 0);
-    let radio = m.radio.borrow();
-    assert!(radio.firmware_loaded && radio.rx_enabled);
+    assert!(m.radio.borrow().firmware_loaded);
+    // The receiver goes off while the radio changes channel: back on
+    // within moments.
+    let at = m.soc.millis();
+    while !m.radio.borrow().rx_enabled {
+        assert!(m.soc.millis() < at + 200, "the receiver stays off");
+        m.run_until_ms(m.soc.millis() + 1);
+    }
 }
 
 /// Without its Wi-Fi stick the firmware says so and carries on: the
