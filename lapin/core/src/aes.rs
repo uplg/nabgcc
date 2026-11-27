@@ -21,8 +21,22 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
+/// The inverse S-box, made from the S-box when the firmware is built.
+const INV_SBOX: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[SBOX[i] as usize] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// Times x in GF(2^8), the reduction applied by a mask: Thumb has no
+/// conditional instructions, a test of the top bit would be a branch
+/// on the key or the data.
 fn xtime(x: u8) -> u8 {
-    (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
+    (x << 1) ^ (0u8.wrapping_sub(x >> 7) & 0x1b)
 }
 
 /// An expanded AES-128 key.
@@ -87,7 +101,8 @@ impl Aes {
     /// Decryption, for the key unwrap only: a few blocks per handshake,
     /// so it is built from the forward steps. Mixing the columns four
     /// times, or shifting the rows four times, gives the block back:
-    /// three times is the inverse.
+    /// three times is the inverse. The S-box is undone by a table, in
+    /// the same time whatever the byte.
     pub fn decrypt(&self, block: &mut Block) {
         let s = block;
         for r in (1..11).rev() {
@@ -101,9 +116,7 @@ impl Aes {
                 shift_rows(s);
             }
             for b in s.iter_mut() {
-                // The inverse S-box by search: decryption only ever runs
-                // on a handful of key wrap blocks.
-                *b = SBOX.iter().position(|x| x == b).unwrap_or(0) as u8;
+                *b = INV_SBOX[*b as usize];
             }
         }
         add(s, &self.rounds[0]);
@@ -142,9 +155,7 @@ fn double(b: &Block) -> Block {
     for i in 0..16 {
         out[i] = b[i] << 1 | if i < 15 { b[i + 1] >> 7 } else { 0 };
     }
-    if b[0] & 0x80 != 0 {
-        out[15] ^= 0x87;
-    }
+    out[15] ^= 0u8.wrapping_sub(b[0] >> 7) & 0x87;
     out
 }
 
@@ -229,7 +240,9 @@ fn add_into(a: &mut [u8], b: &[u8]) {
 }
 
 /// RFC 3394 key unwrap: `out` gets `wrapped.len() - 8` bytes. False if
-/// the integrity check fails or the sizes are wrong.
+/// the integrity check fails or the sizes are wrong. The check looks at
+/// every byte of the integrity value, whatever it holds.
+#[inline(never)]
 pub fn unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
     let n = wrapped.len() / 8;
     if wrapped.len() % 8 != 0 || n < 3 || out.len() != wrapped.len() - 8 {
@@ -253,7 +266,7 @@ pub fn unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
             out[(i - 1) * 8..i * 8].copy_from_slice(&b[8..]);
         }
     }
-    a == [0xA6; 8]
+    crate::ccmp::constant_eq(&a, &[0xA6; 8])
 }
 
 #[cfg(test)]

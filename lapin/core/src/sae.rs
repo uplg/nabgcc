@@ -6,6 +6,7 @@
 //! hide a random number), derive the same key from what they sent and
 //! received, and prove it with a confirm.
 
+use crate::ccmp::constant_eq;
 use crate::p256::{self, Fe, Limbs, Point};
 use crate::sha256::{hkdf_expand, hmac, kdf};
 
@@ -38,27 +39,32 @@ fn ordered(a: &Mac, b: &Mac) -> [u8; 12] {
 pub fn password_element_looping(a: &Mac, b: &Mac, password: &[u8]) -> Option<Point> {
     let addresses = ordered(a, b);
     let prime = p256::to_bytes(&p256::P);
-    let mut found: Option<Point> = None;
+    let mut found_x = Fe::ZERO;
+    let mut found_y = Fe::ZERO;
+    let mut found = 0u32;
     // Forty rounds whatever happens, each doing the same work, so that
-    // neither the count nor the time tells which counter gave the point.
+    // neither the count nor the time tells which counter gave the point:
+    // the first that does is kept by masks, not by a branch.
     for counter in 1..=40u8 {
         let seed = hmac(&addresses, &[password, &[counter]]);
         let mut value = [0u8; 32];
         kdf(&seed, b"SAE Hunting and Pecking", &prime, &mut value);
         let x = p256::from_bytes(&value);
-        let in_field = p256::less(&x, &p256::P);
+        let in_field = (p256::less(&x, &p256::P) as u32).wrapping_neg();
         let x = Fe::new(&x);
-        let root = p256::curve_rhs(&x).sqrt();
-        let mut y = root.unwrap_or(Fe::ZERO);
+        let (mut y, root) = p256::curve_rhs(&x).sqrt_masked();
         let flip = ((y.is_odd() != (seed[31] & 1 != 0)) as u32).wrapping_neg();
         let negated = y.neg();
         y.select(&negated, flip);
-        let candidate = Point::from_affine(&x, &y);
-        if found.is_none() && in_field && root.is_some() {
-            found = candidate;
-        }
+        let take = in_field & root & !found;
+        found_x.select(&x, take);
+        found_y.select(&y, take);
+        found |= take;
     }
-    found
+    if found == 0 {
+        return None;
+    }
+    Point::from_affine(&found_x, &found_y)
 }
 
 /// Simplified SWU map of a field element to a point (RFC 9380, 6.6.2).
@@ -68,19 +74,25 @@ fn map_to_curve(u: &Fe) -> Option<Point> {
     let z = Fe::from_u32(10).neg();
     let zu2 = z.mul(&u.square());
     let t = zu2.square().add(&zu2).invert();
+    // Zero only for two values of u in 2^256: the branch is never
+    // taken in practice, and the test of it looks at every limb.
     let x1 = if t.is_zero() {
         b.mul(&z.mul(&a).invert())
     } else {
         b.neg().mul(&a.invert()).mul(&Fe::one().add(&t))
     };
     let x2 = zu2.mul(&x1);
-    let (x, mut y) = match p256::curve_rhs(&x1).sqrt() {
-        Some(y) => (x1, y),
-        None => (x2, p256::curve_rhs(&x2).sqrt()?),
-    };
-    if u.is_odd() != y.is_odd() {
-        y = y.neg();
-    }
+    // Both candidates, and the one whose right-hand side is a square
+    // kept by a mask: which one it is depends on the password.
+    let (y1, square) = p256::curve_rhs(&x1).sqrt_masked();
+    let (y2, _) = p256::curve_rhs(&x2).sqrt_masked();
+    let mut x = x2;
+    x.select(&x1, square);
+    let mut y = y2;
+    y.select(&y1, square);
+    let flip = ((u.is_odd() != y.is_odd()) as u32).wrapping_neg();
+    let negated = y.neg();
+    y.select(&negated, flip);
     Point::from_affine(&x, &y)
 }
 
@@ -256,7 +268,7 @@ impl Session {
     pub fn check_confirm(&self, counter: u16, value: &[u8]) -> bool {
         self.peer
             .as_ref()
-            .is_some_and(|peer| self.confirm_value(counter, peer, &self.own)[..] == *value)
+            .is_some_and(|peer| constant_eq(&self.confirm_value(counter, peer, &self.own), value))
     }
 }
 

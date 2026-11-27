@@ -60,19 +60,34 @@ pub fn to_bytes(n: &Limbs) -> [u8; 32] {
     out
 }
 
+/// Whether `a < b`: the borrow out of `a - b`, every limb looked at
+/// whatever the numbers.
 pub const fn less(a: &Limbs, b: &Limbs) -> bool {
-    let mut i = 8;
-    while i > 0 {
-        i -= 1;
-        if a[i] != b[i] {
-            return a[i] < b[i];
-        }
-    }
-    false
+    // The whole difference kept, or the optimiser makes the borrow a
+    // comparison that stops at the first limb that differs.
+    core::hint::black_box(sub_raw(a, b)).1
 }
 
+/// Whether `a` is zero, every limb looked at.
 pub fn is_zero(a: &Limbs) -> bool {
-    a.iter().all(|l| *l == 0)
+    a.iter().fold(0, |acc, l| acc | l) == 0
+}
+
+/// `a` where `mask` is all ones, `b` where it is zero.
+const fn pick(a: &Limbs, b: &Limbs, mask: u32) -> Limbs {
+    let mut out = [0u32; 8];
+    let mut i = 0;
+    while i < 8 {
+        out[i] = (a[i] & mask) | (b[i] & !mask);
+        i += 1;
+    }
+    out
+}
+
+/// All ones for true, zero for false. Hidden from the optimiser, which
+/// otherwise sees through the mask and turns `pick` back into a branch.
+const fn mask(b: bool) -> u32 {
+    core::hint::black_box((b as u32).wrapping_neg())
 }
 
 const fn add_raw(a: &Limbs, b: &Limbs) -> (Limbs, bool) {
@@ -101,27 +116,29 @@ const fn sub_raw(a: &Limbs, b: &Limbs) -> (Limbs, bool) {
     (out, borrow != 0)
 }
 
-/// `a + b mod m`, for `a` and `b` below `m`.
+/// `a + b mod m`, for `a` and `b` below `m`. The subtraction of `m` is
+/// always made, and kept or not by a mask: no branch on the numbers.
+#[inline(never)]
 pub const fn add_mod(a: &Limbs, b: &Limbs, m: &Limbs) -> Limbs {
     let (sum, carry) = add_raw(a, b);
-    if carry || !less(&sum, m) {
-        sub_raw(&sum, m).0
-    } else {
-        sum
-    }
+    let (diff, borrow) = sub_raw(&sum, m);
+    pick(&diff, &sum, mask(carry | !borrow))
 }
 
-/// `a - b mod m`, for `a` and `b` below `m`.
+/// `a - b mod m`, for `a` and `b` below `m`: `m` added under a mask.
+#[inline(never)]
 pub fn sub_mod(a: &Limbs, b: &Limbs, m: &Limbs) -> Limbs {
     let (diff, borrow) = sub_raw(a, b);
-    if borrow { add_raw(&diff, m).0 } else { diff }
+    let back = pick(m, &[0; 8], mask(borrow));
+    add_raw(&diff, &back).0
 }
 
 /// Bring any 256-bit number below `m` (for the two moduli used here,
-/// both above 2^255, one subtraction is enough).
+/// both above 2^255, one subtraction is enough), without a branch.
 #[inline(never)]
 pub fn reduce(a: &Limbs, m: &Limbs) -> Limbs {
-    if less(a, m) { *a } else { sub_raw(a, m).0 }
+    let (diff, borrow) = sub_raw(a, m);
+    pick(a, &diff, mask(borrow))
 }
 
 /// `2^(256 * times) mod p`, by doubling.
@@ -161,7 +178,13 @@ const R2: Limbs = power_of_r(2);
 /// iterators. The reduction needs no multiplication, because the prime
 /// is `2^256 - 2^224 + 2^192 + 2^96 - 1`: the quotient digit is the low
 /// limb itself, and adding it times the prime is five additions.
-/// The time taken does not depend on the operands.
+/// The instructions run do not depend on the operands. One thing does,
+/// below the code: the ARM7TDMI's multiplier stops early when the top
+/// bytes of one of its operands (the register the compiler puts in
+/// `Rs`) are zeros, a cycle saved per byte, so a product's time varies
+/// by a few cycles with the limbs. Nothing in the instruction set avoids
+/// it; it is a residual leak, small against the noise of a radio
+/// exchange, and is accepted.
 #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
 #[inline(never)]
 fn mont_mul(a: &Limbs, b: &Limbs) -> Limbs {
@@ -281,6 +304,18 @@ impl Fe {
         }
     }
 
+    /// All ones if both are the same element, zero otherwise, from
+    /// every limb (the derived `==` may stop at the first difference).
+    pub fn equal_mask(&self, other: &Fe) -> u32 {
+        let mut d = 0;
+        let mut i = 0;
+        while i < 8 {
+            d |= self.0[i] ^ other.0[i];
+            i += 1;
+        }
+        mask(d == 0)
+    }
+
     pub fn is_odd(&self) -> bool {
         self.value()[0] & 1 != 0
     }
@@ -337,11 +372,19 @@ impl Fe {
     /// A square root, if there is one. p is 3 mod 4: `a^((p+1)/4)`.
     #[inline(never)]
     pub fn sqrt(&self) -> Option<Fe> {
+        let (root, found) = self.sqrt_masked();
+        (found != 0).then_some(root)
+    }
+
+    /// `a^((p+1)/4)`, and all ones if it is a square root of `a`, zero
+    /// otherwise: for callers that must not branch on the answer.
+    #[inline(never)]
+    pub fn sqrt_masked(&self) -> (Fe, u32) {
         // p + 1 still fits in 256 bits.
         let (p1, _) = add_raw(&P, &[1, 0, 0, 0, 0, 0, 0, 0]);
         let e = shift_right(&shift_right(&p1));
         let root = self.pow(&e);
-        (root.square() == *self).then_some(root)
+        (root, root.square().equal_mask(self))
     }
 }
 
@@ -385,7 +428,7 @@ impl Point {
     /// A point from affine coordinates; `None` if it is not on the curve.
     #[inline(never)]
     pub fn from_affine(x: &Fe, y: &Fe) -> Option<Point> {
-        (y.square() == curve_rhs(x)).then(|| Point {
+        (y.square().equal_mask(&curve_rhs(x)) != 0).then(|| Point {
             x: *x,
             y: *y,
             z: Fe::one(),
@@ -444,7 +487,10 @@ impl Point {
     /// The sum of two points, by the complete formulas of Renes,
     /// Costello and Batina (2016) for curves with a = -3: one sequence
     /// of operations whatever the points, be they equal, opposite or
-    /// infinity. No branch, so nothing to time.
+    /// infinity. No branch here nor in the field operations under it
+    /// (additions and subtractions correct by masks, the product
+    /// reduces by one), so the time does not depend on the points; but
+    /// see `mont_mul` for what the ARM7's multiplier does.
     pub fn add(&self, o: &Point) -> Point {
         let b = Fe(B_MONT);
         let triple = |v: &Fe| v.add(v).add(v);

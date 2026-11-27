@@ -116,6 +116,9 @@ pub fn unprotect(tk: &[u8; 16], frame: &mut [u8]) -> Option<(usize, u64)> {
     Some((len - OVERHEAD, pn))
 }
 
+/// Whether two codes are the same, in a time that does not depend on
+/// where they differ. Out of line: one copy, the one tested.
+#[inline(never)]
 pub fn constant_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
