@@ -203,10 +203,12 @@ fn skipping_the_password_exchange_does_not_get_in() {
         channel: 6,
     });
     w.run(10);
+    // As hostapd's `check_assoc_ies`: open authentication with SAE's key
+    // management needs a cached exchange, status 53 (invalid PMKID).
     assert!(
         w.ap.events.contains(&ApEvent::AssocRejected {
             sta: STA,
-            status: 43
+            status: 53
         }),
         "{:?}",
         w.ap.events

@@ -328,6 +328,39 @@ mod wpa3 {
         assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
     }
 
+    /// Thrown out, the rabbit comes back with the key of its first
+    /// exchange (PMKSA caching): no password exchange the second time.
+    #[test]
+    fn comes_back_without_a_second_password_exchange() {
+        let Some(mut m) = rabbit() else { return };
+        let first = until(&mut m, 30_000, authorized);
+        m.run_until_ms(first + 1000);
+        m.air[0].kick(&mut m.radio.borrow_mut(), DEFAULT_MAC, 3);
+        let kicked = m.soc.millis();
+        let back = until(&mut m, kicked + 30_000, |m| {
+            m.air[0]
+                .events
+                .iter()
+                .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
+                .count()
+                == 2
+        });
+        let events = &m.air[0].events;
+        assert!(
+            events.contains(&ApEvent::PmksaCacheUsed { sta: DEFAULT_MAC }),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ApEvent::SaeComplete { .. }))
+                .count(),
+            1
+        );
+        eprintln!("back {} ms after being thrown out", back - kicked);
+        assert_eq!(m.events, []);
+    }
+
     #[test]
     fn after_a_power_cut_it_waits_out_the_old_association() {
         let Some(mut m) = rabbit() else { return };

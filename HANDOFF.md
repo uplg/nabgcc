@@ -38,7 +38,7 @@ passes in the emulator everything the C firmware passes there.
 | 3. 802.11 station and access point: WEP, WPA, WPA2, WPA3 | done, in `lapin/core/src/wifi.rs` |
 | 4. Metal virtual machine, to run the boot bytecode and garenne as they are | done, `lapin/metal`, checked word for word against the C machine (`lapin/cref`) |
 | 5. Resident loader, so a failed update no longer kills the rabbit | not started: needs a decision, see below |
-| 6. Size, soak, then a real rabbit | size 107.5 KB, 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
+| 6. Size, soak, then a real rabbit | size 108.6 KB, 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
 
 Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
@@ -46,8 +46,8 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 107.5
-KB, the boot bytecode's 27.6 KB included: 16.5 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 108.6
+KB, the boot bytecode's 27.6 KB included: 15.4 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -83,6 +83,7 @@ Query is waited out (status 30) and the rabbit is back in 9 s.
 fixes them, and each test marked "Known defect" checks the fix when it
 runs lapin:
 mixed-mode handshake names the wrong group cipher (`eapol.c:496`);
+a pairwise rekey on a running link is ignored (`eapol.c:383`);
 104-bit WEP keys are cut to 40 bits (`ieee80211.c:1932`); the first
 CCMP frame is numbered 0 and dropped by Linux access points
 (`eapol.c:545`). Probe requests without a network name element is the

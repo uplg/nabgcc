@@ -261,6 +261,14 @@ pub struct Station {
     /// computing it takes an eighth of a second.
     pt: Option<([u8; 32], Point)>,
     retry_assoc_at: Option<u32>,
+    /// A new pairwise key, between messages 1 and 3 of a handshake on a
+    /// running link: the current key stays in use until message 4.
+    next_ptk: Option<[u8; 64]>,
+    /// The key of the last password exchange, for the network it was
+    /// made with (BSSID, PMK, PMKID): joining it again needs no SAE.
+    pmksa: Option<(Mac, [u8; 32], [u8; 16])>,
+    /// The current attempt uses that cached key.
+    cached: bool,
     peers: [Peer; MAX_STATIONS],
     offers: [Offer; OFFERS],
     next_offer: usize,
@@ -417,6 +425,9 @@ impl Station {
             sae: None,
             pt: None,
             retry_assoc_at: None,
+            next_ptk: None,
+            pmksa: None,
+            cached: false,
             peers: [Peer {
                 state: State::Idle,
                 timer: 0,
@@ -581,7 +592,16 @@ impl Station {
                     0xAC, 8, 0xC0, 0x00,
                 ];
                 out[..22].copy_from_slice(&e);
-                22
+                match self.pmksa.filter(|_| self.cached) {
+                    // The cached exchange, named by its PMKID.
+                    Some((_, _, pmkid)) => {
+                        out[1] = 38;
+                        out[22..24].copy_from_slice(&[1, 0]);
+                        out[24..40].copy_from_slice(&pmkid);
+                        40
+                    }
+                    None => 22,
+                }
             }
             _ => 0,
         }
@@ -602,7 +622,7 @@ impl Station {
         self.tx[at..at + 10].copy_from_slice(&RATES);
         self.tx[at + 10..at + 16].copy_from_slice(&XRATES);
         at += 16;
-        let mut e = [0u8; 24];
+        let mut e = [0u8; 40];
         let n = self.own_element(&mut e);
         self.tx[at..at + n].copy_from_slice(&e[..n]);
         at += n;
@@ -948,8 +968,18 @@ impl Station {
         link.set_channel(channel);
         self.state = State::Auth;
         self.timeout = AUTH_TIMEOUT;
+        self.cached = false;
         if let Security::Sae { h2e } = self.security {
-            self.sae_commit(link, h2e);
+            match self.pmksa.filter(|(b, _, _)| b == bssid) {
+                // A key from an earlier exchange with this network: open
+                // authentication, and the PMKID in the association.
+                Some((_, pmk, _)) => {
+                    self.cached = true;
+                    self.pmk = pmk;
+                    self.send_auth(link, &mac.clone(), 0, 1, 0);
+                }
+                None => self.sae_commit(link, h2e),
+            }
         } else {
             let algorithm = self.shared_auth as u16;
             self.send_auth(link, &mac.clone(), algorithm, 1, 0);
@@ -1226,8 +1256,14 @@ impl Station {
                     if self.state != State::Auth || !from_ap {
                         return;
                     }
-                    if let Security::Sae { .. } = self.security {
-                        self.input_sae(link, algorithm, seq, status, frame, len);
+                    if let Security::Sae { h2e } = self.security {
+                        if !self.cached {
+                            self.input_sae(link, algorithm, seq, status, frame, len);
+                        } else if algorithm == 0 && seq == 2 && status == 0 {
+                            self.associate(link);
+                        } else {
+                            self.forget_cached(link, h2e);
+                        }
                     } else if !self.shared_auth {
                         if algorithm == 0 && seq == 2 && status == 0 {
                             self.associate(link);
@@ -1271,7 +1307,12 @@ impl Station {
                     return;
                 }
                 if status != 0 {
-                    self.state = State::Idle;
+                    match self.security {
+                        // The access point no longer has the cached key
+                        // (status 53): the whole exchange, then.
+                        Security::Sae { h2e } if self.cached => self.forget_cached(link, h2e),
+                        _ => self.state = State::Idle,
+                    }
                     return;
                 }
                 self.rssi_index = 0;
@@ -1602,8 +1643,22 @@ impl Station {
         }
     }
 
+    /// The keys the handshake under way signs and encrypts with.
+    fn handshake_ptk(&self) -> &[u8; 64] {
+        self.next_ptk.as_ref().unwrap_or(&self.ptk)
+    }
+
+    /// Drop the cached key and run the password exchange after all.
+    fn forget_cached(&mut self, link: &mut dyn Link, h2e: bool) {
+        self.pmksa = None;
+        self.cached = false;
+        self.state = State::Auth;
+        self.timeout = AUTH_TIMEOUT;
+        self.sae_commit(link, h2e);
+    }
+
     fn mic(&self, data: &[u8]) -> [u8; 16] {
-        let kck = &self.ptk[..16];
+        let kck = &self.handshake_ptk()[..16];
         match self.version() {
             0 => {
                 let mut k = [0u8; 16];
@@ -1623,7 +1678,7 @@ impl Station {
     /// Build, sign and send an EAPOL-Key frame.
     #[inline(never)]
     fn send_key(&mut self, link: &mut dyn Link, info: u16, nonce: &[u8; 32], data: &[u8]) {
-        let mut e = [0u8; 99 + 24];
+        let mut e = [0u8; 99 + 40];
         let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
         e[0] = 1;
         e[1] = 3;
@@ -1637,7 +1692,7 @@ impl Station {
         let n = 99 + data.len();
         let mic = self.mic(&e[..n]);
         e[81..97].copy_from_slice(&mic);
-        let mut body = [0u8; 8 + 99 + 24];
+        let mut body = [0u8; 8 + 99 + 40];
         body[..8].copy_from_slice(&LLC_EAPOL);
         body[8..8 + n].copy_from_slice(&e[..n]);
         let ap = self.ap;
@@ -1682,14 +1737,16 @@ impl Station {
 
     #[inline(never)]
     fn message_1(&mut self, link: &mut dyn Link, f: &[u8], info: u16) {
-        if self.keys != KeyState::Msg1 && self.keys != KeyState::Msg3 {
+        // On a running link: a new pairwise key (the access point's
+        // periodic rekey), used once the handshake is through.
+        let rekey =
+            matches!(self.keys, KeyState::Group | KeyState::Run) && self.state == State::Run;
+        if !rekey && self.keys != KeyState::Msg1 && self.keys != KeyState::Msg3 {
             return;
         }
-        if self.is_wpa3() && self.keys == KeyState::Msg3 && self.soft.is_some() {
-            // A new handshake on a protected link would come encrypted.
-            return;
+        if !rekey {
+            self.keys = KeyState::Msg1;
         }
-        self.keys = KeyState::Msg1;
         self.replay.copy_from_slice(&f[9..17]);
         self.replay_active = true;
         if let Security::Psk {
@@ -1707,50 +1764,68 @@ impl Station {
         self.anonce.copy_from_slice(&f[17..49]);
         let mut snonce = [0u8; 32];
         link.random(&mut snonce);
-        let own = link.mac();
-        let (lo, hi) = if own < self.ap {
-            (own, self.ap)
+        let ptk = self.derive_ptk(&link.mac(), &snonce);
+        if rekey {
+            self.next_ptk = Some(ptk);
         } else {
-            (self.ap, own)
+            self.ptk = ptk;
+        }
+        let mut e = [0u8; 40];
+        let n = self.own_element(&mut e);
+        self.send_key(link, 0x0008 | 0x0100, &snonce, &e[..n]);
+        if rekey {
+            return;
+        }
+        // The pairwise key goes in now, as the C driver did: message 4
+        // still leaves in clear (handshake state), what follows does not.
+        self.install_pairwise(link, false);
+        self.keys = KeyState::Msg3;
+    }
+
+    /// The pairwise keys from the PMK and both nonces (PRF-512, or the
+    /// SHA-256 KDF after SAE).
+    fn derive_ptk(&self, own: &Mac, snonce: &[u8; 32]) -> [u8; 64] {
+        let (lo, hi) = if *own < self.ap {
+            (*own, self.ap)
+        } else {
+            (self.ap, *own)
         };
-        let (n_lo, n_hi) = if snonce < self.anonce {
-            (snonce, self.anonce)
+        let (n_lo, n_hi) = if *snonce < self.anonce {
+            (*snonce, self.anonce)
         } else {
-            (self.anonce, snonce)
+            (self.anonce, *snonce)
         };
         let mut seed = [0u8; 76];
         seed[..6].copy_from_slice(&lo);
         seed[6..12].copy_from_slice(&hi);
         seed[12..44].copy_from_slice(&n_lo);
         seed[44..].copy_from_slice(&n_hi);
+        let mut ptk = [0u8; 64];
         if self.is_wpa3() {
-            sha256::kdf(
-                &self.pmk,
-                b"Pairwise key expansion",
-                &seed,
-                &mut self.ptk[..48],
-            );
+            sha256::kdf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk[..48]);
         } else {
-            prf(&self.pmk, b"Pairwise key expansion", &seed, &mut self.ptk);
+            prf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk);
         }
-        let mut e = [0u8; 24];
-        let n = self.own_element(&mut e);
-        self.send_key(link, 0x0008 | 0x0100, &snonce, &e[..n]);
-        // The pairwise key goes in now, as the C driver did: message 4
-        // still leaves in clear (handshake state), what follows does not.
+        ptk
+    }
+
+    /// Put `self.ptk`'s temporal key to use: in the stick, or (WPA3) in
+    /// the firmware's own keys, keeping the group keys on a rekey.
+    fn install_pairwise(&mut self, link: &mut dyn Link, keep_group: bool) {
         let none = [0u8; 8];
         let mut tk = [0u8; 16];
         tk.copy_from_slice(&self.ptk[32..48]);
         match self.security {
             Security::Sae { .. } => {
+                let old = self.soft.take().filter(|_| keep_group);
                 self.soft = Some(SoftKeys {
                     tk,
-                    gtk: None,
-                    igtk: None,
+                    gtk: old.as_ref().and_then(|o| o.gtk),
+                    igtk: old.as_ref().and_then(|o| o.igtk),
                     rx_pn: 0,
-                    group_rx_pn: 0,
+                    group_rx_pn: old.as_ref().map_or(0, |o| o.group_rx_pn),
                     mgmt_rx_pn: 0,
-                    igtk_ipn: 0,
+                    igtk_ipn: old.as_ref().map_or(0, |o| o.igtk_ipn),
                 });
             }
             Security::Psk {
@@ -1768,7 +1843,6 @@ impl Station {
         // The first frame is numbered 1 (the C driver started at 0, and
         // access points dropped it as a replay).
         self.tx_pn = 1;
-        self.keys = KeyState::Msg3;
     }
 
     fn check_mic(&self, f: &mut [u8]) -> bool {
@@ -1786,7 +1860,7 @@ impl Station {
         let n = be16(f, 97) as usize;
         let data = f.get(99..99 + n)?;
         let mut kek = [0u8; 16];
-        kek.copy_from_slice(&self.ptk[16..32]);
+        kek.copy_from_slice(&self.handshake_ptk()[16..32]);
         if self.version() == 1 {
             // RC4 under the key IV and the KEK.
             if n > out.len() {
@@ -1808,6 +1882,9 @@ impl Station {
 
     #[inline(never)]
     fn message_3(&mut self, link: &mut dyn Link, f: &mut [u8]) {
+        if self.next_ptk.is_some() && matches!(self.keys, KeyState::Group | KeyState::Run) {
+            return self.rekey_message_3(link, f);
+        }
         if self.keys != KeyState::Msg3 && self.keys != KeyState::Group {
             return;
         }
@@ -1834,6 +1911,33 @@ impl Station {
                 self.keys = KeyState::Run;
             }
         }
+    }
+
+    /// Message 3 of a rekey: message 4 leaves under the current key,
+    /// then the new one takes over.
+    fn rekey_message_3(&mut self, link: &mut dyn Link, f: &mut [u8]) {
+        if f[17..49] != self.anonce || !self.check_mic(f) {
+            return;
+        }
+        self.replay.copy_from_slice(&f[9..17]);
+        let secure = if matches!(self.security, Security::Psk { wpa2: false, .. }) {
+            0
+        } else {
+            0x200
+        };
+        self.send_key(link, 0x0008 | 0x0100 | secure, &[0; 32], &[]);
+        let mut plain = [0u8; 160];
+        let groups = self.key_data(f, &mut plain);
+        if let Some(ptk) = self.next_ptk.take() {
+            self.ptk = ptk;
+        }
+        self.install_pairwise(link, true);
+        if let Some(n) =
+            groups.filter(|_| !matches!(self.security, Security::Psk { wpa2: false, .. }))
+        {
+            self.install_group_keys(link, &plain[..n]);
+        }
+        self.timeout = RUN_TIMEOUT;
     }
 
     /// Install the group key (and, on WPA3, the integrity group key)
@@ -2083,6 +2187,7 @@ impl Station {
                     return;
                 }
                 self.pmk = run.session.pmk;
+                self.pmksa = Some((self.bssid, run.session.pmk, run.session.pmkid));
                 self.sae = None;
                 self.associate(link);
             }

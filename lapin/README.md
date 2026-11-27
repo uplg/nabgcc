@@ -26,7 +26,7 @@ point, on the host.
 board up, starts the USB host and the Wi-Fi stick, then runs the boot
 bytecode (the one the r3 release carries, `fw/src/boot.bc`) on the
 Metal machine, whose calls to the board (`fw/src/host.rs`) go to this
-firmware's drivers and its 802.11 station. 107.5 KB of the 124 KB, the
+firmware's drivers and its 802.11 station. 108.6 KB of the 124 KB, the
 boot bytecode's 27.6 KB included.
 
 It passes the emulator's acceptance tests, the ones written for the C
@@ -44,7 +44,13 @@ the firmware reads the passphrase where the setup page saved it and
 runs SAE (hash to element when offered), with protected management
 frames, CCMP done in software (the stick may hold no key on such a
 link), BIP on broadcast deauthentications, SA Query answered, and the
-wait an access point asks for after a restart.
+wait an access point asks for after a restart. Coming back to the same
+network it reuses the key of the last exchange (PMKSA caching), and
+falls back to the full exchange if the access point forgot it.
+
+On every kind of network it also takes a new pairwise key on a running
+link (the access point's periodic rekey), which the C firmware ignored
+until the access point gave up on it.
 
 What differs from the C on purpose: a new image is written by a RAM
 routine that feeds the watchdog after every word (the C counted on the

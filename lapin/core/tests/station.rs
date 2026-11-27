@@ -273,6 +273,8 @@ fn trouble(w: &World) -> Vec<&ApEvent> {
                     | ApEvent::HandshakeComplete { .. }
                     | ApEvent::GroupKeyInstalled { .. }
                     | ApEvent::SaeComplete { .. }
+                    | ApEvent::PairwiseKeyRenewed { .. }
+                    | ApEvent::PmksaCacheUsed { .. }
             )
         })
         .collect()
@@ -493,4 +495,96 @@ fn access_point_mode_lets_a_station_in() {
     assert_eq!(up, vec![vec![0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 1, 2, 3]]);
     let sent: Vec<u8> = w.radio.tx.iter().map(|f| f.data[0]).collect();
     assert_eq!(sent, vec![0xB0, 0x10]);
+}
+
+fn rekeys_and_talks(w: &mut World, sta: &mut Station) {
+    w.aps[0].rekey_pairwise(&mut w.radio, STA);
+    run(w, sta, 200, &mut Vec::new());
+    assert!(
+        w.ap()
+            .events
+            .contains(&ApEvent::PairwiseKeyRenewed { sta: STA }),
+        "{:?}",
+        w.ap().events
+    );
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED);
+    w.aps[0].uplink.clear();
+    talks(w, sta);
+    assert_eq!(trouble(w), Vec::<&ApEvent>::new());
+}
+
+#[test]
+fn wpa2_takes_a_new_pairwise_key_on_the_run() {
+    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Off);
+    let mut sta = Station::new();
+    join(&mut w, &mut sta, &pmk(), &[]);
+    rekeys_and_talks(&mut w, &mut sta);
+}
+
+#[test]
+fn wpa_tkip_takes_a_new_pairwise_key_on_the_run() {
+    let mut w = World::new(Security::wpa(PASSPHRASE), Wpa3::Off);
+    let mut sta = Station::new();
+    join(&mut w, &mut sta, &pmk(), &[]);
+    rekeys_and_talks(&mut w, &mut sta);
+}
+
+#[test]
+fn wpa3_takes_a_new_pairwise_key_on_the_run() {
+    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
+    rekeys_and_talks(&mut w, &mut sta);
+}
+
+#[test]
+fn wpa3_comes_back_without_a_new_password_exchange() {
+    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
+    w.aps[0].kick(&mut w.radio, STA, 3);
+    run(&mut w, &mut sta, 50, &mut Vec::new());
+    assert_eq!(sta.net_state(), wifi::S_IDLE);
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    let events = &w.ap().events;
+    assert!(
+        events.contains(&ApEvent::PmksaCacheUsed { sta: STA }),
+        "{events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ApEvent::SaeComplete { .. }))
+            .count(),
+        1
+    );
+    w.aps[0].uplink.clear();
+    talks(&mut w, &mut sta);
+}
+
+#[test]
+fn wpa3_runs_the_exchange_again_when_the_access_point_forgot() {
+    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
+    w.aps[0].kick(&mut w.radio, STA, 3);
+    run(&mut w, &mut sta, 50, &mut Vec::new());
+    // The access point restarts: its cache is gone.
+    let mut fresh = AccessPoint::new("Terrier", BSSID, 6, Security::wpa2(PASSPHRASE));
+    fresh.wpa3 = Wpa3::Only;
+    // (It reads what was sent from where it last stopped: a new one
+    // starts on an empty air.)
+    w.radio.tx.clear();
+    w.aps[0] = fresh;
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    let events = &w.ap().events;
+    assert!(
+        events.contains(&ApEvent::AssocRejected {
+            sta: STA,
+            status: 53
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ApEvent::SaeComplete { .. }))
+    );
+    talks(&mut w, &mut sta);
 }

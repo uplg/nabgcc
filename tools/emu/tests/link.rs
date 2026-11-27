@@ -176,3 +176,68 @@ fn comes_back_after_the_access_point_restarts() {
         m.run_until_ms(m.soc.millis() + 50);
     }
 }
+
+/// An ARP request sent to the rabbit alone: whether it answered, both
+/// directions then going under the pairwise key.
+fn hears_unicast(m: &mut Machine) -> bool {
+    let lan = m.lan.take();
+    m.air[0].uplink.clear();
+    let mut request = arp_request();
+    request[..6].copy_from_slice(&DEFAULT_MAC);
+    m.air[0].send(&mut m.radio.borrow_mut(), &request);
+    m.run_until_ms(m.soc.millis() + 500);
+    let answered = m.air[0]
+        .uplink
+        .iter()
+        .any(|f| f[12..14] == [0x08, 0x06] && f[20..22] == [0, 2]);
+    m.lan = lan;
+    answered
+}
+
+/// The access point renews the pairwise key on a running link
+/// (hostapd's `wpa_ptk_rekey`): message 1 under the current key, the
+/// new key from message 4 on.
+fn survives_pairwise_key_renewals(wifi: Wifi, security: Security) {
+    let mut m = connected(wifi, security);
+    assert!(hears_unicast(&mut m));
+    for round in 1..=3 {
+        m.air[0].rekey_pairwise(&mut m.radio.borrow_mut(), DEFAULT_MAC);
+        m.run_until_ms(m.soc.millis() + 1000);
+        let renewed = count(&m, &ApEvent::PairwiseKeyRenewed { sta: DEFAULT_MAC });
+        if !nabemu::testing::is_lapin() {
+            // Known defect of r3: message 1 on a running link is
+            // ignored (`eapol_input_msg1` only takes it during the
+            // handshake), so the access point gives up on the rabbit.
+            assert_eq!(renewed, 0, "{:?}", m.air[0].events);
+            return;
+        }
+        assert_eq!(renewed, round, "renewal {round}: {:?}", m.air[0].events);
+        assert!(hears_unicast(&mut m), "deaf after renewal {round}");
+        assert!(
+            hears_broadcasts(&mut m),
+            "deaf to broadcasts after renewal {round}"
+        );
+    }
+    assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
+    assert!(m.air[0].is_authorized(DEFAULT_MAC));
+}
+
+#[test]
+fn survives_wpa2_pairwise_key_renewals() {
+    survives_pairwise_key_renewals(
+        Wifi::Wpa2 {
+            passphrase: PASS.into(),
+        },
+        Security::wpa2(PASS),
+    );
+}
+
+#[test]
+fn survives_wpa_tkip_pairwise_key_renewals() {
+    survives_pairwise_key_renewals(
+        Wifi::Wpa {
+            passphrase: PASS.into(),
+        },
+        Security::wpa(PASS),
+    );
+}

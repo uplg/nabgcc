@@ -118,6 +118,15 @@ pub enum ApEvent {
     GroupKeyInstalled {
         sta: Mac,
     },
+    /// A new pairwise key is in use, after a handshake on a running link.
+    PairwiseKeyRenewed {
+        sta: Mac,
+    },
+    /// The station came back with the key of an earlier password
+    /// exchange (PMKSA caching): no SAE this time.
+    PmksaCacheUsed {
+        sta: Mac,
+    },
     /// A protected frame from the station failed to decrypt.
     DecryptFailure {
         sta: Mac,
@@ -238,6 +247,14 @@ struct Station {
     sa_query_start: u64,
     sa_query_next: u64,
     sa_query_timed_out: bool,
+    /// A handshake on a running link: the new keys, once message 2
+    /// came, and whether message 4 is awaited.
+    rekey: Option<Rekey>,
+}
+
+#[derive(Clone, Copy)]
+struct Rekey {
+    next_ptk: Option<[u8; 64]>,
 }
 
 pub struct AccessPoint {
@@ -284,6 +301,9 @@ pub struct AccessPoint {
     gtk_index: u8,
     group_pn: u64,
     stations: BTreeMap<Mac, Station>,
+    /// Keys of past password exchanges, by station: what PMKSA caching
+    /// lets a station associate with again, without SAE.
+    pmksa: BTreeMap<Mac, ([u8; 32], [u8; 16])>,
     rng: u64,
     seq: u16,
     heard: usize,
@@ -412,6 +432,7 @@ impl AccessPoint {
             gtk_index: 1,
             group_pn: 0,
             stations: BTreeMap::new(),
+            pmksa: BTreeMap::new(),
             rng: u64::from_le_bytes([
                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], 0x5A, 0xA5,
             ]) | 1,
@@ -838,6 +859,8 @@ impl AccessPoint {
                 let mut reply = 1u16.to_le_bytes().to_vec();
                 reply.extend_from_slice(&session.confirm(1));
                 s.sae_key = Some((session.pmk, session.pmkid));
+                self.pmksa.insert(sta, (session.pmk, session.pmkid));
+                let s = self.stations.get_mut(&sta).unwrap();
                 let hash_to_element = s.sae_h2e;
                 s.sae = None;
                 self.reply_auth(radio, sta, 3, 2, 0, &reply);
@@ -1155,6 +1178,7 @@ impl AccessPoint {
             sa_query_start: 0,
             sa_query_next: 0,
             sa_query_timed_out: false,
+            rekey: None,
         }
     }
 
@@ -1245,13 +1269,38 @@ impl AccessPoint {
         } else if element(ies, 0) != Some(self.ssid.as_bytes()) {
             1
         } else if let Some((wpa2, pairwise, group)) = psk {
-            let did_sae = self.stations[&sta].sae_key.is_some();
-            match self.judge_element(wanted, wpa2, pairwise, group, did_sae) {
-                Ok(found) => {
-                    chosen = found;
-                    0
+            let mut did_sae = self.stations[&sta].sae_key.is_some();
+            // Open authentication then SAE's key management: only with the
+            // PMKID of a cached exchange (status 53 otherwise, as hostapd).
+            let asks_sae =
+                wpa2 && wanted.is_some_and(|e| e.get(16..20) == Some(&[0x00, 0x0F, 0xAC, 8]));
+            let mut cache_miss = false;
+            if asks_sae && !did_sae && self.wpa3 != Wpa3::Off {
+                let pmkid = wanted.and_then(|e| {
+                    let body = &e[2..];
+                    (body.get(20..22) == Some(&[1, 0]))
+                        .then(|| body.get(22..38))
+                        .flatten()
+                });
+                match (self.pmksa.get(&sta), pmkid) {
+                    (Some(&(pmk, id)), Some(given)) if given == id => {
+                        self.stations.get_mut(&sta).unwrap().sae_key = Some((pmk, id));
+                        self.events.push(ApEvent::PmksaCacheUsed { sta });
+                        did_sae = true;
+                    }
+                    _ => cache_miss = true,
                 }
-                Err(status) => status,
+            }
+            if cache_miss {
+                53
+            } else {
+                match self.judge_element(wanted, wpa2, pairwise, group, did_sae) {
+                    Ok(found) => {
+                        chosen = found;
+                        0
+                    }
+                    Err(status) => status,
+                }
             }
         } else {
             0
@@ -1547,7 +1596,11 @@ impl AccessPoint {
         eapol.extend_from_slice(&(k.len() as u16).to_be_bytes());
         eapol.extend_from_slice(&k);
         if info & KEY_INFO_MIC != 0 {
-            let mic = Self::eapol_mic(version, &station.ptk[..16], &eapol);
+            let ptk = station
+                .rekey
+                .and_then(|r| r.next_ptk)
+                .unwrap_or(station.ptk);
+            let mic = Self::eapol_mic(version, &ptk[..16], &eapol);
             eapol[81..97].copy_from_slice(&mic);
         }
         station.last_eapol = eapol.clone();
@@ -1576,7 +1629,9 @@ impl AccessPoint {
 
     /// Encrypt EAPOL key data with the key encryption key.
     fn wrap_key_data(&mut self, sta: Mac, mut data: Vec<u8>) -> (Vec<u8>, [u8; 16]) {
-        let kek: [u8; 16] = self.stations[&sta].ptk[16..32].try_into().unwrap();
+        let s = &self.stations[&sta];
+        let ptk = s.rekey.and_then(|r| r.next_ptk).unwrap_or(s.ptk);
+        let kek: [u8; 16] = ptk[16..32].try_into().unwrap();
         if self.key_version(sta) != 1 {
             if !data.len().is_multiple_of(8) || data.len() < 16 {
                 data.push(0xDD);
@@ -1738,6 +1793,113 @@ impl AccessPoint {
         }
     }
 
+    /// Message 3: the access point's element and the group keys, under
+    /// the handshake's key encryption key.
+    fn send_message_3(
+        &mut self,
+        radio: &mut Radio,
+        sta: Mac,
+        wpa2: bool,
+        pairwise: Cipher,
+        group: Cipher,
+    ) {
+        let anonce = self.stations[&sta].anonce;
+        let mut info = KEY_INFO_PAIRWISE | KEY_INFO_INSTALL | KEY_INFO_ACK | KEY_INFO_MIC;
+        let (data, iv) = if wpa2 {
+            info |= KEY_INFO_SECURE | KEY_INFO_ENCRYPTED;
+            let mut plain = self.own_element();
+            plain.extend_from_slice(&self.own_extension());
+            plain.extend_from_slice(&self.group_key_data(group, true));
+            if self.stations[&sta].pmf {
+                // The integrity group key, for protected broadcasts.
+                plain.extend_from_slice(&self.igtk_kde());
+            }
+            self.wrap_key_data(sta, plain)
+        } else {
+            (self.own_element(), [0; 16])
+        };
+        let rsc = if wpa2 { self.group_pn } else { 0 };
+        self.send_key_frame(
+            radio,
+            sta,
+            info,
+            Self::key_len(pairwise),
+            &anonce,
+            &iv,
+            rsc,
+            &data,
+        );
+    }
+
+    /// The pairwise handshake again on a running link (hostapd's
+    /// `wpa_ptk_rekey`): message 1 goes out under the current key, the
+    /// new one is used from message 4 on.
+    pub fn rekey_pairwise(&mut self, radio: &mut Radio, sta: Mac) {
+        let Some((_, pairwise, _)) = self.psk_params() else {
+            return;
+        };
+        let Some(s) = self.stations.get_mut(&sta) else {
+            return;
+        };
+        if s.phase != Phase::Authorized || !s.keys_installed {
+            return;
+        }
+        s.rekey = Some(Rekey { next_ptk: None });
+        let anonce = self.random();
+        let s = self.stations.get_mut(&sta).unwrap();
+        s.anonce = anonce;
+        let mut data = Vec::new();
+        if let Some((_, pmkid)) = s.sae_key.filter(|_| s.akm == 8) {
+            data.extend_from_slice(&[0xDD, 20, 0x00, 0x0F, 0xAC, 0x04]);
+            data.extend_from_slice(&pmkid);
+        }
+        self.send_key_frame(
+            radio,
+            sta,
+            KEY_INFO_PAIRWISE | KEY_INFO_ACK,
+            Self::key_len(pairwise),
+            &anonce,
+            &[0; 16],
+            0,
+            &data,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_rekey(
+        &mut self,
+        radio: &mut Radio,
+        sta: Mac,
+        rekey: Rekey,
+        ptk: [u8; 64],
+        data: &[u8],
+        wpa2: bool,
+        pairwise: Cipher,
+        group: Cipher,
+    ) {
+        if rekey.next_ptk.is_none() {
+            // Message 2 of the rekey.
+            if security_element(data, wpa2) != Some(&self.stations[&sta].element[..]) {
+                self.reject(sta, "element differs from the association request");
+                return self.deauth(radio, sta, 17);
+            }
+            self.stations.get_mut(&sta).unwrap().rekey = Some(Rekey {
+                next_ptk: Some(ptk),
+            });
+            self.send_message_3(radio, sta, wpa2, pairwise, group);
+        } else {
+            // Message 4: the new key takes over, packet numbers start again.
+            let s = self.stations.get_mut(&sta).unwrap();
+            s.ptk = ptk;
+            s.rekey = None;
+            s.tx_pn = 0;
+            s.rx_pn = 0;
+            s.rx_started = false;
+            s.retry_at = 0;
+            self.events.push(ApEvent::PairwiseKeyRenewed { sta });
+        }
+    }
+
     fn reject(&mut self, sta: Mac, why: &'static str) {
         self.events.push(ApEvent::EapolRejected { sta, why });
     }
@@ -1775,8 +1937,11 @@ impl AccessPoint {
         }
 
         // Message 2 is the one that lets us derive the keys.
-        let mut ptk = station.ptk;
-        if phase == Phase::Msg2 {
+        let rekey = station
+            .rekey
+            .filter(|_| phase == Phase::Authorized && info & KEY_INFO_PAIRWISE != 0);
+        let mut ptk = rekey.and_then(|r| r.next_ptk).unwrap_or(station.ptk);
+        if phase == Phase::Msg2 || rekey.is_some_and(|r| r.next_ptk.is_none()) {
             let snonce = &eapol[17..49];
             let (lo_mac, hi_mac) = if self.bssid < sta {
                 (self.bssid, sta)
@@ -1814,6 +1979,9 @@ impl AccessPoint {
             return;
         }
 
+        if let Some(r) = rekey {
+            return self.on_rekey(radio, sta, r, ptk, data, wpa2, pairwise, group);
+        }
         match phase {
             Phase::Msg2 => {
                 if info & KEY_INFO_PAIRWISE == 0 {
@@ -1827,32 +1995,7 @@ impl AccessPoint {
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.ptk = ptk;
                 s.phase = Phase::Msg4;
-                let anonce = s.anonce;
-                let mut info = KEY_INFO_PAIRWISE | KEY_INFO_INSTALL | KEY_INFO_ACK | KEY_INFO_MIC;
-                let (data, iv) = if wpa2 {
-                    info |= KEY_INFO_SECURE | KEY_INFO_ENCRYPTED;
-                    let mut plain = self.own_element();
-                    plain.extend_from_slice(&self.own_extension());
-                    plain.extend_from_slice(&self.group_key_data(group, true));
-                    if self.stations[&sta].pmf {
-                        // The integrity group key, for protected broadcasts.
-                        plain.extend_from_slice(&self.igtk_kde());
-                    }
-                    self.wrap_key_data(sta, plain)
-                } else {
-                    (self.own_element(), [0; 16])
-                };
-                let rsc = if wpa2 { self.group_pn } else { 0 };
-                self.send_key_frame(
-                    radio,
-                    sta,
-                    info,
-                    Self::key_len(pairwise),
-                    &anonce,
-                    &iv,
-                    rsc,
-                    &data,
-                );
+                self.send_message_3(radio, sta, wpa2, pairwise, group);
             }
             Phase::Msg4 => {
                 if info & KEY_INFO_PAIRWISE == 0 {
