@@ -1,27 +1,30 @@
-/* Memory of the ML67Q4051 as the rabbit's board uses it. The last
-   4 KB sector of the flash holds the settings and is not ours. */
+/* Memory of the ML67Q4051 as the rabbit's board uses it, for the
+   application (see src/boot.rs): the first 20 KB of the flash are the
+   rescue core's (rescue.x), the last 4 KB sector holds the settings.
+   The first four words of the internal RAM are shared with the rescue
+   core and left alone. */
 MEMORY
 {
-  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 124K
-  RAM   (rw)  : ORIGIN = 0x10000000, LENGTH = 16K
+  FLASH (rx)  : ORIGIN = 0x08005000, LENGTH = 104K
+  RAM   (rw)  : ORIGIN = 0x10000010, LENGTH = 16K - 16
   /* External static RAM, 1 MB: big buffers, later the bytecode's heap. */
   XRAM  (rw)  : ORIGIN = 0xD0000000, LENGTH = 1024K
 }
 
-ENTRY(_start)
+ENTRY(reset)
 
 /* Stacks grow down from the top of the internal RAM: 1 KB for
    interrupts, then up to 12 KB for the program (measured at most 6.9 KB
    in the emulator, tools/emu/tests/limits.rs). The data must end below
    both, with room to spare. */
-__stack_top = ORIGIN(RAM) + LENGTH(RAM);
+__stack_top = 0x10004000;
 __irq_stack_size = 0x400;
 
 SECTIONS
 {
   .text :
   {
-    KEEP(*(.vectors))
+    KEEP(*(.app_header))
     *(.text .text.*)
     *(.rodata .rodata.*)
     . = ALIGN(4);

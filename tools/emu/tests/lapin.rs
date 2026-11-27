@@ -5,11 +5,10 @@
 use nabemu::Machine;
 
 fn image(name: &str) -> Option<Vec<u8>> {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../lapin/target/thumbv4t-none-eabi/release/"
-    );
-    let image = std::fs::read(format!("{dir}{name}")).ok();
+    // The whole image: the rescue core, then the program as an
+    // application after it (lapin/build.sh).
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../lapin/target/");
+    let image = std::fs::read(format!("{dir}{name}-full.bin")).ok();
     if image.is_none() {
         eprintln!("skipped: lapin is not built");
     }
@@ -30,8 +29,11 @@ fn the_firmware_boots_its_bytecode_and_stays_up() {
     assert!(m.soc.unmodelled.is_empty(), "{:x?}", m.soc.unmodelled);
     assert_eq!(m.soc.cpu_clock_hz(), Some(32_000_000));
     let console = m.console();
+    // The bytecode starts at once, as with the C firmware, and the stick
+    // comes up in the first turn of the main loop.
+    assert!(console.starts_with("lapin 0.1\n"), "{console}");
     assert!(
-        console.starts_with("lapin 0.1\nwifi 00:19:db:00:00:01 radio 02\n"),
+        console.contains("\nwifi 00:19:db:00:00:01 radio 02\n"),
         "{console}"
     );
     assert!(console.contains("wifi state="), "{console}");
@@ -59,10 +61,7 @@ fn a_missing_wifi_stick_is_reported() {
     m.soc.ohci.device = None;
     m.run_until_ms(10_000);
     let console = m.console();
-    assert!(
-        console.starts_with("lapin 0.1\nwifi: no stick\n"),
-        "{console}"
-    );
+    assert!(console.contains("\nwifi: no stick\n"), "{console}");
     assert!(console.contains("started"), "{console}");
     assert_eq!(m.events, []);
 }
@@ -77,7 +76,7 @@ fn a_stick_with_a_radio_it_cannot_tune_is_refused() {
     m.radio.borrow_mut().rf_chip = 3;
     m.run_until_ms(6000);
     assert!(
-        m.console().starts_with("lapin 0.1\nwifi: radio 03\n"),
+        m.console().contains("\nwifi: radio 03\n"),
         "{}",
         m.console()
     );

@@ -63,6 +63,13 @@ fn main() {
     // The linker script lives beside the crate.
     println!("cargo:rustc-link-search={dir}");
     println!("cargo:rerun-if-changed=link.x");
+    println!("cargo:rerun-if-changed=rescue.x");
+    // The rescue core holds the first sectors; every other program is
+    // an application after it (src/boot.rs).
+    println!("cargo:rustc-link-arg-bin=rescue=-Trescue.x");
+    for app in ["lapin", "bench", "selftest"] {
+        println!("cargo:rustc-link-arg-bin={app}=-Tlink.x");
+    }
 
     // The boot bytecode goes in compressed, and must come out the same.
     println!("cargo:rerun-if-changed=src/boot.bc");

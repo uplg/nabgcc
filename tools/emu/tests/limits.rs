@@ -26,7 +26,7 @@ const SYSTEM: usize = 0x1F;
 fn lapin() -> Option<Machine> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../lapin/target/thumbv4t-none-eabi/release/lapin"
+        "/../../lapin/target/lapin-full.bin"
     );
     let image = std::fs::read(path).ok().or_else(|| {
         eprintln!("skipped: lapin is not built");

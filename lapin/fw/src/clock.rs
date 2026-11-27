@@ -13,6 +13,11 @@ reg! {
 pub const HZ: u32 = 32_000_000;
 
 pub fn init() {
+    // Already done (by the rescue core, before handing over): leave
+    // the running clock alone.
+    if CLKCNT.read() == 0x0009_0009 {
+        return;
+    }
     PLL1.write(0x3101_3110);
     PLL2.write(0x0003_0101);
     // System clock and PLL A on, ring oscillator still the source.

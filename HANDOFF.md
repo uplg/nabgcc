@@ -37,8 +37,8 @@ passes in the emulator everything the C firmware passes there.
 | 2. USB host, RT2573 Wi-Fi stick | done: finds the stick, scans the channels |
 | 3. 802.11 station and access point: WEP, WPA, WPA2, WPA3 | done, in `lapin/core/src/wifi.rs` |
 | 4. Metal virtual machine, to run the boot bytecode and garenne as they are | done, `lapin/metal`, checked word for word against the C machine (`lapin/cref`) |
-| 5. Resident loader, so a failed update no longer kills the rabbit | not started: needs a decision, see below |
-| 6. Size, soak, then a real rabbit | size 89.5 KB, 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
+| 5. Resident loader, so a failed update no longer kills the rabbit | done: the rescue core (see below) |
+| 6. Size, soak, then a real rabbit | size 110.8 KB (rescue core included), 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
 
 Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
@@ -46,8 +46,8 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 89.5
-KB, the boot bytecode's 27.6 KB included, packed to 16 KB: 34.5 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 110.8
+KB, the boot bytecode's 27.6 KB included, packed to 16 KB, and the rescue core's 20 KB: 13.2 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -96,15 +96,22 @@ pool (`lapin/core/src/rng.rs`) stirred with the volume wheel's noise,
 the arrival times, strengths and first bytes of received frames, and
 the main loop's rhythm. Unmeasured on a real rabbit.
 
-**Resident loader, the decision to take.** Two full images do not fit
-in the flash, so surviving a power cut during an update means a part
-that is never rewritten and can fetch the firmware again by itself:
-drivers, USB, Wi-Fi with its handshakes, and its own small IP stack
-(DHCP, DNS, TCP, HTTP), with the Metal machine and the bytecode in the
-part that updates. It costs a stable interface between the two parts,
-a URL from which the server serves the image to fetch again (a clapier
-change), and about 10 KB of the 17 left; an update that touches the
-resident part keeps today's risk.
+**The rescue core.** The first 20 KB of the flash (`lapin/fw/src/bin/rescue.rs`,
+`boot.rs`, `rescue.rs`, 18.5 KB) hold the vectors and a core that
+the application's updates never write: the firmware proper is an
+application after it, with a header (length, CRC-32) the core checks
+at every start. An update that brings the same core (`lapin-full.bin`
+from `lapin/build.sh`, as clapier sends it) rewrites the application
+alone. When the application is missing or damaged, or has restarted
+three times without running a minute, the core raises an open network
+"Nabaztag-secours-XXXX" (192.168.0.1, DHCP) with a page to send it
+`lapin-full.bin` from a phone; with an application in place it gives
+it another try after ten idle minutes, or at once from the page.
+Léonard chose this over a download from clapier: no server change.
+`tools/emu/tests/rescue.rs` cuts the power at 17 points of an update:
+the rabbit always comes back. An image that does not bring the same
+core (the C firmware, a new core) still rewrites the whole flash, with
+the old risk.
 
 **WPA3.** The bytecode knows nothing of it: an RSN network offering
 SAE is reported as WPA2, and the station uses SAE when the settings

@@ -8,8 +8,8 @@ use lapin_metal::{Auth, Host, Motor, ScanResult};
 
 use crate::ears::{self, Turn};
 use crate::wifi::link::Radio;
-use crate::wifi::rt2573::Stick;
-use crate::{board, codec, flash, i2c, led, rfid, timer, uart, watchdog};
+use crate::wifi::rt2573::{self, Stick};
+use crate::{board, codec, flash, i2c, led, rfid, timer, uart, usb, watchdog};
 
 /// How many scan results are kept for the bytecode; the C driver put
 /// them all on the machine's stack, every beacon of every network.
@@ -17,6 +17,8 @@ pub const SCAN_RESULTS: usize = 96;
 
 pub struct Board {
     pub stick: Option<&'static mut Stick>,
+    /// Where the stick goes once brought up, until it is.
+    stick_slot: Option<&'static mut core::mem::MaybeUninit<Stick>>,
     pub station: &'static mut Station,
     pub pool: Pool,
     /// The last frame received, and what of it waits for the bytecode.
@@ -40,7 +42,7 @@ pub const SCAN_NONE: ScanResult = ScanResult {
 
 impl Board {
     pub fn new(
-        stick: Option<&'static mut Stick>,
+        stick_slot: &'static mut core::mem::MaybeUninit<Stick>,
         station: &'static mut Station,
         pool: Pool,
         frame: &'static mut [u8; 2400],
@@ -48,7 +50,8 @@ impl Board {
     ) -> Board {
         scan.fill(SCAN_NONE);
         Board {
-            stick,
+            stick: None,
+            stick_slot: Some(stick_slot),
             station,
             pool,
             frame,
@@ -385,6 +388,41 @@ impl Host for Board {
             let n = d.len.min(data.len());
             data[..n].copy_from_slice(&self.frame[d.start..d.start + n]);
             *source = d.source;
+        }
+    }
+
+    fn usb_events(&mut self) {
+        let Some(slot) = self.stick_slot.take() else {
+            return;
+        };
+        let stick = usb::init()
+            .and_then(|()| usb::attach(3000))
+            .and_then(|()| usb::enumerate())
+            .map_err(rt2573::Error::Usb)
+            .and_then(Stick::start);
+        match stick {
+            Ok(stick) => {
+                uart::write(b"wifi ");
+                for (i, byte) in stick.mac.iter().enumerate() {
+                    if i > 0 {
+                        uart::write(b":");
+                    }
+                    uart::hex8(*byte);
+                }
+                uart::write(b" radio ");
+                uart::hex8(stick.radio());
+                uart::write(b"\n");
+                let m = stick.mac;
+                self.pool.mix(u32::from_le_bytes([m[2], m[3], m[4], m[5]]));
+                self.stick = Some(slot.write(stick));
+            }
+            Err(rt2573::Error::Radio(radio)) => {
+                // Not the radio chip this firmware knows how to tune.
+                uart::write(b"wifi: radio ");
+                uart::hex8(radio);
+                uart::write(b"\n");
+            }
+            Err(_) => uart::write(b"wifi: no stick\n"),
         }
     }
 

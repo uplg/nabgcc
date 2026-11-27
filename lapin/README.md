@@ -26,7 +26,7 @@ point, on the host.
 board up, starts the USB host and the Wi-Fi stick, then runs the boot
 bytecode (the one the r3 release carries, `fw/src/boot.bc`) on the
 Metal machine, whose calls to the board (`fw/src/host.rs`) go to this
-firmware's drivers and its 802.11 station. 89.5 KB of the 124 KB, the
+firmware's drivers and its 802.11 station. 110.8 KB of the 124 KB, rescue core included, the
 boot bytecode's 27.6 KB included.
 
 It passes the emulator's acceptance tests, the ones written for the C
@@ -91,7 +91,12 @@ The watchdog bites after 2.09 s: the station feeds it between these
 steps. Joining a WPA3 network takes 1.6 s after the scan on the
 emulated rabbit.
 
+A rescue core holds the first 20 KB of the flash, which updates never
+rewrite: a power cut during an update, or an image that keeps
+crashing, leaves a rabbit that raises "Nabaztag-secours" and takes a
+new image from a phone (`src/boot.rs`, `src/rescue.rs`). `build.sh`
+makes `target/lapin-full.bin`, the image to flash or to send.
+
 ## What is left
 
-A resident loader, so that a power cut during an update no longer
-kills the rabbit; then the real rabbit.
+The real rabbit.

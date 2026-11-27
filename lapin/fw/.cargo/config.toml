@@ -13,6 +13,6 @@ build-std-features = ["optimize_for_size"]
 [target.thumbv4t-none-eabi]
 rustflags = [
     "-Z", "unstable-options", "-C", "panic=immediate-abort",
-    "-C", "link-arg=-Tlink.x", "-C", "link-arg=--gc-sections", "-C", "link-arg=--icf=all",
+    "-C", "link-arg=--gc-sections", "-C", "link-arg=--icf=all",
     "-C", "link-arg=-Map=lapin.map",
 ]

@@ -21,12 +21,13 @@ pub fn is_lapin() -> bool {
     firmware() == Firmware::Lapin
 }
 
-/// The image of the firmware under test, as a file (ELF or `.sim`).
+/// The image of the firmware under test, as a file: r3's `.sim`, or
+/// lapin's whole image (rescue core and application, `lapin/build.sh`).
 pub fn image() -> Vec<u8> {
     let root = env!("CARGO_MANIFEST_DIR");
     let path = match firmware() {
         Firmware::R3 => format!("{root}/../../artifacts/Nab-wpa23-gtk-r3.sim"),
-        Firmware::Lapin => format!("{root}/../../lapin/target/thumbv4t-none-eabi/release/lapin"),
+        Firmware::Lapin => format!("{root}/../../lapin/target/lapin-full.bin"),
     };
     std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
 }

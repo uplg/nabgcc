@@ -109,30 +109,31 @@ unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
     }
 }
 
-/// Rewrite the flash from its first sector with the `len` bytes at
+/// Rewrite the flash from the sector at `to` with the `len` bytes at
 /// `image`, feeding the watchdog after every word; then stop feeding
 /// it and wait: the watchdog restarts the board on the new image.
 ///
 /// # Safety
 /// Interrupts off for good; `image` is `len` readable bytes outside the
-/// flash, word aligned, `len` at most the flash below the settings.
+/// flash, word aligned; `to` a sector boundary, `to + len` at most the
+/// start of the settings sector.
 #[unsafe(link_section = ".data.ramcode")]
 #[unsafe(no_mangle)]
 #[inline(never)]
-unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize) -> ! {
+unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize, to: usize) -> ! {
     // SAFETY: interrupts are off for good, this runs from RAM.
     unsafe {
         let mut offset = 0;
         while offset < len {
             if offset % SECTOR == 0 {
-                erase_sector((BASE + offset) as *mut u8);
+                erase_sector((to + offset) as *mut u8);
             }
             let mut word = image.add(offset / 4).read_volatile();
             if len - offset < 4 {
                 // The rest of the last word stays erased.
                 word |= u32::MAX << (8 * (len - offset));
             }
-            program_word((BASE + offset) as *mut u8, word);
+            program_word((to + offset) as *mut u8, word);
             WDTCON.write_volatile(0xC3);
             WDTCON.write_volatile(0x3C);
             offset += 4;
@@ -147,14 +148,34 @@ unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize) -> ! {
 
 /// Replace the firmware with `image` and restart on it: the end of
 /// this firmware. `image` must be word aligned and lie outside the
-/// flash, and its length leave the settings sector alone.
+/// flash. An image that brings the rescue core in place rewrites the
+/// application alone (see `boot::update_plan`); a damaged application
+/// is refused, and the board restarts on what it had.
 pub fn write_firmware(image: &[u8]) -> ! {
-    let len = image.len().min(SETTINGS - BASE);
+    let Some((to, part)) = crate::boot::update_plan(image) else {
+        crate::watchdog::reset_now()
+    };
+    let len = part.len().min(SETTINGS - to);
     irq::irq_disable();
     watchdog::feed();
     // SAFETY: interrupts are off for good, the routine runs from RAM
-    // and never returns into the flash it rewrites.
-    unsafe { flash_image_from_ram(image.as_ptr().cast(), len) }
+    // and never returns into the flash it rewrites; `to` is a sector
+    // boundary and the length stops below the settings.
+    unsafe { flash_image_from_ram(part.as_ptr().cast(), len, to) }
+}
+
+/// Write an application image after the rescue core (from the rescue
+/// core itself), then restart on it. A damaged image is refused, and
+/// the board restarts on what it had.
+pub fn write_app(app: &[u8]) -> ! {
+    let Some(len) = crate::boot::check_app(app) else {
+        crate::watchdog::reset_now()
+    };
+    irq::irq_disable();
+    watchdog::feed();
+    // SAFETY: as in `write_firmware`; the application's place starts on
+    // a sector boundary and ends below the settings (checked).
+    unsafe { flash_image_from_ram(app.as_ptr().cast(), len, crate::boot::APP_BASE) }
 }
 
 /// One sector's worth of scratch space, in the external RAM.

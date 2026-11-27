@@ -22,6 +22,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "rescue"
+path = "src/bin/rescue.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "selftest"
 path = "src/bin/selftest.rs"
 test = false

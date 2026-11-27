@@ -26,7 +26,7 @@ step "emulator: every test, on r3"
 cargo test --release
 step "the acceptance tests, on lapin"
 NABEMU_FIRMWARE=lapin cargo test --release --test boot --test board --test join --test link \
-    --test network --test setup --test rfid --test factory --test flash --test garenne --test limits
+    --test network --test setup --test rfid --test factory --test flash --test garenne --test limits --test rescue
 step "the browser build"
 cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
 web/build.sh

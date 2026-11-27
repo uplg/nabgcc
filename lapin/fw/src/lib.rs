@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod board;
+pub mod boot;
 pub mod clock;
 pub mod codec;
 pub mod ears;
@@ -16,6 +17,7 @@ pub mod i2c;
 pub mod irq;
 pub mod led;
 pub mod reg;
+pub mod rescue;
 pub mod rfid;
 pub mod spi;
 pub mod start;

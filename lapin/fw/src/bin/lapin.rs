@@ -9,8 +9,8 @@ use core::mem::MaybeUninit;
 use lapin_core::rng::Pool;
 use lapin_core::wifi::Station;
 use lapin_fw::host::{Board, SCAN_RESULTS};
-use lapin_fw::wifi::rt2573::{self, Stick};
-use lapin_fw::{board, clock, codec, ears, i2c, irq, led, spi, timer, uart, usb, watchdog};
+use lapin_fw::wifi::rt2573::Stick;
+use lapin_fw::{board, clock, codec, ears, i2c, irq, led, spi, timer, uart, watchdog};
 use lapin_metal::{Memory, ScanResult, Vm};
 
 #[panic_handler]
@@ -76,59 +76,28 @@ extern "C" fn main() -> ! {
         )
     };
 
-    let stick = usb::init()
-        .and_then(|()| usb::attach(3000))
-        .and_then(|()| usb::enumerate())
-        .map_err(rt2573::Error::Usb)
-        .and_then(Stick::start);
-    let stick = match stick {
-        Ok(stick) => {
-            uart::write(b"wifi ");
-            for (i, byte) in stick.mac.iter().enumerate() {
-                if i > 0 {
-                    uart::write(b":");
-                }
-                uart::hex8(*byte);
-            }
-            uart::write(b" radio ");
-            uart::hex8(stick.radio());
-            uart::write(b"\n");
-            Some(&mut *stick_slot.write(stick))
-        }
-        Err(rt2573::Error::Radio(radio)) => {
-            // Not the radio chip this firmware knows how to tune.
-            uart::write(b"wifi: radio ");
-            uart::hex8(radio);
-            uart::write(b"\n");
-            None
-        }
-        Err(_) => {
-            uart::write(b"wifi: no stick\n");
-            None
-        }
-    };
-
     let mut pool = Pool::new();
     // The volume wheel's last bits wander: a first handful of noise.
     for _ in 0..64 {
         pool.mix(board::volume() as u32 ^ timer::millis() << 8);
     }
-    if let Some(stick) = &stick {
-        pool.mix(u32::from_le_bytes([
-            stick.mac[2],
-            stick.mac[3],
-            stick.mac[4],
-            stick.mac[5],
-        ]));
-    }
-
-    let host = Board::new(stick, station, pool, frame, scan);
+    // The Wi-Fi stick comes up in the first turn of the main loop, as
+    // in the C firmware: the bytecode starts at once, and sees the
+    // network broken until then.
+    let host = Board::new(stick_slot, station, pool, frame, scan);
     let mut vm = Vm::new(host, memory);
     // SAFETY: taken once, here.
     let boot = unsafe { &mut *(&raw mut BOOT) };
     let n = lapin_core::lz::unpack(BOOT_PACKED, boot);
     vm.boot(&boot[..n]);
+    let mut confirmed = false;
     loop {
         vm.main_loop_once();
+        // A minute up: the application is well, the rescue core can
+        // forget the restarts before (lapin_fw::boot).
+        if !confirmed && timer::millis() > 60_000 {
+            lapin_fw::boot::Slots::confirm();
+            confirmed = true;
+        }
     }
 }

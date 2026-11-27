@@ -1,29 +1,25 @@
 //! Reset: what runs before `main`.
 //!
 //! The processor starts in ARM state, supervisor mode, interrupts off,
-//! at the first word of the flash (mapped at address 0 too). The
-//! vectors jump to absolute addresses in the flash proper.
+//! at the first word of the flash: the rescue core's vectors
+//! (`bin/rescue.rs`), which run this same code for the rescue core, and
+//! jump to it for the application, from its header.
 
 use core::arch::global_asm;
 
 global_asm!(
     r#"
-    .section .vectors, "ax"
-    .arm
-    .global _start
-_start:
-    ldr pc, =reset
-    ldr pc, =undefined
-    ldr pc, =trap
-    ldr pc, =trap
-    ldr pc, =trap
-    nop
-    ldr pc, =irq_entry
-    ldr pc, =trap
-    .ltorg
+    /* The application's header (see boot.rs): length and CRC are
+       filled in by build.sh. The rescue core discards it. */
+    .section .app_header, "a"
+    .word 0x4150414C
+    .word 0
+    .word 0
+    .word reset
 
     .section .text.reset, "ax"
     .arm
+    .global reset, trap, undefined
 reset:
     /* Interrupt mode gets its own small stack... */
     ldr r0, =__stack_top
@@ -34,6 +30,15 @@ reset:
     /* ...and the program runs in system mode, interrupts still off. */
     msr cpsr_c, #0xDF
     mov sp, r0
+
+    /* The vectors are the rescue core's, in the first sector: they
+       send interrupts and undefined instructions where these two
+       words say (boot.rs, Slots). */
+    ldr r0, =0x10000008
+    ldr r1, =irq_entry
+    str r1, [r0]
+    ldr r1, =undefined
+    str r1, [r0, #4]
 
     /* Initialised data comes from the flash, the rest starts at zero. */
     ldr r0, =__data_load
@@ -71,11 +76,10 @@ trap:
 
 /// Makes sure the reset code above is linked into the image.
 pub fn link() {
-    // SAFETY: `_start` is the reset code's label above; only its address
+    // SAFETY: `reset` is the reset code's label above; only its address
     // is taken, never a byte read through it.
     unsafe extern "C" {
-        static _start: u8;
+        static reset: u8;
     }
-    // Only the address is taken.
-    core::hint::black_box(&raw const _start);
+    core::hint::black_box(&raw const reset);
 }
