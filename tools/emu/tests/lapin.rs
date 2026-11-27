@@ -356,3 +356,148 @@ fn every_driver_does_its_job() {
 
     assert_eq!(m.soc.board.leds, [[0, 126, 0]; 5], "green at the end");
 }
+
+/// Joining with the settings the setup page saved, as the boot
+/// bytecode will have it do: the rabbit's own processor runs the
+/// handshakes (and, on WPA3, the password exchange and the cipher).
+mod joins {
+    use super::image;
+    use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
+    use nabemu::config::{Config, Wifi};
+    use nabemu::{DEFAULT_MAC, Machine};
+
+    const BSSID: [u8; 6] = [0x02, 0, 0, 0, 0, 0xA1];
+    const PASSPHRASE: &str = "carotte-violette";
+
+    /// Run until connected; returns the time it took, in board ms.
+    fn connect(wifi: Wifi, security: Security, wpa3: Wpa3) -> Option<(Machine, u64)> {
+        let image = image("lapin")?;
+        let mut m = Machine::from_file(&image).0;
+        Config::new("Terrier", wifi).install(&mut m.soc.flash);
+        let mut ap = AccessPoint::new("Terrier", BSSID, 6, security);
+        ap.wpa3 = wpa3;
+        m.air.push(ap);
+        while !m.console().contains("state 04") {
+            assert!(
+                m.soc.millis() < 30_000,
+                "not connected:\n{}\n{:?}",
+                m.console(),
+                m.air[0].events
+            );
+            m.run_until_ms(m.soc.millis() + 20);
+        }
+        let at = m.soc.millis();
+        // The first frame up must reach the wire.
+        while !m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]) {
+            assert!(
+                m.soc.millis() < at + 2000,
+                "nothing came up: {:?}",
+                m.air[0].events
+            );
+            m.run_until_ms(m.soc.millis() + 20);
+        }
+        assert!(m.air[0].is_authorized(DEFAULT_MAC));
+        assert_eq!(m.events, [], "no reset");
+        assert!(m.soc.bus_faults.is_empty());
+        assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
+        let trouble: Vec<_> = m.air[0]
+            .events
+            .iter()
+            .filter(|e| {
+                !matches!(
+                    e,
+                    ApEvent::Authenticated { .. }
+                        | ApEvent::Associated { .. }
+                        | ApEvent::HandshakeComplete { .. }
+                        | ApEvent::GroupKeyInstalled { .. }
+                        | ApEvent::SaeComplete { .. }
+                )
+            })
+            .collect();
+        assert!(trouble.is_empty(), "{trouble:?}\n{}", m.console());
+        Some((m, at))
+    }
+
+    fn wpa2() -> Wifi {
+        Wifi::Wpa2 {
+            passphrase: PASSPHRASE.into(),
+        }
+    }
+
+    #[test]
+    fn open() {
+        connect(Wifi::Open, Security::Open, Wpa3::Off);
+    }
+
+    #[test]
+    fn wpa2_with_no_known_defect_left() {
+        let Some((m, _)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Off) else {
+            return;
+        };
+        assert!(!m.console().contains("wpa3"));
+    }
+
+    #[test]
+    fn wpa_tkip() {
+        connect(
+            Wifi::Wpa {
+                passphrase: PASSPHRASE.into(),
+            },
+            Security::wpa(PASSPHRASE),
+            Wpa3::Off,
+        );
+    }
+
+    #[test]
+    fn mixed_mode() {
+        connect(wpa2(), Security::wpa2_tkip_group(PASSPHRASE), Wpa3::Off);
+    }
+
+    #[test]
+    fn wep_104() {
+        connect(
+            Wifi::Wep {
+                key: "thirteenchars".into(),
+                shared_auth: false,
+            },
+            Security::Wep {
+                key: b"thirteenchars".to_vec(),
+                shared_auth: false,
+            },
+            Wpa3::Off,
+        );
+    }
+
+    #[test]
+    fn wep_shared_key() {
+        connect(
+            Wifi::Wep {
+                key: "carot".into(),
+                shared_auth: true,
+            },
+            Security::Wep {
+                key: b"carot".to_vec(),
+                shared_auth: true,
+            },
+            Wpa3::Off,
+        );
+    }
+
+    #[test]
+    fn wpa3_transition_network() {
+        let Some((m, at)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Transition) else {
+            return;
+        };
+        assert!(m.console().contains("wpa3"), "{}", m.console());
+        eprintln!("{}", m.console());
+        eprintln!("connected at {at} ms");
+    }
+
+    #[test]
+    fn wpa3_only() {
+        let Some((m, _)) = connect(wpa2(), Security::wpa2(PASSPHRASE), Wpa3::Only) else {
+            return;
+        };
+        assert!(m.console().contains("wpa3"), "{}", m.console());
+    }
+}

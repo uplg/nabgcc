@@ -24,6 +24,7 @@ const MAC_CSR4: u16 = 0x3010;
 const MAC_CSR5: u16 = 0x3014;
 const MAC_CSR12: u16 = 0x3030;
 const TXRX_CSR0: u16 = 0x3040;
+const TXRX_CSR5: u16 = 0x3054;
 const TXRX_CSR9: u16 = 0x3064;
 const PHY_CSR1: u16 = 0x3084;
 const PHY_CSR3: u16 = 0x308C;
@@ -163,6 +164,8 @@ pub struct TxOptions {
     /// encrypts: initialisation vector, then its extension.
     pub iv: u32,
     pub eiv: u32,
+    /// The stick writes its clock into the frame (probe responses).
+    pub timestamp: bool,
 }
 
 impl TxOptions {
@@ -174,6 +177,7 @@ impl TxOptions {
         key_index: 0,
         iv: 0,
         eiv: 0,
+        timestamp: false,
     };
 }
 
@@ -547,6 +551,12 @@ impl Stick {
         Ok(())
     }
 
+    /// The rates the stick may answer at (acknowledgements), by its
+    /// rate numbers.
+    pub fn set_answer_rates(&self, mask: u16) -> Result<(), Error> {
+        Ok(self.write(TXRX_CSR5, mask as u32)?)
+    }
+
     /// The network whose frames count as ours.
     pub fn set_bssid(&self, bssid: &[u8; 6]) -> Result<(), Error> {
         self.write(
@@ -599,7 +609,7 @@ impl Stick {
         }
         usb::transmit(total, |buffer| {
             buffer.fill(0);
-            buffer[..24].copy_from_slice(&descriptor(frame.len(), options));
+            buffer[..24].copy_from_slice(&descriptor_with(frame.len(), options, options.timestamp));
             buffer[24..24 + frame.len()].copy_from_slice(frame);
         })
     }
@@ -642,10 +652,6 @@ impl Stick {
         // Clock running, no synchronisation to anyone, beacons on.
         Ok(self.write(TXRX_CSR9, control | 0x001F_0000)?)
     }
-}
-
-fn descriptor(len: usize, options: &TxOptions) -> [u8; 24] {
-    descriptor_with(len, options, false)
 }
 
 /// The six words that precede a frame handed to the stick.

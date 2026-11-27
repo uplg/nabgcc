@@ -7,3 +7,6 @@ description = "The portable part of the rabbit's firmware: no hardware, no alloc
 
 [dependencies]
 lapin-p256 = { path = "../p256" }
+
+[dev-dependencies]
+nabemu = { path = "../../tools/emu" }
