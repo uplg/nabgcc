@@ -617,6 +617,88 @@ fn wpa3_after_a_restart_waits_for_the_sa_query() {
     talks(&mut w, &mut sta);
 }
 
+/// The access point loses power and comes back, the rabbit forgotten.
+/// To the rabbit's protected frames it answers, as hostapd does, with a
+/// deauthentication in clear (reason 7): ignored, as anyone could send
+/// it, and the beacons kept the link "up" for ever. Now the station asks
+/// the access point under the keys (SA Query); no answer within a
+/// second, the link is down, and the station joins again.
+#[test]
+fn wpa3_notices_an_access_point_that_forgot_it() {
+    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
+    w.aps[0].power_cut();
+    // The rabbit talks; the access point says it does not know it.
+    let mut data = vec![0xAA, 0xAA, 0x03, 0, 0, 0, 0x08, 0x00];
+    data.extend_from_slice(&[0x45; 40]);
+    sta.send(&mut w, &data, &[0xFF; 6], false);
+    run(&mut w, &mut sta, 500, &mut Vec::new());
+    assert!(
+        w.ap()
+            .events
+            .iter()
+            .any(|e| matches!(e, ApEvent::Deauthenticated { reason: 7, .. })),
+        "{:?}",
+        w.ap().events
+    );
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "too soon");
+    run(&mut w, &mut sta, 1000, &mut Vec::new());
+    assert_eq!(sta.net_state(), wifi::S_IDLE);
+    join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    w.aps[0].uplink.clear();
+    talks(&mut w, &mut sta);
+}
+
+/// The same deauthentication in clear, but from someone else while the
+/// access point still holds the association: it answers the query, and
+/// the link stays.
+#[test]
+fn wpa3_keeps_the_link_when_the_access_point_answers_the_query() {
+    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
+    let mut forged = vec![0xC0, 0, 0, 0];
+    forged.extend_from_slice(&STA);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&BSSID);
+    forged.extend_from_slice(&[0, 0, 6, 0]);
+    w.radio.rx.push_back(nabemu::rt2573::RxFrame::new(forged));
+    run(&mut w, &mut sta, 3000, &mut Vec::new());
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED);
+    let queries = w
+        .radio
+        .tx
+        .iter()
+        .filter(|f| f.data[0] == 0xD0)
+        .count();
+    assert!(queries >= 1);
+    w.aps[0].uplink.clear();
+    talks(&mut w, &mut sta);
+}
+
+/// Message 4 lost: the access point sends message 3 again, in clear (it
+/// has no key yet). The WPA3 station, keys in place, dropped everything
+/// in clear, the access point gave up (reason 15, in clear: ignored
+/// too), and the rabbit stayed "connected" to an access point that no
+/// longer knew it. Now message 3 again is answered, nothing installed
+/// again.
+#[test]
+fn a_lost_message_4_is_sent_again() {
+    for wpa3 in [Wpa3::Only, Wpa3::Off] {
+        let mut w = World::new(Security::wpa2(PASSPHRASE), wpa3);
+        w.aps[0].lose_message_4 = 1;
+        let mut sta = Station::new();
+        let password: &[u8] = if wpa3 == Wpa3::Only {
+            PASSPHRASE.as_bytes()
+        } else {
+            &[]
+        };
+        join(&mut w, &mut sta, &pmk(), password);
+        assert_eq!(sta.net_state(), wifi::S_CONNECTED);
+        assert!(w.ap().is_authorized(STA), "{:?}", w.ap().events);
+        talks(&mut w, &mut sta);
+        assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
+    }
+}
+
 #[test]
 fn access_point_mode_lets_a_station_in() {
     let mut w = World::new(Security::Open, Wpa3::Off);

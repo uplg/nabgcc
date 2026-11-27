@@ -186,3 +186,106 @@ fn the_curve_arithmetic_takes_the_same_time_whatever_the_numbers() {
         }
     }
 }
+
+/// WPA3 on the emulated rabbit, against an access point that loses
+/// track of it.
+mod wpa3 {
+    use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
+    use nabemu::config::{Config, Wifi};
+    use nabemu::{DEFAULT_MAC, Machine};
+
+    const PASSPHRASE: &str = "carotte-violette";
+
+    fn rabbit(ap: impl FnOnce(&mut AccessPoint)) -> Option<Machine> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../lapin/target/lapin-full.bin"
+        );
+        let Ok(image) = std::fs::read(path) else {
+            eprintln!("skipped: lapin is not built");
+            return None;
+        };
+        let mut m = Machine::from_file(&image).0;
+        Config::new(
+            "Terrier",
+            Wifi::Wpa2 {
+                passphrase: PASSPHRASE.into(),
+            },
+        )
+        .install(&mut m.soc.flash);
+        let mut a = AccessPoint::new(
+            "Terrier",
+            [2, 0, 0, 0, 0, 0xA1],
+            6,
+            Security::wpa2(PASSPHRASE),
+        );
+        a.wpa3 = Wpa3::Only;
+        ap(&mut a);
+        m.air.push(a);
+        Some(m)
+    }
+
+    fn until(m: &mut Machine, limit: u64, done: impl Fn(&Machine) -> bool) -> u64 {
+        while !done(m) {
+            assert!(
+                m.soc.millis() < limit,
+                "not by {limit} ms: {:?}\n{}",
+                m.air[0].events,
+                m.console()
+            );
+            m.run_until_ms(m.soc.millis() + 5);
+        }
+        m.soc.millis()
+    }
+
+    fn handshakes(m: &Machine) -> usize {
+        m.air[0]
+            .events
+            .iter()
+            .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
+            .count()
+    }
+
+    /// Scenario A of the review: the access point loses power and comes
+    /// back without the rabbit, which goes on sending under its keys;
+    /// the answer is a deauthentication in clear, reason 7. The rabbit
+    /// ignored it and stayed "connected" for ever; it now asks, gets no
+    /// answer, and joins again.
+    #[test]
+    fn after_the_access_point_restarts_the_rabbit_joins_again() {
+        let Some(mut m) = rabbit(|_| {}) else { return };
+        let first = until(&mut m, 30_000, |m| m.air[0].is_authorized(DEFAULT_MAC));
+        m.run_until_ms(first + 2000);
+        m.air[0].power_cut();
+        let cut = m.soc.millis();
+        let back = until(&mut m, cut + 40_000, |m| {
+            m.air[0].is_authorized(DEFAULT_MAC) && handshakes(m) == 2
+        });
+        assert!(
+            m.air[0]
+                .events
+                .iter()
+                .any(|e| matches!(e, ApEvent::Deauthenticated { reason: 7, .. })),
+            "{:?}",
+            m.air[0].events
+        );
+        eprintln!("back {} ms after the power cut", back - cut);
+        assert_eq!(m.events, []);
+    }
+
+    /// Scenario B: message 4 lost, message 3 again in clear. Dropped,
+    /// the access point gave up (reason 15, in clear, ignored too); now
+    /// answered.
+    #[test]
+    fn a_lost_message_4_does_not_leave_the_rabbit_stranded() {
+        let Some(mut m) = rabbit(|ap| ap.lose_message_4 = 1) else {
+            return;
+        };
+        let done = until(&mut m, 30_000, |m| m.air[0].is_authorized(DEFAULT_MAC));
+        m.run_until_ms(done + 3000);
+        assert!(m.air[0].is_authorized(DEFAULT_MAC));
+        assert_eq!(handshakes(&m), 1);
+        assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
+        assert_eq!(m.events, []);
+    }
+}

@@ -285,6 +285,25 @@ struct SoftKeys {
     igtk_ipn: u64,
 }
 
+/// The SA Query procedure (802.11-2020 11.13): the transaction
+/// identifiers sent (`sent` of them; none, no procedure), when it began,
+/// when the next request is due, when the last one began.
+#[derive(Clone, Copy)]
+struct SaQuery {
+    ids: [[u8; 2]; 5],
+    sent: u8,
+    start: u32,
+    next: u32,
+    last: Option<u32>,
+}
+
+/// wpa_supplicant's timings: a request every 201 time units, an answer
+/// within 1000 (in milliseconds here), and no new procedure within ten
+/// seconds of the last.
+const SA_QUERY_RETRY_MS: u32 = 206;
+const SA_QUERY_MAX_MS: u32 = 1024;
+const SA_QUERY_QUIET_MS: u32 = 10_000;
+
 /// A password exchange under way.
 #[derive(Clone)]
 struct SaeRun {
@@ -368,6 +387,7 @@ pub struct Station {
     ap_keyed: bool,
     /// The cached key led to a checked message 3.
     pmksa_proven: bool,
+    sa_query: SaQuery,
     tx: [u8; 2400],
 }
 
@@ -577,6 +597,13 @@ impl Station {
             renew_snonce: true,
             ap_keyed: false,
             pmksa_proven: false,
+            sa_query: SaQuery {
+                ids: [[0; 2]; 5],
+                sent: 0,
+                start: 0,
+                next: 0,
+                last: None,
+            },
             next_offer: 0,
             tx: [0; 2400],
         }
@@ -967,6 +994,8 @@ impl Station {
         }
         self.pmksa_proven = false;
         self.renew_snonce = true;
+        self.sa_query.sent = 0;
+        self.sa_query.last = None;
         self.state = State::Idle;
         self.ap = *mac;
         self.bssid = *bssid;
@@ -1307,6 +1336,19 @@ impl Station {
     /// try again after the access point said to come back).
     #[inline(never)]
     pub fn poll(&mut self, link: &mut impl Link) {
+        if self.sa_query.sent != 0 {
+            let now = link.millis();
+            if self.state != State::Run {
+                self.sa_query.sent = 0;
+            } else if now.wrapping_sub(self.sa_query.start) >= SA_QUERY_MAX_MS {
+                // No answer under the keys: the access point no longer
+                // holds the association. Join again.
+                self.sa_query.sent = 0;
+                self.state = State::Idle;
+            } else if (now.wrapping_sub(self.sa_query.next) as i32) >= 0 {
+                self.sa_query_round(link);
+            }
+        }
         if let Some(at) = self.retry_assoc_at
             && (link.millis().wrapping_sub(at) as i32) >= 0
         {
@@ -1473,10 +1515,27 @@ impl Station {
                     if self.state == State::Idle || !sent_by_ap || !our_bss {
                         return;
                     }
-                    if self.soft.is_some() && !self.trusted_management(frame, len, to_us) {
+                    // Protected management frames once message 4 is out:
+                    // before, the access point holds no key to protect a
+                    // deauthentication with, and one in clear counts.
+                    let protected =
+                        self.soft.is_some() && matches!(self.keys, KeyState::Group | KeyState::Run);
+                    if protected && !self.trusted_management(frame, len, to_us) {
+                        // Forged, or from an access point that lost our
+                        // keys (it restarted, or never got message 4)
+                        // and says the frames it gets are from nobody it
+                        // knows (reasons 6 and 7): ask it, under the
+                        // keys (802.11-2020 11.13, as wpa_supplicant).
+                        if to_us
+                            && frame[1] & 0x40 == 0
+                            && len >= 26
+                            && matches!(le16(frame, 24), 6 | 7)
+                        {
+                            self.start_sa_query(link);
+                        }
                         return;
                     }
-                    if to_us || self.soft.is_some() {
+                    if to_us || protected {
                         self.state = State::Idle;
                     }
                 } else if to_us
@@ -1522,6 +1581,7 @@ impl Station {
             match ccmp::unprotect(&tk, &mut frame[..len]) {
                 Some((_, pn)) if pn > soft.mgmt_rx_pn => {
                     soft.mgmt_rx_pn = pn;
+                    self.ap_keyed = true;
                     true
                 }
                 _ => false,
@@ -1538,13 +1598,57 @@ impl Station {
             return;
         }
         let body = &frame[24..len - ccmp::OVERHEAD];
-        if let [8, 0, a, b, ..] = *body {
-            let own = link.mac();
-            let (ap, bssid) = (self.ap, self.bssid);
-            let at = self.header(&own, 0xD0, 0, &ap, &bssid);
-            let at = put(&mut self.tx, at, &[8, 1, a, b]);
-            self.send_management(link, at, true);
+        match *body {
+            [8, 0, a, b, ..] => {
+                let own = link.mac();
+                let (ap, bssid) = (self.ap, self.bssid);
+                let at = self.header(&own, 0xD0, 0, &ap, &bssid);
+                let at = put(&mut self.tx, at, &[8, 1, a, b]);
+                self.send_management(link, at, true);
+            }
+            // The access point still holds our association.
+            [8, 1, a, b, ..]
+                if self.sa_query.ids[..self.sa_query.sent as usize].contains(&[a, b]) =>
+            {
+                self.sa_query.sent = 0;
+            }
+            _ => {}
         }
+    }
+
+    /// Begin the SA Query procedure, unless it runs or ran less than ten
+    /// seconds ago (forged deauthentications must not keep the radio
+    /// busy).
+    fn start_sa_query(&mut self, link: &mut impl Link) {
+        let now = link.millis();
+        let q = &mut self.sa_query;
+        if q.sent != 0
+            || q.last
+                .is_some_and(|at| now.wrapping_sub(at) < SA_QUERY_QUIET_MS)
+        {
+            return;
+        }
+        q.last = Some(now);
+        q.start = now;
+        self.sa_query_round(link);
+    }
+
+    /// One SA Query request, under the pairwise key, with a new
+    /// transaction identifier: an answer to any of them will do.
+    fn sa_query_round(&mut self, link: &mut impl Link) {
+        let mut id = [0u8; 2];
+        link.random(&mut id);
+        let q = &mut self.sa_query;
+        if (q.sent as usize) < q.ids.len() {
+            q.ids[q.sent as usize] = id;
+            q.sent += 1;
+        }
+        q.next = link.millis().wrapping_add(SA_QUERY_RETRY_MS);
+        let own = link.mac();
+        let (ap, bssid) = (self.ap, self.bssid);
+        let at = self.header(&own, 0xD0, 0, &ap, &bssid);
+        let at = put(&mut self.tx, at, &[8, 0, id[0], id[1]]);
+        self.send_management(link, at, true);
     }
 
     #[inline(never)]

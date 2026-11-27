@@ -222,8 +222,12 @@ struct Station {
     tx_pn: u64,
     rx_pn: u64,
     rx_started: bool,
-    /// Replay counter of the last EAPOL-Key frame sent to this station.
+    /// Replay counter of the last EAPOL-Key frame sent to this station,
+    /// and of the first transmission of that message: a retransmission
+    /// takes the next counter (as hostapd), and an answer to any of them
+    /// is taken.
     replay: u64,
+    replay_first: u64,
     last_eapol: Vec<u8>,
     retries: u32,
     retry_at: u64,
@@ -289,6 +293,9 @@ pub struct AccessPoint {
     /// `assoc_sa_query_retry_timeout`).
     pub sa_query_max_tu: u64,
     pub sa_query_retry_tu: u64,
+    /// Messages 4 to lose, as if they never arrived: the access point
+    /// sends message 3 again, in clear (it holds no key yet).
+    pub lose_message_4: u32,
     psk: [u8; 32],
     comeback_key: [u8; 32],
     igtk_index: u8,
@@ -422,6 +429,7 @@ impl AccessPoint {
             anti_clogging_threshold: 5,
             sa_query_max_tu: 1000,
             sa_query_retry_tu: 201,
+            lose_message_4: 0,
             psk,
             comeback_key: [0; 32],
             igtk_index: 4,
@@ -606,6 +614,19 @@ impl AccessPoint {
         });
     }
 
+    /// Lose power and come back: every station forgotten, with its keys
+    /// and cached exchanges, and nobody told; new group keys. A station
+    /// that goes on talking gets the answer hostapd gives frames from
+    /// strangers: a deauthentication, reason 7, in clear.
+    pub fn power_cut(&mut self) {
+        self.stations.clear();
+        self.pmksa.clear();
+        self.gtk = self.random();
+        self.igtk = self.random();
+        self.group_pn = 0;
+        self.ipn = 0;
+    }
+
     /// Throw a station out, as an access point does when it restarts or
     /// an administrator kicks a client.
     pub fn kick(&mut self, radio: &mut Radio, sta: Mac, reason: u16) {
@@ -661,7 +682,19 @@ impl AccessPoint {
             } else {
                 s.retries += 1;
                 s.retry_at = now_ms + EAPOL_RETRY_MS;
-                let again = s.last_eapol.clone();
+                // The same message under the next replay counter, signed
+                // again.
+                s.replay += 1;
+                let mut again = s.last_eapol.clone();
+                again[9..17].copy_from_slice(&s.replay.to_be_bytes());
+                let info = u16::from_be_bytes([again[5], again[6]]);
+                if info & KEY_INFO_MIC != 0 {
+                    let ptk = s.rekey.and_then(|r| r.next_ptk).unwrap_or(s.ptk);
+                    again[81..97].fill(0);
+                    let mic = Self::eapol_mic(info & 7, &ptk[..16], &again);
+                    again[81..97].copy_from_slice(&mic);
+                }
+                s.last_eapol = again.clone();
                 self.send_eapol_raw(radio, sta, &again);
             }
         }
@@ -1163,6 +1196,7 @@ impl AccessPoint {
             rx_pn: 0,
             rx_started: false,
             replay: 0,
+            replay_first: 0,
             last_eapol: Vec::new(),
             retries: 0,
             retry_at: 0,
@@ -1588,6 +1622,7 @@ impl AccessPoint {
         let version = self.key_version(sta);
         let station = self.stations.get_mut(&sta).unwrap();
         station.replay += 1;
+        station.replay_first = station.replay;
         let mut k = vec![if wpa2 { 2 } else { 254 }];
         k.extend_from_slice(&(info | version).to_be_bytes());
         k.extend_from_slice(&key_len.to_be_bytes());
@@ -1939,7 +1974,7 @@ impl AccessPoint {
         if info & KEY_INFO_MIC == 0 || info & KEY_INFO_ACK != 0 {
             return self.reject(sta, "flags of a message from a supplicant");
         }
-        if replay != station.replay {
+        if replay < station.replay_first || replay > station.replay {
             return self.reject(sta, "replay counter");
         }
 
@@ -2007,6 +2042,11 @@ impl AccessPoint {
             Phase::Msg4 => {
                 if info & KEY_INFO_PAIRWISE == 0 {
                     return self.reject(sta, "message 4 is not a pairwise message");
+                }
+                if self.lose_message_4 > 0 {
+                    // Lost on the way: message 3 goes again.
+                    self.lose_message_4 -= 1;
+                    return;
                 }
                 let s = self.stations.get_mut(&sta).unwrap();
                 s.keys_installed = true;
