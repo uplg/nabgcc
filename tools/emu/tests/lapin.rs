@@ -360,3 +360,53 @@ mod wpa3 {
         assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
     }
 }
+
+/// The interpreter's speed against the C one's, on the same bytecode:
+/// 100 000 turns of a loop of five instructions, timed by the bytecode
+/// itself with `time_ms`, on each firmware.
+#[test]
+fn the_interpreter_keeps_pace_with_the_c_one() {
+    use nabemu::air::{AccessPoint, Security};
+    use nabemu::config::{Config, Wifi};
+    use nabemu::lan::{Lan, Response};
+    use nabemu::metal;
+
+    let Some(lapin) = image("lapin") else { return };
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.push(53); // time_ms
+    f.extend(metal::int(100_000));
+    f.extend([6, 29, 19, 0]); // dup; else 19
+    f.extend(metal::int(1));
+    f.extend([10, 28, 6, 0]); // sub; goto 6
+    f.extend([5, 53, 10, 95, 1]); // drop; time_ms; sub; Iecholn; ret
+    let served = metal::boot_response(&metal::bytecode(&[], &f));
+    let r3 = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
+    ))
+    .unwrap();
+    let time = |image: &[u8]| {
+        let mut m = Machine::from_file(image).0;
+        Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
+        m.air.push(AccessPoint::new(
+            "Terrier",
+            [2, 0, 0, 0, 0, 0xA1],
+            6,
+            Security::Open,
+        ));
+        let mut lan = Lan::new();
+        let served = served.clone();
+        lan.handler = Box::new(move |_| Response::ok(served.clone()));
+        m.lan = Some(lan);
+        m.run_until_ms(40_000);
+        let console = m.console();
+        console
+            .lines()
+            .filter_map(|l| l.strip_prefix('-')?.parse::<u64>().ok())
+            .last()
+            .unwrap_or_else(|| panic!("no time printed:\n{console}"))
+    };
+    let (c, rust) = (time(&r3), time(&lapin));
+    eprintln!("the loop takes {c} ms on r3, {rust} ms on lapin");
+    assert!(rust * 2 < c * 3, "{rust} ms against {c} ms");
+}

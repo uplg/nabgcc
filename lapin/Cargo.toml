@@ -20,3 +20,6 @@ overflow-checks = false
 # a scalar multiplication from 980 ms to a third of that.
 [profile.release.package.lapin-p256]
 opt-level = 2
+
+[profile.release.package.lapin-metal]
+opt-level = 2

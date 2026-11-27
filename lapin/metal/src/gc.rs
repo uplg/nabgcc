@@ -182,7 +182,22 @@ impl<H: Host> Vm<'_, H> {
 
     /// `vmem_check`: room for `wsize` more words, collecting if need be.
     /// Out of memory, the machine breaks and the board reboots.
+    #[inline(always)]
     fn check(&mut self, wsize: i32) -> bool {
+        let free = (VMEM_LENGTH as i32)
+            .wrapping_add(self.stack)
+            .wrapping_sub(self.heapindex)
+            .wrapping_sub(wsize);
+        if free >= GC_THRESHOLD {
+            return true;
+        }
+        self.check_slow(wsize)
+    }
+
+    /// The rare case of `check`: collect, and break if still short.
+    #[cold]
+    #[inline(never)]
+    fn check_slow(&mut self, wsize: i32) -> bool {
         let free = |vm: &Self| {
             (VMEM_LENGTH as i32)
                 .wrapping_add(vm.stack)
