@@ -8,9 +8,11 @@ build-std-features = ["optimize_for_size"]
 # A panic is an undefined instruction where it happens, with no message
 # built nor location kept (3 KB of the flash): the processor's vector
 # for it says PANIC on the serial port and stops, as the panic handler
-# did (see src/start.rs).
+# did (see src/start.rs). The linker folds the functions that came out
+# identical (nothing compares function addresses).
 [target.thumbv4t-none-eabi]
 rustflags = [
     "-Z", "unstable-options", "-C", "panic=immediate-abort",
-    "-C", "link-arg=-Tlink.x", "-C", "link-arg=--gc-sections", "-C", "link-arg=-Map=lapin.map",
+    "-C", "link-arg=-Tlink.x", "-C", "link-arg=--gc-sections", "-C", "link-arg=--icf=all",
+    "-C", "link-arg=-Map=lapin.map",
 ]

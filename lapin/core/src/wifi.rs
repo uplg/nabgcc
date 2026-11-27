@@ -291,6 +291,13 @@ fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
 
+/// Whether two addresses are the same: a call, not six comparisons
+/// at each of the many places that ask.
+#[inline(never)]
+fn same(a: &Mac, b: &Mac) -> bool {
+    a == b
+}
+
 fn mac_at(b: &[u8], at: usize) -> Mac {
     let mut m = [0u8; 6];
     m.copy_from_slice(&b[at..at + 6]);
@@ -484,7 +491,7 @@ impl Station {
 
     /// Fill in the duration and send `tx[..len]` as a management frame
     /// at the lowest rate, protected in software if `protect`.
-    fn send_management(&mut self, link: &mut dyn Link, len: usize, protect: bool) -> bool {
+    fn send_management(&mut self, link: &mut impl Link, len: usize, protect: bool) -> bool {
         let (units, rate) = mask_rate(self.lowest_txrate);
         let mut len = len;
         if protect {
@@ -507,7 +514,7 @@ impl Station {
         link.transmit(&self.tx[..len], &tx)
     }
 
-    fn send_auth(&mut self, link: &mut dyn Link, to: &Mac, algorithm: u16, seq: u16, status: u16) {
+    fn send_auth(&mut self, link: &mut impl Link, to: &Mac, algorithm: u16, seq: u16, status: u16) {
         let own = link.mac();
         let bssid = self.bssid;
         let at = self.header(&own, 0xB0, 0, to, &bssid);
@@ -519,81 +526,41 @@ impl Station {
 
     /// The RSN (or WPA) element we offer, the same in the association
     /// request and in message 2: the access point compares them.
-    fn own_element(&self, out: &mut [u8]) -> usize {
+    fn own_element(&self, out: &mut [u8; 40]) -> usize {
+        const WPA: [u8; 24] = [
+            0xDD, 22, 0x00, 0x50, 0xF2, 0x01, 0x01, 0x00, 0x00, 0x50, 0xF2, 0, 1, 0, 0x00, 0x50,
+            0xF2, 0, 1, 0, 0x00, 0x50, 0xF2, 2,
+        ];
+        const RSN: [u8; 22] = [
+            48, 20, 1, 0, 0x00, 0x0F, 0xAC, 0, 1, 0, 0x00, 0x0F, 0xAC, 0, 1, 0, 0x00, 0x0F, 0xAC,
+            2, 0, 0,
+        ];
+        // Management frames protected, and required.
+        const SAE: [u8; 22] = [
+            48, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC,
+            8, 0xC0, 0x00,
+        ];
         match self.security {
             Security::Psk {
                 wpa2: false,
                 group,
                 pairwise,
             } => {
-                let p = pairwise.unwrap_or(Cipher::Tkip) as u8;
-                let e = [
-                    0xDD,
-                    22,
-                    0x00,
-                    0x50,
-                    0xF2,
-                    0x01,
-                    0x01,
-                    0x00,
-                    0x00,
-                    0x50,
-                    0xF2,
-                    group as u8,
-                    1,
-                    0,
-                    0x00,
-                    0x50,
-                    0xF2,
-                    p,
-                    1,
-                    0,
-                    0x00,
-                    0x50,
-                    0xF2,
-                    2,
-                ];
-                out[..24].copy_from_slice(&e);
+                out[..24].copy_from_slice(&WPA);
+                out[11] = group as u8;
+                out[17] = pairwise.unwrap_or(Cipher::Tkip) as u8;
                 24
             }
             Security::Psk {
                 group, pairwise, ..
             } => {
-                let p = pairwise.unwrap_or(Cipher::Ccmp) as u8;
-                let e = [
-                    48,
-                    20,
-                    1,
-                    0,
-                    0x00,
-                    0x0F,
-                    0xAC,
-                    group as u8,
-                    1,
-                    0,
-                    0x00,
-                    0x0F,
-                    0xAC,
-                    p,
-                    1,
-                    0,
-                    0x00,
-                    0x0F,
-                    0xAC,
-                    2,
-                    0,
-                    0,
-                ];
-                out[..22].copy_from_slice(&e);
+                out[..22].copy_from_slice(&RSN);
+                out[7] = group as u8;
+                out[13] = pairwise.unwrap_or(Cipher::Ccmp) as u8;
                 22
             }
             Security::Sae { .. } => {
-                // Management frames protected, and required.
-                let e = [
-                    48, 20, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F,
-                    0xAC, 8, 0xC0, 0x00,
-                ];
-                out[..22].copy_from_slice(&e);
+                out[..22].copy_from_slice(&SAE);
                 match self.pmksa.filter(|_| self.cached) {
                     // The cached exchange, named by its PMKID.
                     Some((_, _, pmkid)) => {
@@ -609,7 +576,7 @@ impl Station {
         }
     }
 
-    fn associate(&mut self, link: &mut dyn Link) {
+    fn associate(&mut self, link: &mut impl Link) {
         let own = link.mac();
         let (ap, bssid) = (self.ap, self.bssid);
         let mut at = self.header(&own, 0x00, 0, &ap, &bssid);
@@ -641,7 +608,7 @@ impl Station {
     /// `netSetmode`: 0 joins networks, 1 is an access point named `ssid`
     /// on `channel`.
     #[inline(never)]
-    pub fn set_mode(&mut self, link: &mut dyn Link, master: bool, ssid: &[u8], channel: u8) {
+    pub fn set_mode(&mut self, link: &mut impl Link, master: bool, ssid: &[u8], channel: u8) {
         if !master {
             self.state = State::Idle;
             self.mode = Mode::Managed;
@@ -681,7 +648,7 @@ impl Station {
     }
 
     /// A beacon (0x80) or probe response (0x50) of our access point.
-    fn beacon_like(&mut self, link: &mut dyn Link, fc0: u8, to: &Mac) -> usize {
+    fn beacon_like(&mut self, link: &mut impl Link, fc0: u8, to: &Mac) -> usize {
         let own = link.mac();
         let bssid = self.bssid;
         let mut at = self.header(&own, fc0, 0, to, &bssid);
@@ -702,7 +669,7 @@ impl Station {
     #[inline(never)]
     pub fn scan(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         ssid: Option<&[u8]>,
         buffer: &mut [u8],
         found: &mut dyn FnMut(&ScanResult),
@@ -841,7 +808,7 @@ impl Station {
             let slot = self
                 .offers
                 .iter()
-                .position(|o| o.bssid == offer.bssid)
+                .position(|o| same(&o.bssid, &offer.bssid))
                 .unwrap_or_else(|| {
                     self.next_offer = (self.next_offer + 1) % OFFERS;
                     self.next_offer
@@ -859,7 +826,7 @@ impl Station {
     #[inline(never)]
     pub fn auth(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         ssid: &[u8],
         mac: &Mac,
         bssid: &Mac,
@@ -883,7 +850,7 @@ impl Station {
         self.soft = None;
         self.sae = None;
         self.retry_assoc_at = None;
-        let offer = self.offers.iter().find(|o| o.bssid == *bssid).copied();
+        let offer = self.offers.iter().find(|o| same(&o.bssid, bssid)).copied();
         let none = [0u8; 8];
         self.security = match encryption & 0xF0 {
             CRYPT_NONE => {
@@ -1041,7 +1008,7 @@ impl Station {
     #[inline(never)]
     pub fn send(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         data: &[u8],
         destination: &Mac,
         low_rate: bool,
@@ -1148,7 +1115,7 @@ impl Station {
     /// Every couple of hundred milliseconds, from the main loop: time
     /// out what did not answer, age the stations of the access point.
     #[inline(never)]
-    pub fn tick(&mut self, link: &mut dyn Link) {
+    pub fn tick(&mut self, link: &mut impl Link) {
         if self.mode == Mode::Managed {
             if self.timeout > 0 {
                 self.timeout -= 1;
@@ -1179,7 +1146,7 @@ impl Station {
     /// As often as possible: what waits on a clock (an association to
     /// try again after the access point said to come back).
     #[inline(never)]
-    pub fn poll(&mut self, link: &mut dyn Link) {
+    pub fn poll(&mut self, link: &mut impl Link) {
         if let Some(at) = self.retry_assoc_at
             && (link.millis().wrapping_sub(at) as i32) >= 0
         {
@@ -1195,7 +1162,7 @@ impl Station {
     /// A frame from the stick, in `frame[..rx.len]` (the buffer may be
     /// changed). Returns the data to hand up, if any.
     #[inline(never)]
-    pub fn input(&mut self, link: &mut dyn Link, frame: &mut [u8], rx: Rx) -> Option<Delivery> {
+    pub fn input(&mut self, link: &mut impl Link, frame: &mut [u8], rx: Rx) -> Option<Delivery> {
         if self.state == State::Idle || rx.len < 10 {
             return None;
         }
@@ -1210,7 +1177,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn input_management(&mut self, link: &mut dyn Link, frame: &mut [u8], rx: Rx) {
+    fn input_management(&mut self, link: &mut impl Link, frame: &mut [u8], rx: Rx) {
         let len = rx.len;
         if len < 24 || frame[1] & 3 != 0 {
             return;
@@ -1218,10 +1185,14 @@ impl Station {
         let own = link.mac();
         let (a1, a2, a3) = (mac_at(frame, 4), mac_at(frame, 10), mac_at(frame, 16));
         let managed = self.mode == Mode::Managed;
-        if managed && self.state == State::Run && a2 == self.ap {
+        // Each address compared once (nothing below changes them).
+        let to_us = same(&a1, &own);
+        let sent_by_ap = same(&a2, &self.ap);
+        let our_bss = same(&a3, &self.bssid);
+        if managed && self.state == State::Run && sent_by_ap {
             self.rssi_sample(rx.rssi as i16);
         }
-        let from_ap = a1 == own && a2 == self.ap && a3 == self.bssid;
+        let from_ap = to_us && sent_by_ap && our_bss;
         let subtype = frame[0] & 0xF0;
         match subtype {
             0x40 if !managed => {
@@ -1250,7 +1221,7 @@ impl Station {
                 }
             }
             0x50 | 0x80 => {
-                if managed && self.state == State::Run && a2 == self.ap && a3 == self.bssid {
+                if managed && self.state == State::Run && sent_by_ap && our_bss {
                     self.timeout = RUN_TIMEOUT;
                 }
             }
@@ -1279,12 +1250,12 @@ impl Station {
                     } else {
                         self.input_shared_auth(link, algorithm, seq, status, frame, len);
                     }
-                } else if a1 == own && a3 == self.bssid {
+                } else if to_us && our_bss {
                     self.accept_auth(link, &a2, algorithm, seq, status);
                 }
             }
             0x00 if !managed => {
-                if a1 != own || a3 != self.bssid {
+                if !to_us || !our_bss {
                     return;
                 }
                 if let Some(i) = self.peer(&a2) {
@@ -1334,17 +1305,17 @@ impl Station {
             }
             0xA0 | 0xC0 => {
                 if managed {
-                    if self.state == State::Idle || a2 != self.ap || a3 != self.bssid {
+                    if self.state == State::Idle || !sent_by_ap || !our_bss {
                         return;
                     }
-                    if self.soft.is_some() && !self.trusted_management(frame, len, a1 == own) {
+                    if self.soft.is_some() && !self.trusted_management(frame, len, to_us) {
                         return;
                     }
-                    if a1 == own || self.soft.is_some() {
+                    if to_us || self.soft.is_some() {
                         self.state = State::Idle;
                     }
-                } else if a1 == own
-                    && a3 == self.bssid
+                } else if to_us
+                    && our_bss
                     && let Some(i) = self.peer(&a2)
                 {
                     if subtype == 0xA0 {
@@ -1396,7 +1367,7 @@ impl Station {
     /// An action frame from the access point: an SA Query gets its
     /// answer.
     #[inline(never)]
-    fn input_action(&mut self, link: &mut dyn Link, frame: &mut [u8], len: usize) {
+    fn input_action(&mut self, link: &mut impl Link, frame: &mut [u8], len: usize) {
         if self.soft.is_none() || frame[1] & 0x40 == 0 || !self.trusted_management(frame, len, true)
         {
             return;
@@ -1414,7 +1385,7 @@ impl Station {
     #[inline(never)]
     fn input_shared_auth(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         algorithm: u16,
         seq: u16,
         status: u16,
@@ -1477,13 +1448,13 @@ impl Station {
     fn peer(&self, mac: &Mac) -> Option<usize> {
         self.peers
             .iter()
-            .position(|p| p.state != State::Idle && p.mac == *mac)
+            .position(|p| p.state != State::Idle && same(&p.mac, mac))
     }
 
     #[inline(never)]
     fn accept_auth(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         sta: &Mac,
         algorithm: u16,
         seq: u16,
@@ -1515,7 +1486,7 @@ impl Station {
         self.send_auth(link, sta, 0, 2, 0);
     }
 
-    fn send_association_response(&mut self, link: &mut dyn Link, sta: &Mac, id: u16) {
+    fn send_association_response(&mut self, link: &mut impl Link, sta: &Mac, id: u16) {
         let own = link.mac();
         let bssid = self.bssid;
         let at = self.header(&own, 0x10, 0, sta, &bssid);
@@ -1526,7 +1497,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn input_data(&mut self, link: &mut dyn Link, frame: &mut [u8], rx: Rx) -> Option<Delivery> {
+    fn input_data(&mut self, link: &mut impl Link, frame: &mut [u8], rx: Rx) -> Option<Delivery> {
         if self.state != State::Eapol && self.state != State::Run {
             return None;
         }
@@ -1538,23 +1509,23 @@ impl Station {
         let (a1, a2, a3) = (mac_at(frame, 4), mac_at(frame, 10), mac_at(frame, 16));
         let direction = frame[1] & 3;
         let (source, destination) = if direction == 2 && self.mode == Mode::Managed {
-            if a1 != own && a1 != BROADCAST && a1[..3] != MULTICAST {
+            if !same(&a1, &own) && !same(&a1, &BROADCAST) && a1[..3] != MULTICAST {
                 return None;
             }
-            if a2 != self.bssid {
+            if !same(&a2, &self.bssid) {
                 return None;
             }
             self.rssi_sample(rx.rssi as i16);
             (a3, a1)
         } else if direction == 1 && self.mode == Mode::Master {
-            if a1 != self.bssid {
+            if !same(&a1, &self.bssid) {
                 return None;
             }
             let i = self
                 .peer(&a2)
                 .filter(|i| self.peers[*i].state == State::Run)?;
             self.peers[i].timer = STA_MAX_IDLE;
-            if a3 != own && a3 != BROADCAST && a3[..3] != MULTICAST {
+            if !same(&a3, &own) && !same(&a3, &BROADCAST) && a3[..3] != MULTICAST {
                 return None;
             }
             (a2, a3)
@@ -1626,7 +1597,7 @@ impl Station {
                 })
             }
             0x40 => {
-                if self.mode == Mode::Managed && source == self.ap {
+                if self.mode == Mode::Managed && same(&source, &self.ap) {
                     let ap = self.ap;
                     self.send(link, &[], &ap, true);
                 }
@@ -1655,7 +1626,7 @@ impl Station {
     }
 
     /// Drop the cached key and run the password exchange after all.
-    fn forget_cached(&mut self, link: &mut dyn Link, h2e: bool) {
+    fn forget_cached(&mut self, link: &mut impl Link, h2e: bool) {
         self.pmksa = None;
         self.cached = false;
         self.state = State::Auth;
@@ -1683,7 +1654,7 @@ impl Station {
 
     /// Build, sign and send an EAPOL-Key frame.
     #[inline(never)]
-    fn send_key(&mut self, link: &mut dyn Link, info: u16, nonce: &[u8; 32], data: &[u8]) {
+    fn send_key(&mut self, link: &mut impl Link, info: u16, nonce: &[u8; 32], data: &[u8]) {
         let mut e = [0u8; 99 + 40];
         let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
         e[0] = 1;
@@ -1706,7 +1677,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn input_eapol(&mut self, link: &mut dyn Link, body: &mut [u8]) {
+    fn input_eapol(&mut self, link: &mut impl Link, body: &mut [u8]) {
         let f = &mut body[8..];
         if f.len() < 99 || (f[0] != 1 && f[0] != 2) || f[1] != 3 || (f[4] != 0xFE && f[4] != 0x02) {
             return;
@@ -1742,7 +1713,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn message_1(&mut self, link: &mut dyn Link, f: &[u8], info: u16) {
+    fn message_1(&mut self, link: &mut impl Link, f: &[u8], info: u16) {
         // On a running link: a new pairwise key (the access point's
         // periodic rekey), used once the handshake is through.
         let rekey =
@@ -1817,7 +1788,7 @@ impl Station {
 
     /// Put `self.ptk`'s temporal key to use: in the stick, or (WPA3) in
     /// the firmware's own keys, keeping the group keys on a rekey.
-    fn install_pairwise(&mut self, link: &mut dyn Link, keep_group: bool) {
+    fn install_pairwise(&mut self, link: &mut impl Link, keep_group: bool) {
         let none = [0u8; 8];
         let mut tk = [0u8; 16];
         tk.copy_from_slice(&self.ptk[32..48]);
@@ -1887,7 +1858,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn message_3(&mut self, link: &mut dyn Link, f: &mut [u8]) {
+    fn message_3(&mut self, link: &mut impl Link, f: &mut [u8]) {
         if self.next_ptk.is_some() && matches!(self.keys, KeyState::Group | KeyState::Run) {
             return self.rekey_message_3(link, f);
         }
@@ -1921,7 +1892,7 @@ impl Station {
 
     /// Message 3 of a rekey: message 4 leaves under the current key,
     /// then the new one takes over.
-    fn rekey_message_3(&mut self, link: &mut dyn Link, f: &mut [u8]) {
+    fn rekey_message_3(&mut self, link: &mut impl Link, f: &mut [u8]) {
         if f[17..49] != self.anonce || !self.check_mic(f) {
             return;
         }
@@ -1949,7 +1920,7 @@ impl Station {
     /// Install the group key (and, on WPA3, the integrity group key)
     /// from a list of key data elements. False if there was none.
     #[inline(never)]
-    fn install_group_keys(&mut self, link: &mut dyn Link, plain: &[u8]) -> bool {
+    fn install_group_keys(&mut self, link: &mut impl Link, plain: &[u8]) -> bool {
         let mut found = false;
         for (id, e) in elements(plain) {
             if id != 0xDD || e.len() < 4 || e[..3] != [0x00, 0x0F, 0xAC] {
@@ -1978,7 +1949,7 @@ impl Station {
         found
     }
 
-    fn install_gtk(&mut self, link: &mut dyn Link, index: u8, key: &[u8]) -> bool {
+    fn install_gtk(&mut self, link: &mut impl Link, index: u8, key: &[u8]) -> bool {
         let group = match self.security {
             Security::Psk { group, .. } => group,
             _ => Cipher::Ccmp,
@@ -2006,7 +1977,7 @@ impl Station {
     }
 
     #[inline(never)]
-    fn group_message(&mut self, link: &mut dyn Link, f: &mut [u8], info: u16) {
+    fn group_message(&mut self, link: &mut impl Link, f: &mut [u8], info: u16) {
         if self.keys != KeyState::Group && self.keys != KeyState::Run {
             return;
         }
@@ -2042,7 +2013,7 @@ impl Station {
     // ---- WPA3: the password exchange --------------------------------------
 
     #[inline(never)]
-    fn sae_commit(&mut self, link: &mut dyn Link, h2e: bool) {
+    fn sae_commit(&mut self, link: &mut impl Link, h2e: bool) {
         let own = link.mac();
         let password_len = self.password_len;
         let password = self.password;
@@ -2096,7 +2067,7 @@ impl Station {
 
     /// An authentication frame with `body`; `token` goes where the
     /// access point wants it (after the group, or in a container).
-    fn send_sae(&mut self, link: &mut dyn Link, body: &[u8], token: &[u8]) {
+    fn send_sae(&mut self, link: &mut impl Link, body: &[u8], token: &[u8]) {
         let own = link.mac();
         let (ap, bssid) = (self.ap, self.bssid);
         let at = self.header(&own, 0xB0, 0, &ap, &bssid);
@@ -2123,7 +2094,7 @@ impl Station {
     #[inline(never)]
     fn input_sae(
         &mut self,
-        link: &mut dyn Link,
+        link: &mut impl Link,
         algorithm: u16,
         seq: u16,
         status: u16,

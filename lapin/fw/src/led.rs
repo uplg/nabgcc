@@ -14,8 +14,8 @@ pub const MIDDLE: usize = 2;
 pub const RIGHT: usize = 3;
 pub const BOTTOM: usize = 4;
 
-/// Where each led sits in the driver's chain.
-const CHANNEL: [usize; 5] = [4, 2, 0, 3, 1];
+/// The led at each place of the driver's chain (the nose is last).
+const LED_AT: [usize; 5] = [MIDDLE, BOTTOM, LEFT, RIGHT, NOSE];
 
 /// From an 8-bit colour component to a current setting: eyes do not
 /// see brightness linearly.
@@ -65,23 +65,23 @@ pub fn set(led: usize, colour: u32) {
         let mut all = SETTINGS.0.get();
         all[led % 5] = rgb;
         SETTINGS.0.set(all);
-        // Pack fifteen 7-bit fields into fourteen bytes.
-        let mut bytes = [0u8; 14];
-        for (led, rgb) in all.iter().enumerate() {
-            for (component, value) in rgb.iter().enumerate() {
-                let first = (CHANNEL[led] * 3 + component) * 7;
-                for bit in 0..7 {
-                    if value >> (6 - bit) & 1 != 0 {
-                        bytes[(first + bit) / 8] |= 0x80 >> ((first + bit) % 8);
-                    }
+        board::port2_set(board::LED_MODE);
+        board::port4_clear(board::LED_LATCH);
+        // Fifteen 7-bit fields in fourteen bytes, in the chain's order,
+        // the last seven bits zero.
+        let mut bits = 0u32;
+        let mut held = 0;
+        for led in LED_AT {
+            for value in all[led] {
+                bits = bits << 7 | value as u32;
+                held += 7;
+                if held >= 8 {
+                    held -= 8;
+                    spi::LEDS.transfer((bits >> held) as u8);
                 }
             }
         }
-        board::port2_set(board::LED_MODE);
-        board::port4_clear(board::LED_LATCH);
-        for byte in bytes {
-            spi::LEDS.transfer(byte);
-        }
+        spi::LEDS.transfer((bits << (8 - held)) as u8);
         latch();
     });
 }
