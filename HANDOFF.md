@@ -65,6 +65,16 @@ unfed (an SAE step) against a budget of half its 2.09 s. The first
 measurement found 12.8 KB of stack, 5.4 KB of it a scan array built on
 the stack, and a collection three times slower than the C one's.
 
+**A real hostapd.** `scripts/hostapd-interop.sh`, in a Linux VM (Lima
+here: Docker's kernels lack `mac80211_hwsim`), puts hostapd 2.11 on a
+simulated radio with dnsmasq and a web server, and
+`tools/emu/tests/hostapd.rs` carries frames between that radio and the
+emulated rabbit over generic netlink, as wmediumd does. Open, WPA TKIP,
+WPA2, WPA2/WPA3 transition and WPA3 only all pass: the boot bytecode
+gets its address, fetches the served bytecode and runs it. The access
+point's ciphers there are the kernel's. Not in CI (it needs root and
+the module); run it by hand after touching the station.
+
 **Randomness.** The chip has no generator. SAE's numbers come from a
 pool (`lapin/core/src/rng.rs`) stirred with the volume wheel's noise,
 the arrival times, strengths and first bytes of received frames, and

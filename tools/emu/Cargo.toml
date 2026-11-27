@@ -28,3 +28,7 @@ debug = false
 strip = true
 lto = true
 codegen-units = 1
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tests/hostapd.rs talks to the kernel's simulated radios.
+libc = "0.2"
