@@ -403,7 +403,7 @@ fn the_interpreter_keeps_pace_with_the_c_one() {
         console
             .lines()
             .filter_map(|l| l.strip_prefix('-')?.parse::<u64>().ok())
-            .last()
+            .next_back()
             .unwrap_or_else(|| panic!("no time printed:\n{console}"))
     };
     let (c, rust) = (time(&r3), time(&lapin));
