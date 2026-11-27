@@ -18,8 +18,12 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     lapin_fw::panicked()
 }
 
-/// The bytecode every rabbit starts with, as the r3 firmware carries it.
-static BOOT: &[u8] = include_bytes!("../boot.bc");
+/// The bytecode every rabbit starts with, as the r3 firmware carries it,
+/// packed (`build.rs`): unpacked into `BOOT` at power-on.
+static BOOT_PACKED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.lz"));
+const BOOT_LEN: usize = 28279;
+#[unsafe(link_section = ".xram.boot")]
+static mut BOOT: [u8; BOOT_LEN] = [0; BOOT_LEN];
 
 #[unsafe(link_section = ".vmem")]
 static mut MEMORY: Memory = Memory::new();
@@ -111,7 +115,10 @@ extern "C" fn main() -> ! {
 
     let host = Board::new(stick, station, pool, frame, scan);
     let mut vm = Vm::new(host, memory);
-    vm.boot(BOOT);
+    // SAFETY: taken once, here.
+    let boot = unsafe { &mut *(&raw mut BOOT) };
+    let n = lapin_core::lz::unpack(BOOT_PACKED, boot);
+    vm.boot(&boot[..n]);
     loop {
         vm.main_loop_once();
     }

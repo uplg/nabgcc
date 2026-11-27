@@ -30,3 +30,6 @@ bench = false
 [dependencies]
 lapin-core = { path = "../core" }
 lapin-metal = { path = "../metal" }
+
+[build-dependencies]
+lapin-core = { path = "../core" }

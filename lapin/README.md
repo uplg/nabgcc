@@ -26,7 +26,7 @@ point, on the host.
 board up, starts the USB host and the Wi-Fi stick, then runs the boot
 bytecode (the one the r3 release carries, `fw/src/boot.bc`) on the
 Metal machine, whose calls to the board (`fw/src/host.rs`) go to this
-firmware's drivers and its 802.11 station. 108.6 KB of the 124 KB, the
+firmware's drivers and its 802.11 station. 89.5 KB of the 124 KB, the
 boot bytecode's 27.6 KB included.
 
 It passes the emulator's acceptance tests, the ones written for the C
