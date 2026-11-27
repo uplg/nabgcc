@@ -407,8 +407,10 @@ fn suites(body: &[u8], oui: [u8; 3]) -> Option<(u8, u8, u16, u16)> {
         *at += 2;
         let mut bits = 0u16;
         for _ in 0..n {
-            if let Some(s) = suite(body, *at) {
-                bits |= 1 << (s & 15);
+            // Suites past 15 are none of ours, and must not alias one
+            // that is (SAE-EXT-KEY, 24, is not SAE, 8).
+            if let Some(s) = suite(body, *at).filter(|s| *s < 16) {
+                bits |= 1 << s;
             }
             *at += 4;
             if *at > body.len() {
@@ -859,11 +861,13 @@ impl Station {
         self.retry_assoc_at = None;
         let offer = self.offers.iter().find(|o| same(&o.bssid, bssid)).copied();
         let none = [0u8; 8];
+        // Every key of the last network goes, the group keys too: one
+        // left in its slot would open the next network's broadcasts.
+        for slot in 0..4 {
+            link.set_key(slot, HwCipher::None, &[], &none, &none);
+        }
         self.security = match encryption & 0xF0 {
-            CRYPT_NONE => {
-                link.set_key(0, HwCipher::None, &[], &none, &none);
-                Security::Open
-            }
+            CRYPT_NONE => Security::Open,
             CRYPT_WEP => {
                 // The key's own length decides (the C driver measured the
                 // pointer, and cut every 104-bit key to 40).
@@ -884,7 +888,6 @@ impl Station {
                 self.pmk = [0; 32];
                 let n = key.len().min(32);
                 self.pmk[..n].copy_from_slice(&key[..n]);
-                link.set_key(0, HwCipher::None, &[], &none, &none);
                 self.keys = KeyState::Msg1;
                 self.replay_active = false;
                 let rsn = offer.and_then(|o| o.rsn);
@@ -2511,6 +2514,32 @@ mod tests {
                 assert_eq!(s.state, State::Idle);
             }
         }
+    }
+
+    /// An RSN element offering SAE-EXT-KEY (suite 24) alone: the bit of
+    /// the suite modulo 16 was set, 8, and the station took the network
+    /// for one offering SAE (and 18 for PSK, 2).
+    #[test]
+    fn a_key_management_suite_past_15_aliases_none() {
+        let mut rsn = std::vec![1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4];
+        rsn.extend_from_slice(&[2, 0, 0x00, 0x0F, 0xAC, 24, 0x00, 0x0F, 0xAC, 18, 0, 0]);
+        let (_, _, akm, _) = suites(&rsn, [0x00, 0x0F, 0xAC]).unwrap();
+        assert_eq!(akm, 0);
+    }
+
+    /// Joining a network cleared the stick's key 0 alone: the group
+    /// keys of the last network stayed in slots 1 to 3, and the stick
+    /// kept opening frames with them.
+    #[test]
+    fn joining_clears_every_key_slot() {
+        let mut s = running(WPA2);
+        s.state = State::Idle;
+        let mut air = Air::default();
+        s.auth(&mut air, b"Terrier", &AP, &AP, 6, 1, false, CRYPT_NONE, &[], &[]);
+        let mut cleared: Vec<u8> = air.keys.iter().map(|(i, _)| *i).collect();
+        cleared.sort();
+        assert_eq!(cleared, [0, 1, 2, 3]);
+        assert!(air.keys.iter().all(|(_, k)| k.is_empty()));
     }
 
     /// The access point mode answers an authentication of any sequence
