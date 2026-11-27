@@ -29,6 +29,16 @@ fn button_at_power_on_starts_setup_mode() {
     m.run_until_ms(2000);
     assert_eq!(m.soc.board.leds[LED_NOSE], BLUE);
     m.soc.board.button = false;
+    m.run_until_ms(8000);
+    let beacons_at = |m: &Machine| {
+        m.radio
+            .borrow()
+            .tx
+            .iter()
+            .filter(|f| f.data[0] == 0x80)
+            .count()
+    };
+    let before = beacons_at(&m);
     m.run_until_ms(12_000);
 
     assert!(
@@ -39,8 +49,8 @@ fn button_at_power_on_starts_setup_mode() {
     assert_eq!(m.soc.board.leds, [BLUE; 5]);
     let radio = m.radio.borrow();
     let beacons: Vec<_> = radio.tx.iter().filter(|f| f.data[0] == 0x80).collect();
-    // One every 100 time units of 1.024 ms.
-    let per_second = beacons.len() as f64 / 4.0;
+    // One every 100 time units of 1.024 ms, over the last 4 s.
+    let per_second = (beacons.len() - before) as f64 / 4.0;
     assert!(
         (5.0..=11.0).contains(&per_second),
         "{} beacons",

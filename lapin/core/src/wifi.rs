@@ -101,8 +101,10 @@ const STA_ASSOC_TIMEOUT: u32 = 200;
 const STA_MAX_IDLE: u32 = 3000;
 const MAX_STATIONS: usize = 5;
 const RSSI_SAMPLES: usize = 15;
-/// How long the scan listens on each channel.
-pub const SCAN_DWELL_MS: u32 = 350;
+/// How long the scan listens on each channel: one beacon interval
+/// (102.4 ms) and the time to switch. The C driver stayed 350 ms, which
+/// made every scan last 4.9 s.
+pub const SCAN_DWELL_MS: u32 = 120;
 
 pub const LLC_EAPOL: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
 const MULTICAST: [u8; 3] = [0x01, 0x00, 0x5E];
@@ -735,7 +737,11 @@ impl Station {
                 eiv: 0,
                 timestamp: false,
             };
-            link.transmit(&self.tx[..at], &tx);
+            // Channel 14 is Japan's alone, and only for listening
+            // elsewhere: no probe there.
+            if channel != 14 {
+                link.transmit(&self.tx[..at], &tx);
+            }
             let start = link.millis();
             while link.millis().wrapping_sub(start) < SCAN_DWELL_MS {
                 link.pause();

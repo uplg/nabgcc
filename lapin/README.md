@@ -50,7 +50,10 @@ falls back to the full exchange if the access point forgot it.
 
 On every kind of network it also takes a new pairwise key on a running
 link (the access point's periodic rekey), which the C firmware ignored
-until the access point gave up on it.
+until the access point gave up on it. Its scan listens 120 ms on each
+channel instead of 350 (one beacon interval is 102.4 ms) and sends no
+probe on channel 14, which only Japan allows: garenne is awake 5 s
+after power-on on the emulated rabbit, against 12 s for the C firmware.
 
 What differs from the C on purpose: a new image is written by a RAM
 routine that feeds the watchdog after every word (the C counted on the

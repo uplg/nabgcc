@@ -35,8 +35,10 @@ fn the_firmware_boots_its_bytecode_and_stays_up() {
         "{console}"
     );
     assert!(console.contains("wifi state="), "{console}");
-    // The bytecode's amber: no network found yet.
-    assert_eq!(m.soc.board.leds, [AMBER; 5]);
+    // The bytecode's amber, blinking: no network found yet.
+    let leds = m.soc.board.leds;
+    assert!(leds.iter().all(|l| *l == AMBER || *l == [0; 3]), "{leds:?}");
+    assert!(leds.contains(&AMBER), "{leds:?}");
     assert_eq!(m.soc.ohci.errors, 0);
     let radio = m.radio.borrow();
     assert!(radio.firmware_loaded && radio.rx_enabled);
