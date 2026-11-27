@@ -345,7 +345,7 @@ impl<'m, H: Host> Vm<'m, H> {
     // The memory, word by word. Outside the heap, reads give zero and
     // writes are dropped.
 
-    #[inline(always)]
+    #[inline(never)]
     fn w(&self, i: i32) -> i32 {
         match self.mem.heap.get(i as usize) {
             Some(v) => *v,
@@ -353,7 +353,7 @@ impl<'m, H: Host> Vm<'m, H> {
         }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn set(&mut self, i: i32, v: i32) {
         if let Some(w) = self.mem.heap.get_mut(i as usize) {
             *w = v;
@@ -445,7 +445,7 @@ impl<'m, H: Host> Vm<'m, H> {
         bytes_mut(&mut self.mem.heap)
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn b(&self, off: i32) -> u8 {
         match self.bytes().get(off as usize) {
             Some(v) => *v,
@@ -453,7 +453,7 @@ impl<'m, H: Host> Vm<'m, H> {
         }
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn set_b(&mut self, off: i32, v: u8) {
         if let Some(b) = self.bytes_mut().get_mut(off as usize) {
             *b = v;
@@ -461,7 +461,7 @@ impl<'m, H: Host> Vm<'m, H> {
     }
 
     /// `loaderGetShort`.
-    #[inline(always)]
+    #[inline(never)]
     fn short(&self, off: i32) -> i32 {
         let bytes = self.bytes();
         let o = off as usize;

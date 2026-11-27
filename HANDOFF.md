@@ -38,7 +38,7 @@ passes in the emulator everything the C firmware passes there.
 | 3. 802.11 station and access point: WEP, WPA, WPA2, WPA3 | done, in `lapin/core/src/wifi.rs` |
 | 4. Metal virtual machine, to run the boot bytecode and garenne as they are | done, `lapin/metal`, checked word for word against the C machine (`lapin/cref`) |
 | 5. Resident loader, so a failed update no longer kills the rabbit | not started: needs a decision, see below |
-| 6. Size, soak, then a real rabbit | size 106.8 KB, 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
+| 6. Size, soak, then a real rabbit | size 107.5 KB, 30 minutes of garenne soaked in the emulator; the real rabbit waits for Léonard's go |
 
 Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
@@ -46,14 +46,15 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 106.8
-KB, the boot bytecode's 27.6 KB included: 17 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 107.5
+KB, the boot bytecode's 27.6 KB included: 16.5 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
-**Speed.** The interpreter takes 1.4 times as long as the C one on a
-tight loop (`tests/lapin.rs` fails past 1.5). Most of the gap is the
-machine reaching its memory through a reference where the C uses a
-fixed address; giving `Vm` that address at compile time would close it.
+**Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
+loop of 500 000 opcodes, 0.68 s against 1.26 s on `fib 20`
+(`tests/lapin.rs` fails past 70 % of the C's time). Its hot loop is ARM
+code (`#[instruction_set(arm::a32)]`): Thumb's eight registers could
+not hold the machine's state.
 
 **Randomness.** The chip has no generator. SAE's numbers come from a
 pool (`lapin/core/src/rng.rs`) stirred with the volume wheel's noise,

@@ -361,11 +361,12 @@ mod wpa3 {
     }
 }
 
-/// The interpreter's speed against the C one's, on the same bytecode:
-/// 100 000 turns of a loop of five instructions, timed by the bytecode
-/// itself with `time_ms`, on each firmware.
+/// The interpreter's speed against the C one's, on the same bytecode,
+/// timed by the bytecode itself with `time_ms`, on each firmware: a
+/// loop of five instructions turned 100 000 times, and `fib 20`, the
+/// recursive way (21 891 calls).
 #[test]
-fn the_interpreter_keeps_pace_with_the_c_one() {
+fn the_interpreter_outruns_the_c_one() {
     use nabemu::air::{AccessPoint, Security};
     use nabemu::config::{Config, Wifi};
     use nabemu::lan::{Lan, Response};
@@ -379,13 +380,34 @@ fn the_interpreter_keeps_pace_with_the_c_one() {
     f.extend(metal::int(1));
     f.extend([10, 28, 6, 0]); // sub; goto 6
     f.extend([5, 53, 10, 95, 1]); // drop; time_ms; sub; Iecholn; ret
-    let served = metal::boot_response(&metal::bytecode(&[], &f));
+    let lp = metal::bytecode(&[], &f);
+
+    // Function 0: time_ms; fib 20; drop; time_ms; sub; Iecholn; ret.
+    let main = [53u8, 2, 20, 2, 1, 0, 5, 53, 10, 95, 1];
+    // Function 1, fib n: if n < 2 then n else fib (n-1) + fib (n-2).
+    let fib = [
+        7u8, 0, 2, 2, 24, 29, 11, 0, 7, 0, 1, 7, 0, 2, 1, 10, 2, 1, 0, 7, 0, 2, 2, 10, 2, 1, 0, 9,
+        1,
+    ];
+    let mut code = vec![0u8, 0, 0];
+    code.extend(main);
+    let second = code.len() as u32;
+    code.extend([1u8, 0, 0]);
+    code.extend(fib);
+    let mut fb = 4u32.to_le_bytes().to_vec();
+    fb.extend((code.len() as u32).to_le_bytes());
+    fb.extend(&code);
+    fb.extend(2u16.to_le_bytes());
+    fb.extend(0u32.to_le_bytes());
+    fb.extend(second.to_le_bytes());
+
     let r3 = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../artifacts/Nab-wpa23-gtk-r3.sim"
     ))
     .unwrap();
-    let time = |image: &[u8]| {
+    let time = |image: &[u8], bytecode: &[u8]| {
+        let served = metal::boot_response(bytecode);
         let mut m = Machine::from_file(image).0;
         Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
         m.air.push(AccessPoint::new(
@@ -395,7 +417,6 @@ fn the_interpreter_keeps_pace_with_the_c_one() {
             Security::Open,
         ));
         let mut lan = Lan::new();
-        let served = served.clone();
         lan.handler = Box::new(move |_| Response::ok(served.clone()));
         m.lan = Some(lan);
         m.run_until_ms(40_000);
@@ -406,7 +427,9 @@ fn the_interpreter_keeps_pace_with_the_c_one() {
             .next_back()
             .unwrap_or_else(|| panic!("no time printed:\n{console}"))
     };
-    let (c, rust) = (time(&r3), time(&lapin));
-    eprintln!("the loop takes {c} ms on r3, {rust} ms on lapin");
-    assert!(rust * 2 < c * 3, "{rust} ms against {c} ms");
+    for (name, bytecode) in [("loop", &lp), ("fib 20", &fb)] {
+        let (c, rust) = (time(&r3, bytecode), time(&lapin, bytecode));
+        eprintln!("{name}: {c} ms on r3, {rust} ms on lapin");
+        assert!(rust * 10 <= c * 7, "{name}: {rust} ms against {c} ms");
+    }
 }

@@ -197,7 +197,7 @@ impl<H: Host> Vm<'_, H> {
     /// The rare case of `check`: collect, and break if still short.
     #[cold]
     #[inline(never)]
-    fn check_slow(&mut self, wsize: i32) -> bool {
+    pub(crate) fn check_slow(&mut self, wsize: i32) -> bool {
         let free = |vm: &Self| {
             (VMEM_LENGTH as i32)
                 .wrapping_add(vm.stack)
@@ -281,7 +281,7 @@ impl<H: Host> Vm<'_, H> {
     }
 
     /// `vmemPush`.
-    #[inline]
+    #[inline(never)]
     pub(crate) fn push(&mut self, v: i32) -> bool {
         self.stack = self.stack.wrapping_sub(1);
         self.set_top(self.stack, v);

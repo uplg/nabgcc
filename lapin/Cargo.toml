@@ -21,5 +21,7 @@ overflow-checks = false
 [profile.release.package.lapin-p256]
 opt-level = 2
 
+# The machine is built for speed: at "s" or "z" its hot loop takes five
+# times as long, for 160 bytes saved.
 [profile.release.package.lapin-metal]
 opt-level = 2

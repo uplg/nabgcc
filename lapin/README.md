@@ -26,7 +26,7 @@ point, on the host.
 board up, starts the USB host and the Wi-Fi stick, then runs the boot
 bytecode (the one the r3 release carries, `fw/src/boot.bc`) on the
 Metal machine, whose calls to the board (`fw/src/host.rs`) go to this
-firmware's drivers and its 802.11 station. 106.8 KB of the 124 KB, the
+firmware's drivers and its 802.11 station. 107.5 KB of the 124 KB, the
 boot bytecode's 27.6 KB included.
 
 It passes the emulator's acceptance tests, the ones written for the C
@@ -48,9 +48,13 @@ wait an access point asks for after a restart.
 
 What differs from the C on purpose: a new image is written by a RAM
 routine that feeds the watchdog after every word (the C counted on the
-whole rewrite fitting in 2.09 s), and the interpreter takes 1.4 times
-as long as the C one on a tight loop (2.4 s against 1.7 s for 500 000
-instructions; `tools/emu/tests/lapin.rs` fails past 1.5).
+whole rewrite fitting in 2.09 s), and the interpreter is faster: its
+hot loop, in ARM code, keeps the machine's stack and memory in
+registers, runs the frequent opcodes itself and sends the others to a
+cold side that follows the C step by step; the watchdog is fed every
+256 opcodes. On the emulated rabbit a loop of 500 000 opcodes takes
+1.0 s against the C's 1.7 s, `fib 20` 0.68 s against 1.26 s
+(`tools/emu/tests/lapin.rs` fails past 70 % of the C's time).
 
 `selftest` exercises the other drivers one by one: both ears (it
 counts the teeth of a full turn), the tag reader, the settings sector
