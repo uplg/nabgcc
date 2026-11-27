@@ -1,0 +1,586 @@
+//! Programs for comparing the two machines: random, but such that the
+//! C machine stays inside its memory (it reads and writes wherever a
+//! bytecode points it, which this one does not, by design).
+//!
+//! The main function works on sixteen typed locals: integers,
+//! strings, tables of known sizes, and values of unknown kind (what a
+//! table held), which are only printed as numbers or stored. Indexes
+//! and lengths are small constants; every other value may be
+//! anything. Blocks are skipped by `ELSE` or repeated by a counted
+//! loop; inside them, locals keep their kind.
+
+use lapin_metal::op::*;
+
+use crate::input::Input;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Int,
+    Str,
+    /// A table of this many words.
+    Tab(u8),
+    Any,
+}
+
+const LOCALS: usize = 16;
+
+struct Gen<'a, 'b> {
+    input: &'a mut Input<'b>,
+    code: Vec<u8>,
+    locals: [Kind; LOCALS],
+    /// Locals a loop counts with: not to be written.
+    reserved: u32,
+    depth: u32,
+    globals: usize,
+    /// This function's number, and how many there are: a function
+    /// calls only those after it (no recursion, so no end to wait for).
+    fun: usize,
+    funs: usize,
+}
+
+const INTS: [i32; 12] = [
+    0,
+    1,
+    -1,
+    2,
+    7,
+    -7,
+    255,
+    0x3FFF_FFFF,
+    -0x4000_0000,
+    12345,
+    31,
+    48,
+];
+
+impl Gen<'_, '_> {
+    fn op(&mut self, o: i32) {
+        self.code.push(o as u8);
+    }
+
+    fn int(&mut self, v: i32) {
+        if (0..256).contains(&v) {
+            self.code.extend([INTB as u8, v as u8]);
+        } else {
+            self.code.push(INT as u8);
+            self.code.extend(v.to_le_bytes());
+        }
+    }
+
+    fn get(&mut self, i: usize) {
+        self.code.extend([GETLOCALB as u8, i as u8]);
+    }
+
+    fn set(&mut self, i: usize) {
+        self.code.extend([SETLOCALB as u8, i as u8]);
+    }
+
+    /// A small number, for an index or a length.
+    fn small(&mut self) -> i32 {
+        match self.input.u8() % 8 {
+            0 => -1,
+            1 => 0,
+            2 => 1,
+            _ => self.input.u8() as i32 % 40,
+        }
+    }
+
+    fn any_int(&mut self) -> i32 {
+        let b = self.input.u8();
+        if b < 192 {
+            INTS[b as usize % INTS.len()]
+        } else {
+            (self.input.u32() as i32) >> 1
+        }
+    }
+
+    /// A local of `kind` (any table for `Tab(0)`), if there is one.
+    fn pick(&mut self, want: fn(Kind) -> bool) -> Option<usize> {
+        let start = self.input.u8() as usize;
+        (0..LOCALS)
+            .map(|k| (start + k) % LOCALS)
+            .find(|&i| want(self.locals[i]))
+    }
+
+    /// Where a result of `kind` goes: a local free to take it.
+    fn dest(&mut self, kind: Kind) -> Option<usize> {
+        let start = self.input.u8() as usize;
+        (0..LOCALS)
+            .map(|k| (start + k) % LOCALS)
+            .find(|&i| self.reserved & 1 << i == 0 && (self.depth == 0 || self.locals[i] == kind))
+    }
+
+    fn store(&mut self, kind: Kind) {
+        match self.dest(kind) {
+            Some(i) => {
+                self.set(i);
+                self.locals[i] = kind;
+            }
+            None => self.op(DROP),
+        }
+    }
+
+    fn int_local(&mut self) -> Option<usize> {
+        self.pick(|k| k == Kind::Int)
+    }
+
+    fn str_local(&mut self) -> Option<usize> {
+        self.pick(|k| k == Kind::Str)
+    }
+
+    fn statement(&mut self) {
+        let choice = self.input.u8() % 37;
+        match choice {
+            0 => {
+                let v = self.any_int();
+                self.int(v);
+                self.store(Kind::Int);
+            }
+            1..=4 => {
+                let (Some(a), Some(b)) = (self.int_local(), self.int_local()) else {
+                    return;
+                };
+                const OPS: [i32; 14] = [
+                    ADD, SUB, MUL, AND, OR, EOR, EQ, NE, LT, GT, LE, GE, MAX, MIN,
+                ];
+                let o = OPS[self.input.u8() as usize % OPS.len()];
+                self.get(a);
+                self.get(b);
+                self.op(o);
+                self.store(Kind::Int);
+            }
+            5 => {
+                let Some(a) = self.int_local() else { return };
+                self.get(a);
+                // By zero (or by more than 31) the host differs from the
+                // rabbit: lapin-metal's own tests pin those.
+                match self.input.u8() % 4 {
+                    0 => {
+                        let d = [3, -2, 7, 1000, -1][self.input.u8() as usize % 5];
+                        self.int(d);
+                        self.op(DIV);
+                    }
+                    1 => {
+                        let d = [3, -2, 7, 1000, -1][self.input.u8() as usize % 5];
+                        self.int(d);
+                        self.op(MOD);
+                    }
+                    2 => {
+                        let s = self.input.u8() as i32 % 32;
+                        self.int(s);
+                        self.op(SHL);
+                    }
+                    _ => {
+                        let s = self.input.u8() as i32 % 32;
+                        self.int(s);
+                        self.op(SHR);
+                    }
+                }
+                self.store(Kind::Int);
+            }
+            6 => {
+                let Some(a) = self.int_local() else { return };
+                self.get(a);
+                let o = [NEG, NOT, NON, ABS][self.input.u8() as usize % 4];
+                self.op(o);
+                self.store(Kind::Int);
+            }
+            // Printing.
+            7 | 8 => {
+                let Some(a) = self.pick(|k| matches!(k, Kind::Int | Kind::Any)) else {
+                    return;
+                };
+                self.get(a);
+                self.op(if choice == 7 { IECHOLN } else { IECHO });
+                self.op(DROP);
+            }
+            9 | 10 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                self.op(if choice == 9 { SECHOLN } else { SECHO });
+                self.op(DROP);
+            }
+            // Strings.
+            11 => {
+                let Some(a) = self.int_local() else { return };
+                self.get(a);
+                let o = [ITOA, CTOA, ITOH, CTOH, ITOBIN2][self.input.u8() as usize % 5];
+                self.op(o);
+                self.store(Kind::Str);
+            }
+            12 => {
+                let n = self.input.u16() as i32 % 600 - 2;
+                self.int(n);
+                self.op(STRNEW);
+                self.store(Kind::Str);
+            }
+            13 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                self.op(STRLEN);
+                self.store(Kind::Int);
+            }
+            14 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                let n = self.small();
+                self.int(n);
+                self.op(STRGET);
+                self.store(Kind::Int);
+            }
+            15 => {
+                let Some(a) = self.str_local() else { return };
+                let v = self.int_local();
+                self.get(a);
+                let n = self.small();
+                self.int(n);
+                match v {
+                    Some(v) => self.get(v),
+                    None => self.int(65),
+                }
+                self.op(STRSET);
+                self.op(DROP);
+            }
+            16 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                let s = self.small();
+                self.int(s);
+                if self.input.bool() {
+                    self.op(NIL_);
+                } else {
+                    let l = self.small();
+                    self.int(l);
+                }
+                self.op(STRSUB);
+                self.store(Kind::Str);
+            }
+            17 => {
+                let (Some(a), Some(b)) = (self.str_local(), self.str_local()) else {
+                    return;
+                };
+                self.get(a);
+                self.get(b);
+                let o = if self.input.bool() { STRCAT } else { STRCMP };
+                self.op(o);
+                let k = if self.code.last() == Some(&(STRCAT as u8)) {
+                    Kind::Str
+                } else {
+                    Kind::Int
+                };
+                self.store(k);
+            }
+            18 => {
+                // p, index, q, start, len.
+                let (Some(a), Some(b)) = (self.str_local(), self.str_local()) else {
+                    return;
+                };
+                let o = [STRCPY, VSTRCMP, STRFIND, STRFINDREV][self.input.u8() as usize % 4];
+                self.get(a);
+                let i = self.small();
+                if o == STRFINDREV && self.input.bool() {
+                    self.op(NIL_);
+                } else {
+                    self.int(i);
+                }
+                self.get(b);
+                let j = self.small();
+                self.int(j);
+                // VSTRCMP's default length reads past the shorter
+                // string, in the C as here: within the heap, unless
+                // the length itself is large.
+                if o != VSTRCMP && self.input.bool() {
+                    self.op(NIL_);
+                } else {
+                    let l = self.small();
+                    self.int(l);
+                }
+                self.op(o);
+                self.store(if o == STRCPY { Kind::Str } else { Kind::Int });
+            }
+            19 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                let o = if self.input.bool() { ATOI } else { HTOI };
+                self.op(o);
+                self.store(Kind::Int);
+            }
+            20 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                let i = self.small();
+                self.int(i);
+                if self.input.bool() {
+                    self.op(STRGETWORD);
+                    self.store(Kind::Int);
+                } else {
+                    let v = self.any_int();
+                    self.int(v);
+                    self.op(STRPUTWORD);
+                    self.op(DROP);
+                }
+            }
+            // Tables.
+            21 if self.depth == 0 => {
+                let n = self.input.u8() % 12;
+                if self.input.bool() {
+                    self.code.extend([MKTABB as u8, n]);
+                } else {
+                    let v = self.pick(|_| true).unwrap_or(0);
+                    self.get(v);
+                    self.int(n as i32);
+                    self.op(TABNEW);
+                }
+                self.store(Kind::Tab(n));
+            }
+            22 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(_))) else {
+                    return;
+                };
+                self.get(t);
+                let i = self.small();
+                self.int(i);
+                self.op(FETCH);
+                self.store(Kind::Any);
+            }
+            23 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(n) if n > 0)) else {
+                    return;
+                };
+                let Kind::Tab(n) = self.locals[t] else { return };
+                let v = self.pick(|_| true).unwrap_or(0);
+                self.get(t);
+                let i = self.input.u8() % n;
+                self.int(i as i32);
+                self.get(v);
+                self.op(STORE);
+                self.op(DROP);
+            }
+            24 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(_))) else {
+                    return;
+                };
+                self.get(t);
+                self.op(TABLEN);
+                self.store(Kind::Int);
+            }
+            25 => {
+                self.op(GC);
+                self.store(Kind::Int);
+            }
+            26 => {
+                if self.input.bool() {
+                    self.op(RAND);
+                } else {
+                    let v = self.any_int();
+                    self.int(v);
+                    self.op(SRAND);
+                }
+                self.store(Kind::Int);
+            }
+            27 if self.globals > 0 => {
+                let g = self.input.u8() as usize % self.globals;
+                self.code.extend([GETGLOBALB as u8, g as u8]);
+                self.store(Kind::Str);
+            }
+            // The board.
+            28 => {
+                let (a, b) = (self.small(), self.any_int());
+                self.int(a);
+                self.int(b);
+                let o = [LED, MOTORSET][self.input.u8() as usize & 1];
+                self.op(o);
+                self.op(DROP);
+            }
+            // A block skipped, or not.
+            29 | 30 if self.depth < 3 => {
+                let Some(c) = self.int_local() else { return };
+                self.get(c);
+                self.op(ELSE);
+                let at = self.code.len();
+                self.code.extend([0, 0]);
+                self.depth += 1;
+                for _ in 0..self.input.u8() % 6 {
+                    self.statement();
+                }
+                self.depth -= 1;
+                let to = self.code.len() as u16;
+                self.code[at..at + 2].copy_from_slice(&to.to_le_bytes());
+            }
+            // A block repeated.
+            31 if self.depth < 2 => {
+                let Some(c) = self.dest(Kind::Int) else {
+                    return;
+                };
+                let n = self.input.u8() as i32 % 40;
+                self.int(n);
+                self.set(c);
+                self.locals[c] = Kind::Int;
+                let top = self.code.len() as u16;
+                self.get(c);
+                self.op(ELSE);
+                let at = self.code.len();
+                self.code.extend([0, 0]);
+                self.reserved |= 1 << c;
+                self.depth += 1;
+                for _ in 0..self.input.u8() % 6 {
+                    self.statement();
+                }
+                self.depth -= 1;
+                self.reserved &= !(1 << c);
+                self.get(c);
+                self.int(1);
+                self.op(SUB);
+                self.set(c);
+                self.op(GOTO);
+                self.code.extend(top.to_le_bytes());
+                let to = self.code.len() as u16;
+                self.code[at..at + 2].copy_from_slice(&to.to_le_bytes());
+            }
+            // A call: two integers, an integer back.
+            32 | 33 if self.fun + 1 < self.funs => {
+                let (Some(a), Some(b)) = (self.int_local(), self.int_local()) else {
+                    return;
+                };
+                let f = self.fun + 1 + self.input.u8() as usize % (self.funs - self.fun - 1);
+                self.get(a);
+                self.get(b);
+                self.int(f as i32);
+                self.op(EXEC);
+                self.store(Kind::Int);
+            }
+            34 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                let i = self.small();
+                self.int(i);
+                if self.input.bool() {
+                    self.op(NIL_);
+                } else {
+                    let l = self.small();
+                    self.int(l);
+                }
+                let (key, alpha) = (self.any_int(), self.any_int());
+                self.int(key);
+                self.int(alpha);
+                let o = if self.input.bool() { CRYPT } else { UNCRYPT };
+                self.op(o);
+                self.store(Kind::Int);
+            }
+            // A tuple of integers, and its parts.
+            35 => {
+                let n = 1 + self.input.u8() % 4;
+                for _ in 0..n {
+                    match self.int_local() {
+                        Some(a) => self.get(a),
+                        None => self.int(0),
+                    }
+                }
+                self.code.extend([DEFTABB as u8, n]);
+                self.store(Kind::Tab(n));
+            }
+            36 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(n) if n >= 2)) else {
+                    return;
+                };
+                let Kind::Tab(n) = self.locals[t] else { return };
+                self.get(t);
+                match self.input.u8() % 3 {
+                    0 => self.op(HD),
+                    1 => self.op(TL),
+                    _ => {
+                        let k = self.input.u8() % n;
+                        self.code.extend([FETCHB as u8, k]);
+                    }
+                }
+                self.store(Kind::Any);
+            }
+            _ => {}
+        }
+    }
+
+    /// Start the locals from `from` on as something of their kind.
+    fn init(&mut self, from: usize) {
+        for i in from..LOCALS {
+            let kind = match i % 4 {
+                0 | 1 => Kind::Int,
+                2 => Kind::Str,
+                _ => Kind::Tab(2),
+            };
+            match kind {
+                Kind::Int => self.int(INTS[i % INTS.len()]),
+                Kind::Str => {
+                    self.int(i as i32);
+                    self.op(ITOA);
+                }
+                _ => self.code.extend([MKTABB as u8, 2]),
+            }
+            self.set(i);
+            self.locals[i] = kind;
+        }
+    }
+}
+
+/// A whole bytecode: string globals, then one function.
+pub fn program(input: &mut Input) -> Vec<u8> {
+    let mut globals = Vec::new();
+    let nglobals = input.u8() as usize % 4;
+    for _ in 0..nglobals {
+        let s = input.chunk(false);
+        let s = &s[..s.len().min(64)];
+        globals.extend(((s.len() as u32) << 2 | 1).to_le_bytes());
+        globals.extend_from_slice(s);
+    }
+    // The main function, then functions of two integers, made last
+    // first (the main one takes what is left of the input).
+    let funs = 1 + input.u8() as usize % 4;
+    let mut lengths: Vec<usize> = (1..funs).map(|_| input.u8() as usize % 40).collect();
+    lengths.insert(0, 400);
+    let mut made = Vec::new();
+    for (fun, &statements) in lengths.iter().enumerate().rev() {
+        let narg = if fun == 0 { 0 } else { 2 };
+        let mut g = Gen {
+            input: &mut *input,
+            code: Vec::new(),
+            locals: [Kind::Int; LOCALS],
+            reserved: 0,
+            depth: 0,
+            globals: nglobals,
+            fun,
+            funs,
+        };
+        g.init(narg);
+        let mut n = 0;
+        while !g.input.is_empty() && n < statements && g.code.len() < 30_000 {
+            g.statement();
+            n += 1;
+        }
+        if fun == 0 {
+            g.op(NIL_);
+        } else {
+            let r = g.int_local().unwrap_or(0);
+            g.get(r);
+        }
+        g.op(RET);
+        let mut f = vec![narg as u8];
+        f.extend(((LOCALS - narg) as u16).to_le_bytes());
+        // Jumps count from the function's first instruction, after
+        // its header.
+        f.extend(&g.code);
+        made.push((fun, f));
+    }
+    made.sort_by_key(|(fun, _)| *fun);
+    let mut code = Vec::new();
+    let mut table = Vec::new();
+    for (_, f) in made {
+        table.extend((code.len() as u32).to_le_bytes());
+        code.extend(f);
+    }
+    let mut bc = (globals.len() as u32 + 4).to_le_bytes().to_vec();
+    bc.extend(globals);
+    bc.extend((code.len() as u32).to_le_bytes());
+    bc.extend(code);
+    bc.extend((funs as u16).to_le_bytes());
+    bc.extend(table);
+    bc
+}

@@ -1,0 +1,70 @@
+[package]
+name = "lapin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+description = "Fuzz targets for the rabbit's firmware: the radio's parsers and the bytecode machine"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+lapin-core = { path = "../core" }
+lapin-metal = { path = "../metal" }
+lapin-metal-cref = { path = "../cref", optional = true }
+
+[features]
+# The differential target builds the C machine (and the emulator).
+cref = ["dep:lapin-metal-cref"]
+
+# Not a member of the firmware's workspace: it builds for the host only,
+# with the fuzzer's instrumentation.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "station"
+path = "fuzz_targets/station.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sae"
+path = "fuzz_targets/sae.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ccmp"
+path = "fuzz_targets/ccmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lz"
+path = "fuzz_targets/lz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vm"
+path = "fuzz_targets/vm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vm_diff"
+path = "fuzz_targets/vm_diff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["cref"]
