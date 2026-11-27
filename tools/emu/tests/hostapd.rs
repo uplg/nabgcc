@@ -50,7 +50,7 @@ mod hwsim {
         out.extend_from_slice(&((4 + data.len()) as u16).to_ne_bytes());
         out.extend_from_slice(&kind.to_ne_bytes());
         out.extend_from_slice(data);
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push(0);
         }
     }

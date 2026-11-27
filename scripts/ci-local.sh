@@ -22,6 +22,9 @@ fi
 step "emulator: format and lints"
 cargo fmt --check
 cargo clippy --release --all-targets -- -D warnings
+# The CI runs on Linux, where tests/hostapd.rs compiles: lint it here too.
+rustup target add aarch64-unknown-linux-gnu >/dev/null
+cargo clippy --release --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 step "emulator: every test, on r3"
 cargo test --release
 step "the acceptance tests, on lapin"
