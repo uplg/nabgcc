@@ -2317,15 +2317,17 @@ impl Station {
         );
         self.renew_snonce = true;
         self.pmksa_proven = true;
-        self.state = State::Run;
-        self.timeout = RUN_TIMEOUT;
         if wpa1 {
-            // The group key follows in its own handshake.
+            // The group key follows in its own handshake; the link is
+            // up once it is in (before, broadcasts would go unheard,
+            // and the bytecode's first frames raced the group key).
             if self.keys == KeyState::Msg3 {
                 self.keys = KeyState::Group;
             }
             return;
         }
+        self.state = State::Run;
+        self.timeout = RUN_TIMEOUT;
         self.install_group_keys(link, plain, Self::key_rsc(f));
         self.keys = KeyState::Run;
     }
