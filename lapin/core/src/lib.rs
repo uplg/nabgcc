@@ -8,6 +8,7 @@ pub use lapin_p256 as p256;
 
 pub mod aes;
 pub mod ccmp;
+mod hash;
 pub mod md5;
 pub mod rng;
 pub mod sae;

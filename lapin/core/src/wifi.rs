@@ -109,9 +109,11 @@ pub const SCAN_DWELL_MS: u32 = 120;
 pub const LLC_EAPOL: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
 const MULTICAST: [u8; 3] = [0x01, 0x00, 0x5E];
 
-/// The rates every frame we send advertises.
-const RATES: [u8; 10] = [1, 8, 0x02, 0x04, 0x0B, 0x16, 0x24, 0x30, 0x48, 0x6C];
-const XRATES: [u8; 6] = [50, 4, 0x0C, 0x12, 0x18, 0x60];
+/// The rates every frame we send advertises: the supported rates
+/// element, then the extended one.
+const RATES: [u8; 16] = [
+    1, 8, 0x02, 0x04, 0x0B, 0x16, 0x24, 0x30, 0x48, 0x6C, 50, 4, 0x0C, 0x12, 0x18, 0x60,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -296,6 +298,20 @@ fn be16(b: &[u8], at: usize) -> u16 {
 #[inline(never)]
 fn same(a: &Mac, b: &Mac) -> bool {
     a == b
+}
+
+/// Put `bytes` in a frame being built, at `at`; returns where they end.
+#[inline(never)]
+fn put(frame: &mut [u8], at: usize, bytes: &[u8]) -> usize {
+    frame[at..at + bytes.len()].copy_from_slice(bytes);
+    at + bytes.len()
+}
+
+/// Put an element (identifier, length, body); returns where it ends.
+#[inline(never)]
+fn put_element(frame: &mut [u8], at: usize, id: u8, body: &[u8]) -> usize {
+    let at = put(frame, at, &[id, body.len() as u8]);
+    put(frame, at, body)
 }
 
 fn mac_at(b: &[u8], at: usize) -> Mac {
@@ -518,10 +534,11 @@ impl Station {
         let own = link.mac();
         let bssid = self.bssid;
         let at = self.header(&own, 0xB0, 0, to, &bssid);
-        self.tx[at..at + 2].copy_from_slice(&algorithm.to_le_bytes());
-        self.tx[at + 2..at + 4].copy_from_slice(&seq.to_le_bytes());
-        self.tx[at + 4..at + 6].copy_from_slice(&status.to_le_bytes());
-        self.send_management(link, at + 6, false);
+        let [a0, a1] = algorithm.to_le_bytes();
+        let [q0, q1] = seq.to_le_bytes();
+        let [s0, s1] = status.to_le_bytes();
+        let at = put(&mut self.tx, at, &[a0, a1, q0, q1, s0, s1]);
+        self.send_management(link, at, false);
     }
 
     /// The RSN (or WPA) element we offer, the same in the association
@@ -579,22 +596,14 @@ impl Station {
     fn associate(&mut self, link: &mut impl Link) {
         let own = link.mac();
         let (ap, bssid) = (self.ap, self.bssid);
-        let mut at = self.header(&own, 0x00, 0, &ap, &bssid);
+        let at = self.header(&own, 0x00, 0, &ap, &bssid);
         // Capabilities (ESS), listen interval 100.
-        self.tx[at..at + 4].copy_from_slice(&[0x01, 0x00, 0x64, 0x00]);
-        at += 4;
-        self.tx[at] = 0;
-        self.tx[at + 1] = self.ssid_len as u8;
-        let ssid = self.ssid;
-        self.tx[at + 2..at + 2 + self.ssid_len].copy_from_slice(&ssid[..self.ssid_len]);
-        at += 2 + self.ssid_len;
-        self.tx[at..at + 10].copy_from_slice(&RATES);
-        self.tx[at + 10..at + 16].copy_from_slice(&XRATES);
-        at += 16;
+        let at = put(&mut self.tx, at, &[0x01, 0x00, 0x64, 0x00]);
+        let at = put_element(&mut self.tx, at, 0, &self.ssid[..self.ssid_len]);
+        let at = put(&mut self.tx, at, &RATES);
         let mut e = [0u8; 40];
         let n = self.own_element(&mut e);
-        self.tx[at..at + n].copy_from_slice(&e[..n]);
-        at += n;
+        let at = put(&mut self.tx, at, &e[..n]);
         if !self.send_management(link, at, false) {
             self.state = State::Idle;
             return;
@@ -651,16 +660,14 @@ impl Station {
     fn beacon_like(&mut self, link: &mut impl Link, fc0: u8, to: &Mac) -> usize {
         let own = link.mac();
         let bssid = self.bssid;
-        let mut at = self.header(&own, fc0, 0, to, &bssid);
-        self.tx[at..at + 12].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x64, 0, 0x01, 0]);
-        at += 12;
-        self.tx[at] = 0;
-        self.tx[at + 1] = self.ssid_len as u8;
-        let ssid = self.ssid;
-        self.tx[at + 2..at + 2 + self.ssid_len].copy_from_slice(&ssid[..self.ssid_len]);
-        at += 2 + self.ssid_len;
-        self.tx[at..at + 6].copy_from_slice(&[1, 1, 0x82, 3, 1, self.channel]);
-        at + 6
+        let at = self.header(&own, fc0, 0, to, &bssid);
+        let at = put(
+            &mut self.tx,
+            at,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0x64, 0, 0x01, 0],
+        );
+        let at = put_element(&mut self.tx, at, 0, &self.ssid[..self.ssid_len]);
+        put(&mut self.tx, at, &[1, 1, 0x82, 3, 1, self.channel])
     }
 
     /// `netScan`: go through the fourteen channels, asking (for `ssid`,
@@ -682,19 +689,14 @@ impl Station {
         let own = link.mac();
         for channel in 1..=14 {
             link.set_channel(channel);
-            let mut at = self.header(&own, 0x40, 0, &BROADCAST, &BROADCAST);
+            let at = self.header(&own, 0x40, 0, &BROADCAST, &BROADCAST);
             // The network's name, or the wildcard: an empty one. (The C
             // driver left the element out, which the standard forbids.)
             let name = ssid.map_or(&[][..], |s| {
                 &s[..s.iter().position(|b| *b == 0).unwrap_or(s.len()).min(32)]
             });
-            self.tx[at] = 0;
-            self.tx[at + 1] = name.len() as u8;
-            self.tx[at + 2..at + 2 + name.len()].copy_from_slice(name);
-            at += 2 + name.len();
-            self.tx[at..at + 10].copy_from_slice(&RATES);
-            self.tx[at + 10..at + 16].copy_from_slice(&XRATES);
-            at += 16;
+            let at = put_element(&mut self.tx, at, 0, name);
+            let at = put(&mut self.tx, at, &RATES);
             let tx = Tx {
                 rate: 0,
                 ack: true,
@@ -1137,8 +1139,8 @@ impl Station {
                 let own = link.mac();
                 let bssid = self.bssid;
                 let at = self.header(&own, 0xC0, 0, &to, &bssid);
-                self.tx[at..at + 2].copy_from_slice(&2u16.to_le_bytes());
-                self.send_management(link, at + 2, false);
+                let at = put(&mut self.tx, at, &2u16.to_le_bytes());
+                self.send_management(link, at, false);
             }
         }
     }
@@ -1377,8 +1379,8 @@ impl Station {
             let own = link.mac();
             let (ap, bssid) = (self.ap, self.bssid);
             let at = self.header(&own, 0xD0, 0, &ap, &bssid);
-            self.tx[at..at + 4].copy_from_slice(&[8, 1, a, b]);
-            self.send_management(link, at + 4, true);
+            let at = put(&mut self.tx, at, &[8, 1, a, b]);
+            self.send_management(link, at, true);
         }
     }
 
@@ -1405,14 +1407,11 @@ impl Station {
                     self.state = State::Idle;
                     return;
                 };
-                let mut c = [0u8; 128];
-                c.copy_from_slice(challenge);
                 let own = link.mac();
                 let (ap, bssid) = (self.ap, self.bssid);
                 let at = self.header(&own, 0xB0, 0x40, &ap, &bssid);
-                self.tx[at..at + 8].copy_from_slice(&[1, 0, 3, 0, 0, 0, 16, 128]);
-                self.tx[at + 8..at + 136].copy_from_slice(&c);
-                let n = at + 136;
+                let at = put(&mut self.tx, at, &[1, 0, 3, 0, 0, 0]);
+                let n = put_element(&mut self.tx, at, 16, challenge);
                 let Security::Wep { long, .. } = self.security else {
                     return;
                 };
@@ -1490,10 +1489,13 @@ impl Station {
         let own = link.mac();
         let bssid = self.bssid;
         let at = self.header(&own, 0x10, 0, sta, &bssid);
-        self.tx[at..at + 6].copy_from_slice(&[0x01, 0, 0, 0, id as u8, (id >> 8) as u8]);
-        self.tx[at + 6..at + 16].copy_from_slice(&RATES);
-        self.tx[at + 16..at + 22].copy_from_slice(&XRATES);
-        self.send_management(link, at + 22, false);
+        let at = put(
+            &mut self.tx,
+            at,
+            &[0x01, 0, 0, 0, id as u8, (id >> 8) as u8],
+        );
+        let at = put(&mut self.tx, at, &RATES);
+        self.send_management(link, at, false);
     }
 
     #[inline(never)]
@@ -2072,22 +2074,19 @@ impl Station {
         let (ap, bssid) = (self.ap, self.bssid);
         let at = self.header(&own, 0xB0, 0, &ap, &bssid);
         let h2e = matches!(self.security, Security::Sae { h2e: true });
-        let mut n = at;
-        if token.is_empty() || h2e {
-            self.tx[n..n + body.len()].copy_from_slice(body);
-            n += body.len();
-            if !token.is_empty() {
-                self.tx[n..n + 3].copy_from_slice(&[255, 1 + token.len() as u8, 93]);
-                self.tx[n + 3..n + 3 + token.len()].copy_from_slice(token);
-                n += 3 + token.len();
+        let n = if token.is_empty() || h2e {
+            let n = put(&mut self.tx, at, body);
+            if token.is_empty() {
+                n
+            } else {
+                let n = put(&mut self.tx, n, &[255, 1 + token.len() as u8, 93]);
+                put(&mut self.tx, n, token)
             }
         } else {
-            self.tx[n..n + 8].copy_from_slice(&body[..8]);
-            self.tx[n + 8..n + 8 + token.len()].copy_from_slice(token);
-            n += 8 + token.len();
-            self.tx[n..n + body.len() - 8].copy_from_slice(&body[8..]);
-            n += body.len() - 8;
-        }
+            let n = put(&mut self.tx, at, &body[..8]);
+            let n = put(&mut self.tx, n, token);
+            put(&mut self.tx, n, &body[8..])
+        };
         self.send_management(link, n, false);
     }
 

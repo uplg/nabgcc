@@ -1,6 +1,8 @@
 //! MD5 and HMAC-MD5, for the integrity code of WPA's (TKIP) handshake,
 //! and RC4, which carries its group key.
 
+use crate::hash::{Engine, Keyed};
+
 const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
 
 fn k(i: usize) -> u32 {
@@ -19,13 +21,14 @@ fn k(i: usize) -> u32 {
     K[i]
 }
 
+const START: Engine = Engine::new(
+    [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0, 0, 0, 0],
+    compress,
+    false,
+);
+
 #[derive(Clone)]
-pub struct Md5 {
-    state: [u32; 4],
-    block: [u8; 64],
-    filled: usize,
-    length: u64,
-}
+pub struct Md5(Engine);
 
 impl Default for Md5 {
     fn default() -> Self {
@@ -33,86 +36,50 @@ impl Default for Md5 {
     }
 }
 
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut m = [0u32; 16];
+    for (slot, word) in m.iter_mut().zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_le_bytes(*word);
+    }
+    let [mut a, mut b, mut c, mut d, ..] = *state;
+    for i in 0..64 {
+        let (f, g) = match i / 16 {
+            0 => ((b & c) | (!b & d), i),
+            1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+            2 => (b ^ c ^ d, (3 * i + 5) % 16),
+            _ => (c ^ (b | !d), (7 * i) % 16),
+        };
+        let f = f.wrapping_add(a).wrapping_add(k(i)).wrapping_add(m[g]);
+        a = d;
+        d = c;
+        c = b;
+        b = b.wrapping_add(f.rotate_left(S[(i / 16) * 4 + i % 4]));
+    }
+    for (s, x) in state.iter_mut().zip([a, b, c, d]) {
+        *s = s.wrapping_add(x);
+    }
+}
+
 impl Md5 {
     pub const fn new() -> Self {
-        Md5 {
-            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476],
-            block: [0; 64],
-            filled: 0,
-            length: 0,
-        }
-    }
-
-    fn compress(&mut self) {
-        let mut m = [0u32; 16];
-        for (slot, word) in m.iter_mut().zip(self.block.as_chunks::<4>().0) {
-            *slot = u32::from_le_bytes(*word);
-        }
-        let [mut a, mut b, mut c, mut d] = self.state;
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let f = f.wrapping_add(a).wrapping_add(k(i)).wrapping_add(m[g]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(f.rotate_left(S[(i / 16) * 4 + i % 4]));
-        }
-        for (s, x) in self.state.iter_mut().zip([a, b, c, d]) {
-            *s = s.wrapping_add(x);
-        }
+        Md5(START)
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        self.length += data.len() as u64;
-        for &byte in data {
-            self.block[self.filled] = byte;
-            self.filled += 1;
-            if self.filled == 64 {
-                self.compress();
-                self.filled = 0;
-            }
-        }
+        self.0.update(data);
     }
 
     pub fn finish(mut self) -> [u8; 16] {
-        let bits = self.length * 8;
-        self.update(&[0x80]);
-        while self.filled != 56 {
-            self.update(&[0]);
-        }
-        self.block[56..].copy_from_slice(&bits.to_le_bytes());
-        self.compress();
         let mut out = [0u8; 16];
-        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
-            *chunk = word.to_le_bytes();
-        }
+        self.0.finish(&mut out);
         out
     }
 }
 
 pub fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-    let mut block = [0u8; 64];
-    if key.len() > 64 {
-        let mut h = Md5::new();
-        h.update(key);
-        block[..16].copy_from_slice(&h.finish());
-    } else {
-        block[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Md5::new();
-    inner.update(&block.map(|b| b ^ 0x36));
-    for p in parts {
-        inner.update(p);
-    }
-    let mut outer = Md5::new();
-    outer.update(&block.map(|b| b ^ 0x5C));
-    outer.update(&inner.finish());
-    outer.finish()
+    let mut out = [0u8; 16];
+    Keyed::new(&START, 16, key).sign(parts, &mut out);
+    out
 }
 
 /// RC4 over `data` in place, after throwing away the first `skip`

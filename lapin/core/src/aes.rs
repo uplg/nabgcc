@@ -25,19 +25,6 @@ fn xtime(x: u8) -> u8 {
     (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
 }
 
-/// Multiplication in GF(2^8), for the inverse mix.
-fn mul(mut a: u8, mut b: u8) -> u8 {
-    let mut p = 0;
-    while b != 0 {
-        if b & 1 != 0 {
-            p ^= a;
-        }
-        a = xtime(a);
-        b >>= 1;
-    }
-    p
-}
-
 /// An expanded AES-128 key.
 pub struct Aes {
     rounds: [[u8; 16]; 11],
@@ -97,24 +84,21 @@ impl Aes {
         }
     }
 
+    /// Decryption, for the key unwrap only: a few blocks per handshake,
+    /// so it is built from the forward steps. Mixing the columns four
+    /// times, or shifting the rows four times, gives the block back:
+    /// three times is the inverse.
     pub fn decrypt(&self, block: &mut Block) {
         let s = block;
         for r in (1..11).rev() {
             add(s, &self.rounds[r]);
             if r != 10 {
-                for c in s.as_chunks_mut::<4>().0 {
-                    let [a, b, d, e] = *c;
-                    c[0] = mul(a, 14) ^ mul(b, 11) ^ mul(d, 13) ^ mul(e, 9);
-                    c[1] = mul(a, 9) ^ mul(b, 14) ^ mul(d, 11) ^ mul(e, 13);
-                    c[2] = mul(a, 13) ^ mul(b, 9) ^ mul(d, 14) ^ mul(e, 11);
-                    c[3] = mul(a, 11) ^ mul(b, 13) ^ mul(d, 9) ^ mul(e, 14);
+                for _ in 0..3 {
+                    mix_columns(s);
                 }
             }
-            let t = *s;
-            for c in 0..4 {
-                for row in 1..4 {
-                    s[4 * ((c + row) % 4) + row] = t[4 * c + row];
-                }
+            for _ in 0..3 {
+                shift_rows(s);
             }
             for b in s.iter_mut() {
                 // The inverse S-box by search: decryption only ever runs
@@ -123,6 +107,27 @@ impl Aes {
             }
         }
         add(s, &self.rounds[0]);
+    }
+}
+
+#[allow(clippy::needless_range_loop)]
+fn shift_rows(s: &mut Block) {
+    let t = *s;
+    for c in 0..4 {
+        for row in 1..4 {
+            s[4 * c + row] = t[4 * ((c + row) % 4) + row];
+        }
+    }
+}
+
+fn mix_columns(s: &mut Block) {
+    for c in s.as_chunks_mut::<4>().0 {
+        let all = c[0] ^ c[1] ^ c[2] ^ c[3];
+        let first = c[0];
+        c[0] ^= all ^ xtime(c[0] ^ c[1]);
+        c[1] ^= all ^ xtime(c[1] ^ c[2]);
+        c[2] ^= all ^ xtime(c[2] ^ c[3]);
+        c[3] ^= all ^ xtime(c[3] ^ first);
     }
 }
 

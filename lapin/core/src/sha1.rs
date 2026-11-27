@@ -1,13 +1,18 @@
 //! SHA-1 and what WPA and WPA2 build on it: HMAC, the passphrase to key
 //! derivation (PBKDF2, 4096 rounds) and the pairwise key expansion PRF.
 
+use crate::hash::{Engine, Keyed};
+
+const START: Engine = Engine::new(
+    [
+        0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0, 0, 0, 0,
+    ],
+    compress,
+    true,
+);
+
 #[derive(Clone)]
-pub struct Sha1 {
-    state: [u32; 5],
-    block: [u8; 64],
-    filled: usize,
-    length: u64,
-}
+pub struct Sha1(Engine);
 
 impl Default for Sha1 {
     fn default() -> Self {
@@ -15,74 +20,52 @@ impl Default for Sha1 {
     }
 }
 
+fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 16];
+    for (slot, word) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *slot = u32::from_be_bytes(*word);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, ..] = *state;
+    for i in 0..80 {
+        if i >= 16 {
+            let x = w[(i + 13) & 15] ^ w[(i + 8) & 15] ^ w[(i + 2) & 15] ^ w[i & 15];
+            w[i & 15] = x.rotate_left(1);
+        }
+        let (f, k) = match i / 20 {
+            0 => ((b & c) | (!b & d), 0x5A827999),
+            1 => (b ^ c ^ d, 0x6ED9EBA1),
+            2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+            _ => (b ^ c ^ d, 0xCA62C1D6),
+        };
+        let t = a
+            .rotate_left(5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(w[i & 15]);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = t;
+    }
+    for (s, x) in state.iter_mut().zip([a, b, c, d, e]) {
+        *s = s.wrapping_add(x);
+    }
+}
+
 impl Sha1 {
     pub const fn new() -> Self {
-        Sha1 {
-            state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
-            block: [0; 64],
-            filled: 0,
-            length: 0,
-        }
-    }
-
-    fn compress(&mut self) {
-        let mut w = [0u32; 16];
-        for (slot, word) in w.iter_mut().zip(self.block.as_chunks::<4>().0) {
-            *slot = u32::from_be_bytes(*word);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = self.state;
-        for i in 0..80 {
-            if i >= 16 {
-                let x = w[(i + 13) & 15] ^ w[(i + 8) & 15] ^ w[(i + 2) & 15] ^ w[i & 15];
-                w[i & 15] = x.rotate_left(1);
-            }
-            let (f, k) = match i / 20 {
-                0 => ((b & c) | (!b & d), 0x5A827999),
-                1 => (b ^ c ^ d, 0x6ED9EBA1),
-                2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(w[i & 15]);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        for (s, x) in self.state.iter_mut().zip([a, b, c, d, e]) {
-            *s = s.wrapping_add(x);
-        }
+        Sha1(START)
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        self.length += data.len() as u64;
-        for &byte in data {
-            self.block[self.filled] = byte;
-            self.filled += 1;
-            if self.filled == 64 {
-                self.compress();
-                self.filled = 0;
-            }
-        }
+        self.0.update(data);
     }
 
     pub fn finish(mut self) -> [u8; 20] {
-        let bits = self.length * 8;
-        self.update(&[0x80]);
-        while self.filled != 56 {
-            self.update(&[0]);
-        }
-        self.block[56..].copy_from_slice(&bits.to_be_bytes());
-        self.compress();
         let mut out = [0u8; 20];
-        for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
-            *chunk = word.to_be_bytes();
-        }
+        self.0.finish(&mut out);
         out
     }
 }
@@ -95,42 +78,18 @@ pub fn sha1(parts: &[&[u8]]) -> [u8; 20] {
     h.finish()
 }
 
-/// The two hash states an HMAC key leads to, computed once for the
-/// many messages PBKDF2 signs with the same key.
-#[derive(Clone)]
-struct Keyed {
-    inner: Sha1,
-    outer: Sha1,
+fn keyed(key: &[u8]) -> Keyed {
+    Keyed::new(&START, 20, key)
 }
 
-impl Keyed {
-    fn new(key: &[u8]) -> Keyed {
-        let mut block = [0u8; 64];
-        if key.len() > 64 {
-            block[..20].copy_from_slice(&sha1(&[key]));
-        } else {
-            block[..key.len()].copy_from_slice(key);
-        }
-        let mut inner = Sha1::new();
-        inner.update(&block.map(|b| b ^ 0x36));
-        let mut outer = Sha1::new();
-        outer.update(&block.map(|b| b ^ 0x5C));
-        Keyed { inner, outer }
-    }
-
-    fn sign(&self, parts: &[&[u8]]) -> [u8; 20] {
-        let mut inner = self.inner.clone();
-        for p in parts {
-            inner.update(p);
-        }
-        let mut outer = self.outer.clone();
-        outer.update(&inner.finish());
-        outer.finish()
-    }
+fn sign(key: &Keyed, parts: &[&[u8]]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    key.sign(parts, &mut out);
+    out
 }
 
 pub fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
-    Keyed::new(key).sign(parts)
+    sign(&keyed(key), parts)
 }
 
 /// The pairwise master key of a WPA or WPA2 network from its passphrase
@@ -141,13 +100,13 @@ pub fn passphrase_to_pmk(
     ssid: &[u8],
     progress: &mut dyn FnMut(u32),
 ) -> [u8; 32] {
-    let key = Keyed::new(passphrase);
+    let key = keyed(passphrase);
     let mut pmk = [0u8; 40];
     for (block, out) in pmk.chunks_mut(20).enumerate() {
-        let mut u = key.sign(&[ssid, &(block as u32 + 1).to_be_bytes()]);
+        let mut u = sign(&key, &[ssid, &(block as u32 + 1).to_be_bytes()]);
         let mut sum = u;
         for round in 1..4096 {
-            u = key.sign(&[&u]);
+            u = sign(&key, &[&u]);
             for (s, x) in sum.iter_mut().zip(u) {
                 *s ^= x;
             }
@@ -165,9 +124,9 @@ pub fn passphrase_to_pmk(
 /// The PRF of IEEE 802.11-2020 12.7.1.2: `out` filled from HMAC-SHA1
 /// rounds over the label, a zero byte, the data and a counter.
 pub fn prf(key: &[u8], label: &[u8], data: &[u8], out: &mut [u8]) {
-    let key = Keyed::new(key);
+    let key = keyed(key);
     for (i, chunk) in out.chunks_mut(20).enumerate() {
-        let block = key.sign(&[label, &[0], data, &[i as u8]]);
+        let block = sign(&key, &[label, &[0], data, &[i as u8]]);
         chunk.copy_from_slice(&block[..chunk.len()]);
     }
 }
