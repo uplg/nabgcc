@@ -100,10 +100,12 @@ pub fn init() {
     PO11.set(AUDIO_DATA_SELECT);
     PO5.clear(MOTOR_PINS);
 
-    // Analogue input 2, the volume wheel; conversion clock at 1 MHz.
+    // Analogue input 2, the volume wheel; conversion clock CPUCLK/32,
+    // 1 MHz, as the C (ADCON2_CLK32): the converter wants 800 ns at
+    // least, which 2 MHz (3) would not give.
     ADCON0.write(0);
     ADCON1.write(2);
-    ADCON2.write(3);
+    ADCON2.write(4);
 }
 
 /// Whether the head button is held down.
