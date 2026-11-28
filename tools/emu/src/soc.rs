@@ -493,6 +493,11 @@ pub struct Soc {
     pub trace: Option<Trace>,
     /// The I2C bus held low by a broken device: the master never gets it.
     pub i2c_jammed: bool,
+    /// The next transfer's device holds the clock low this many
+    /// milliseconds after its start (a reader gone wrong mid-transfer):
+    /// the transfer does not complete meanwhile.
+    pub i2c_stretch_ms: Option<u64>,
+    i2c_stretch_until: u64,
     /// The USB controller's interrupt line (EXINT2) takes a while to
     /// fall once its cause is cleared: the processor can still take it
     /// then, and the controller has nothing to name (IRN 0, an illegal
@@ -572,6 +577,8 @@ impl Soc {
             unmodelled: BTreeSet::new(),
             trace: None,
             i2c_jammed: false,
+            i2c_stretch_ms: None,
+            i2c_stretch_until: 0,
             irq_lag: std::env::var_os("NABEMU_IRQ_LAG").is_some(),
             falling_lines: 0,
             falling_until: 0,
@@ -1123,8 +1130,10 @@ impl Soc {
             FTM0GR => self.board.ear_count(0) as u32,
             FTM1GR => self.board.ear_count(1) as u32,
             // I2C: transfer complete, bus free; bit 0 is "no acknowledge".
-            I2CSR if self.i2c_jammed => 0x20,
-            I2CSR => 0x80 | self.i2c.nak as u32,
+            I2CSR if self.i2c_jammed || self.cycles < self.i2c_stretch_until => 0x20,
+            // I2CMBB (5) from the start to the stop (manual 14.4.3): a
+            // master that never clears I2CMSTA holds the bus for good.
+            I2CSR => 0x80 | (self.i2c.active as u32) << 5 | self.i2c.nak as u32,
             I2CDR => {
                 if self.i2c.active && self.i2c.reading {
                     self.board.rfid.read() as u32
@@ -1325,6 +1334,9 @@ impl Soc {
                 // in the data register, cleared sends a stop.
                 let master = merged & 0x20 != 0;
                 if master && !self.i2c.active {
+                    if let Some(ms) = self.i2c_stretch_ms.take() {
+                        self.i2c_stretch_until = self.cycles + ms * CLOCK_HZ / 1000;
+                    }
                     self.i2c.active = true;
                     self.i2c.reading = self.i2c.data & 1 != 0;
                     self.i2c.nak = self.i2c.data & 0xFE != CRX14_ADDRESS;

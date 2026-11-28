@@ -583,6 +583,34 @@ fn the_tag_reader_is_as_quick_as_r3s() {
     }
 }
 
+/// The reader holds the clock low a second in the middle of a transfer:
+/// the wait for its end times out. lapin left I2CMSTA set then, and the
+/// controller kept the bus (I2CMBB, from a start to its stop): every
+/// transfer after found it busy, and no tag was read again until a
+/// restart. It now sends the stop. Known defect: r3 still does as
+/// lapin did.
+#[test]
+fn a_transfer_that_timed_out_leaves_the_bus_free() {
+    // Ask for a tag, print what came, again and again.
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.extend([metal::OP_RFID_GET, metal::OP_SECHOLN, DROP, GOTO, 0, 0]);
+    let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&[], &f));
+    until(&mut m, 60_000, "the polling", |m| {
+        m.soc.board.rfid.exchanges > 0
+    });
+    m.soc.i2c_stretch_ms = Some(1000);
+    wait(&mut m, 2000);
+    let mark = m.soc.uart_tx.len();
+    m.soc.board.rfid.tags = vec![nabemu::rfid::Tag::new(common::UID)];
+    wait(&mut m, 1000);
+    let seen = common::find(&m.soc.uart_tx[mark..], &common::UID).is_some();
+    if is_lapin() {
+        assert!(seen, "the reader dead after a timeout");
+    } else {
+        assert!(!seen, "Known defect: r3's reader dead until a restart");
+    }
+}
+
 // ---- more of r3's defects --------------------------------------------------
 
 const WAV2ALAW: u8 = 141;
