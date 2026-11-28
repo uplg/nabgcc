@@ -157,6 +157,57 @@ fn fill_td(td: usize, control: u32, buffer: usize, len: usize, next: usize) {
     });
 }
 
+/// The two bulk endpoints, empty, for the device at `address`, the out
+/// one first in the list.
+fn set_bulk_eds(address: u8, flags: u32) {
+    set_ed(
+        ED_OUT,
+        address,
+        1,
+        flags | ED_OUT_DIR,
+        PACKET as u16,
+        TD_OUT,
+    );
+    set_ed(ED_IN, address, 1, flags | ED_IN_DIR, PACKET as u16, TD_IN);
+    word(ED_OUT + 12).write(ED_IN as u32);
+}
+
+/// Bytes a finished descriptor moved into or out of its buffer from
+/// `start`, of the `asked`: the controller leaves its current pointer
+/// at the next byte, or at zero when all of them went.
+fn moved(td: usize, start: usize, asked: usize) -> usize {
+    match word(td + 4).read() as usize {
+        0 => asked,
+        end => end - start,
+    }
+}
+
+/// Hand a descriptor to a bulk endpoint: its placeholder `td` becomes
+/// the request, `spare` the new placeholder.
+fn queue_bulk(ed: usize, td: usize, control: u32, buffer: usize, len: usize, spare: usize) {
+    fill_td(td, control, buffer, len, spare);
+    word(ed + 4).write(spare as u32);
+    HC_COMMAND_STATUS.write(BULK_FILLED);
+}
+
+/// Take back from the controller what an endpoint holds (lost): the
+/// endpoint skipped, time for the controller to let go, then its
+/// queue emptied, the head brought to the tail with the bits of `keep`
+/// it had (the data toggle).
+fn take_back(ed: usize, keep: u32) {
+    word(ed).set(ED_SKIP);
+    timer::delay_ms(2);
+    let kept = word(ed + 8).read() & keep;
+    word(ed + 8).write(word(ed + 4).read() | kept);
+}
+
+/// A bulk transfer failed: counted, and the endpoint the controller
+/// halted on it let go again.
+fn bulk_failed(ed: usize) {
+    BULK_ERRORS.set(BULK_ERRORS.get() + 1);
+    word(ed + 8).clear(1);
+}
+
 /// Bring the controller up as a host and power its port.
 pub fn init() -> Result<(), Error> {
     let settle = || {
@@ -195,9 +246,7 @@ pub fn init() -> Result<(), Error> {
 
     // Endpoints start empty and skipped: head equals tail.
     set_ed(ED_CONTROL, 0, 0, ED_SKIP, 8, TD_CONTROL);
-    set_ed(ED_OUT, 0, 1, ED_SKIP | ED_OUT_DIR, PACKET as u16, TD_OUT);
-    set_ed(ED_IN, 0, 1, ED_SKIP | ED_IN_DIR, PACKET as u16, TD_IN);
-    word(ED_OUT + 12).write(ED_IN as u32);
+    set_bulk_eds(0, ED_SKIP);
     HC_CONTROL_HEAD.write(ED_CONTROL as u32);
     HC_BULK_HEAD.write(ED_OUT as u32);
 
@@ -264,10 +313,8 @@ pub(crate) fn on_interrupt() {
 fn retire(td: usize) {
     let condition = word(td).read() >> 28;
     if (TD_IN..TD_IN + RX_TDS * 16).contains(&td) {
-        let slot = (td - TD_IN) / 16;
-        let buffer = RX_BUFFERS + slot * PACKET;
-        let end = word(td + 4).read() as usize;
-        let len = if end == 0 { PACKET } else { end - buffer };
+        let buffer = rx_buffer(td);
+        let len = moved(td, buffer, PACKET);
         // The buffer is read plainly between the descriptor's register
         // reads and writes: keep it there.
         crate::sync::barrier();
@@ -278,15 +325,13 @@ fn retire(td: usize) {
                 handler(unsafe { core::slice::from_raw_parts(buffer as *const u8, len) });
             }
         } else {
-            BULK_ERRORS.set(BULK_ERRORS.get() + 1);
-            clear_halt(ED_IN);
+            bulk_failed(ED_IN);
         }
         crate::sync::barrier();
         queue_rx(td);
     } else if (TD_OUT..TD_OUT + 32).contains(&td) {
         if condition != 0 {
-            BULK_ERRORS.set(BULK_ERRORS.get() + 1);
-            clear_halt(ED_OUT);
+            bulk_failed(ED_OUT);
         }
         TX_BUSY.set(false);
         STUCK_SINCE.set(0);
@@ -297,9 +342,8 @@ fn retire(td: usize) {
         CONTROL_RESULT.set(0x8000_0000 | condition);
     } else if td == TD_CONTROL + 16 {
         // The data stage: note how much of the buffer was used.
-        let end = word(td + 4).read() as usize;
         let asked = word(td + 12).read() as usize + 1 - CONTROL_DATA;
-        DATA_MOVED.set(if end == 0 { asked } else { end - CONTROL_DATA } as u32);
+        DATA_MOVED.set(moved(td, CONTROL_DATA, asked) as u32);
     } else if td == TD_CONTROL + 32 {
         CONTROL_RESULT.set(DATA_MOVED.get());
     }
@@ -307,8 +351,9 @@ fn retire(td: usize) {
 
 static DATA_MOVED: Shared<u32> = Shared::new(0);
 
-fn clear_halt(ed: usize) {
-    word(ed + 8).write(word(ed + 8).read() & !1);
+/// The packet buffer of a receive descriptor, one each.
+fn rx_buffer(td: usize) -> usize {
+    RX_BUFFERS + (td - TD_IN) / 16 * PACKET
 }
 
 /// Put a receive descriptor (back) at the end of the bulk-in queue:
@@ -316,16 +361,14 @@ fn clear_halt(ed: usize) {
 /// new placeholder.
 fn queue_rx(spare: usize) {
     let td = word(ED_IN + 4).read() as usize;
-    let slot = (td - TD_IN) / 16;
-    fill_td(
+    queue_bulk(
+        ED_IN,
         td,
         TD_ROUNDING | TD_IN_PID,
-        RX_BUFFERS + slot * PACKET,
+        rx_buffer(td),
         PACKET,
         spare,
     );
-    word(ED_IN + 4).write(spare as u32);
-    HC_COMMAND_STATUS.write(BULK_FILLED);
 }
 
 /// Whether the controller reported an unrecoverable error.
@@ -379,8 +422,8 @@ pub fn control(
     let len = data.len().min(CONTROL_MAX);
     let read = setup[0] & 0x80 != 0;
     irq::free(|| {
-        for (i, chunk) in setup.chunks(4).enumerate() {
-            word(SETUP + 4 * i).write(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for (i, chunk) in setup.as_chunks::<4>().0.iter().enumerate() {
+            word(SETUP + 4 * i).write(u32::from_le_bytes(*chunk));
         }
         if !read {
             for (i, byte) in data[..len].iter().enumerate() {
@@ -433,12 +476,9 @@ pub fn control(
             break result;
         }
         if broken() || timer::since(start) > 500 {
-            // Take the transfer back from the controller.
-            irq::free(|| {
-                word(ED_CONTROL).write(word(ED_CONTROL).read() | ED_SKIP);
-                timer::delay_ms(2);
-                word(ED_CONTROL + 8).write(word(ED_CONTROL + 4).read());
-            });
+            // Take the transfer back from the controller; the next one
+            // brings its own toggles, and lets the endpoint go again.
+            irq::free(|| take_back(ED_CONTROL, 0));
             return Err(Error::Timeout);
         }
     };
@@ -507,9 +547,7 @@ pub fn enumerate() -> Result<Device, Error> {
     control(ADDRESS, max_packet, [0x00, 9, 1, 0, 0, 0, 0, 0], &mut [])?;
 
     irq::free(|| {
-        set_ed(ED_OUT, ADDRESS, 1, ED_OUT_DIR, PACKET as u16, TD_OUT);
-        set_ed(ED_IN, ADDRESS, 1, ED_IN_DIR, PACKET as u16, TD_IN);
-        word(ED_OUT + 12).write(ED_IN as u32);
+        set_bulk_eds(ADDRESS, 0);
         // Four receive requests in flight, the fifth descriptor waits.
         for slot in 1..RX_TDS {
             queue_rx(TD_IN + slot * 16);
@@ -548,11 +586,8 @@ pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
         // Take the frame back from the controller (it is lost, as on the
         // air), keeping the data toggle the stick expects next.
         irq::free(|| {
-            word(ED_OUT).write(word(ED_OUT).read() | ED_SKIP);
-            timer::delay_ms(2);
-            let toggle = word(ED_OUT + 8).read() & 2;
-            word(ED_OUT + 8).write(word(ED_OUT + 4).read() | toggle);
-            word(ED_OUT).write(word(ED_OUT).read() & !ED_SKIP);
+            take_back(ED_OUT, 2);
+            word(ED_OUT).clear(ED_SKIP);
             TX_BUSY.set(false);
         });
     }
@@ -569,9 +604,7 @@ pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
         TX_AT.set(timer::millis());
         let td = word(ED_OUT + 4).read() as usize;
         let spare = if td == TD_OUT { TD_OUT + 16 } else { TD_OUT };
-        fill_td(td, TD_OUT_PID, TX_BUFFER, len, spare);
-        word(ED_OUT + 4).write(spare as u32);
-        HC_COMMAND_STATUS.write(BULK_FILLED);
+        queue_bulk(ED_OUT, td, TD_OUT_PID, TX_BUFFER, len, spare);
     });
     true
 }
