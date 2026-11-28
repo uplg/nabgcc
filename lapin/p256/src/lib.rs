@@ -497,25 +497,14 @@ impl Point {
         let x1x2 = self.x.mul(&o.x);
         let y1y2 = self.y.mul(&o.y);
         let z1z2 = self.z.mul(&o.z);
-        // Cross terms, each by one product instead of two.
-        let xy = self
-            .x
-            .add(&self.y)
-            .mul(&o.x.add(&o.y))
-            .sub(&x1x2)
-            .sub(&y1y2);
-        let xz = self
-            .x
-            .add(&self.z)
-            .mul(&o.x.add(&o.z))
-            .sub(&x1x2)
-            .sub(&z1z2);
-        let yz = self
-            .y
-            .add(&self.z)
-            .mul(&o.y.add(&o.z))
-            .sub(&y1y2)
-            .sub(&z1z2);
+        // Cross terms, each by one product instead of two: a1 b2 + b1 a2
+        // as (a1 + b1)(a2 + b2) - a1 a2 - b1 b2.
+        let cross = |a1: &Fe, b1: &Fe, a2: &Fe, b2: &Fe, a1a2: &Fe, b1b2: &Fe| {
+            a1.add(b1).mul(&a2.add(b2)).sub(a1a2).sub(b1b2)
+        };
+        let xy = cross(&self.x, &self.y, &o.x, &o.y, &x1x2, &y1y2);
+        let xz = cross(&self.x, &self.z, &o.x, &o.z, &x1x2, &z1z2);
+        let yz = cross(&self.y, &self.z, &o.y, &o.z, &y1y2, &z1z2);
 
         let bz = triple(&b.mul(&z1z2));
         let xz3 = triple(&xz);

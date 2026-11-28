@@ -221,6 +221,35 @@ mod packer {
         Copy { distance: usize, len: usize },
     }
 
+    /// The items as bits, each in its context, in the order the decoder
+    /// reads them: the encoder records them, the parse prices them.
+    trait Bits {
+        fn bit(&mut self, ctx: usize, one: bool);
+
+        /// `value`'s Elias gamma code, from `ctx` on.
+        fn gamma(&mut self, mut ctx: usize, value: usize) {
+            let top = usize::BITS - 1 - value.leading_zeros();
+            for shift in 0..top {
+                self.bit(ctx, true);
+                self.bit(ctx + 1, value >> shift & 1 != 0);
+                ctx += 2;
+            }
+            self.bit(ctx, false);
+        }
+
+        /// The literal `buf[n]`, after the bit that says it is one.
+        fn literal(&mut self, buf: &[u8], n: usize, after_copy: usize) {
+            self.bit(IS_COPY + (n & 1) + 2 * after_copy, false);
+            let mut k = 8;
+            literal(tree(buf, n), |ctx| {
+                k -= 1;
+                let b = buf[n] as usize >> k & 1;
+                self.bit(ctx, b != 0);
+                b
+            });
+        }
+    }
+
     /// The model's bits as the coder will take them, recorded with their
     /// probability at that point.
     struct Model {
@@ -238,7 +267,9 @@ mod packer {
                 seen: vec![[0; 2]; CONTEXTS],
             }
         }
+    }
 
+    impl Bits for Model {
         fn bit(&mut self, ctx: usize, one: bool) {
             let p = &mut self.probs[ctx];
             self.bits.push((one, *p));
@@ -250,16 +281,13 @@ mod packer {
                 *p -= (prob >> RATE) as u16;
             }
         }
+    }
 
-        fn gamma(&mut self, mut ctx: usize, value: usize) {
+    impl Model {
+        /// `gamma`, of a value the decoder reads.
+        fn coded(&mut self, ctx: usize, value: usize) {
             assert!((1..1 << GAMMA_BITS).contains(&value));
-            let top = usize::BITS - 1 - value.leading_zeros();
-            for shift in 0..top {
-                self.bit(ctx, true);
-                self.bit(ctx + 1, value >> shift & 1 != 0);
-                ctx += 2;
-            }
-            self.bit(ctx, false);
+            self.gamma(ctx, value);
         }
 
         /// rANS: the bits taken in reverse, the bytes put out reversed.
@@ -306,26 +334,28 @@ mod packer {
             self.0[ctx][one as usize]
         }
 
-        fn gamma(&self, mut ctx: usize, value: usize) -> u32 {
-            let top = usize::BITS - 1 - value.leading_zeros();
-            let mut c = 0;
-            for shift in 0..top {
-                c += self.bit(ctx, true) + self.bit(ctx + 1, value >> shift & 1 != 0);
-                ctx += 2;
-            }
-            c + self.bit(ctx, false)
+        /// What `code` costs, the bits it gives `Bits` priced.
+        fn price(&self, code: impl FnOnce(&mut Price)) -> u32 {
+            let mut p = Price(self, 0);
+            code(&mut p);
+            p.1
+        }
+
+        fn gamma(&self, ctx: usize, value: usize) -> u32 {
+            self.price(|p| p.gamma(ctx, value))
         }
 
         fn literal(&self, buf: &[u8], n: usize, after_copy: usize) -> u32 {
-            let mut c = self.bit(IS_COPY + (n & 1) + 2 * after_copy, false);
-            let mut k = 8;
-            literal(tree(buf, n), |ctx| {
-                k -= 1;
-                let b = buf[n] as usize >> k & 1;
-                c += self.bit(ctx, b != 0);
-                b
-            });
-            c
+            self.price(|p| p.literal(buf, n, after_copy))
+        }
+    }
+
+    /// The bits priced by `Costs`, summed.
+    struct Price<'a>(&'a Costs, u32);
+
+    impl Bits for Price<'_> {
+        fn bit(&mut self, ctx: usize, one: bool) {
+            self.1 += self.0.bit(ctx, one);
         }
     }
 
@@ -337,14 +367,7 @@ mod packer {
             let parity = n & 1;
             match item {
                 Item::Literal => {
-                    m.bit(IS_COPY + parity + 2 * after_copy, false);
-                    let mut k = 8;
-                    literal(tree(buf, n), |ctx| {
-                        k -= 1;
-                        let b = buf[n] as usize >> k & 1;
-                        m.bit(ctx, b != 0);
-                        b
-                    });
+                    m.literal(buf, n, after_copy);
                     after_copy = 0;
                 }
                 Item::Copy { distance: d, len } => {
@@ -353,9 +376,9 @@ mod packer {
                         m.bit(REPEAT, d == distance);
                     }
                     if after_copy != 0 || d != distance {
-                        m.gamma(DISTANCE, d);
+                        m.coded(DISTANCE, d);
                     }
-                    m.gamma(LENGTH, len - 1);
+                    m.coded(LENGTH, len - 1);
                     distance = d;
                     after_copy = 1;
                 }
