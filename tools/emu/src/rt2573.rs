@@ -122,6 +122,10 @@ pub struct Radio {
     /// The bulk endpoint in stalls every transfer while set: a stick
     /// that has stopped delivering what it receives.
     pub rx_stall: bool,
+    /// Receive descriptors leave the IV words of a decrypted frame zero,
+    /// as a stick might that does not report them (nothing has shown
+    /// the RT2573 does; the C driver never read them).
+    pub rx_no_iv: bool,
 }
 
 pub type SharedRadio = Rc<RefCell<Radio>>;
@@ -473,6 +477,13 @@ impl Rt2573 {
             let mut buf = Vec::with_capacity(RXD_SIZE + data.len() + 4);
             buf.extend_from_slice(&w0.to_le_bytes());
             buf.extend_from_slice(&w1.to_le_bytes());
+            // Words 2 and 3, the IV of what it decrypted; left zero by a
+            // stick that does not report them (`rx_no_iv`).
+            let (iv, eiv) = if self.radio.borrow().rx_no_iv {
+                (0, 0)
+            } else {
+                (iv, eiv)
+            };
             buf.extend_from_slice(&iv.to_le_bytes());
             buf.extend_from_slice(&eiv.to_le_bytes());
             buf.extend_from_slice(&[0; 8]);

@@ -137,6 +137,10 @@ impl Link for Radio<'_> {
         timer::delay_ms(AIR_MS);
     }
 
+    fn note(&mut self, text: &[u8]) {
+        crate::uart::write(text);
+    }
+
     fn random(&mut self, out: &mut [u8]) {
         // Nothing drawn for a key before the pool has had its fill
         // (the boot's readings, the stick's arrival, frames heard).

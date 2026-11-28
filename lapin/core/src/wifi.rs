@@ -86,6 +86,8 @@ pub trait Link {
     /// one.
     fn flush(&mut self) {}
     fn random(&mut self, out: &mut [u8]);
+    /// Say something on the console, once in a while (not in a loop).
+    fn note(&mut self, _text: &[u8]) {}
 }
 
 // The states and modes the bytecode reads through `netState`.
@@ -501,6 +503,8 @@ pub struct Station {
     /// from it opened with it): from then on nothing comes in clear,
     /// handshake messages included.
     ap_keyed: bool,
+    /// The stick was seen to give no packet numbers (see `input_data`).
+    pn_unreported: bool,
     /// The cached key led to a checked message 3.
     pmksa_proven: bool,
     sa_query: SaQuery,
@@ -735,6 +739,7 @@ impl Station {
             snonce: [0; 32],
             renew_snonce: true,
             ap_keyed: false,
+            pn_unreported: false,
             pmksa_proven: false,
             sa_query: SaQuery {
                 ids: [[0; 2]; 5],
@@ -1986,7 +1991,20 @@ impl Station {
                 Cipher::Ccmp => eiv << 16 | (iv & 0xFFFF) as u64,
                 Cipher::Tkip => eiv << 16 | ((iv & 0xFF) << 8 | (iv >> 16) & 0xFF) as u64,
             };
-            if !self.fresh(group, (iv >> 30) as u8, pn) {
+            // Every TKIP and CCMP header has its extended IV bit set: IV
+            // words without it are not the frame's, the stick does not
+            // report them. Nothing has shown that the RT2573 does (the
+            // C driver never read them): rather than drop every frame
+            // after the first as a replay, the check is left out for
+            // the frames it opens, and the console says so once. No
+            // sender can make a frame's descriptor say this; the frames
+            // this firmware opens itself (WPA3) are always checked.
+            if iv & 1 << 29 == 0 {
+                if !self.pn_unreported {
+                    self.pn_unreported = true;
+                    link.note(b"wifi: the stick reports no packet numbers, no replay check\n");
+                }
+            } else if !self.fresh(group, (iv >> 30) as u8, pn) {
                 return None;
             }
             self.ap_keyed |= !group;

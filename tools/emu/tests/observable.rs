@@ -438,3 +438,33 @@ fn an_environment_past_32_kb_is_cut() {
     // The watchdog restarts the rabbit, again and again.
     assert!(m.events.len() >= 2, "{:?}", m.events);
 }
+
+/// A WPA2 rabbit fetching and running its bytecode, the stick leaving
+/// the IV words of what it decrypts zero (`rx_no_iv`), or not.
+fn wpa2_with_a_stick_that_reports_iv(reports: bool) -> Machine {
+    let mut m = common::on_network(&nabemu::testing::image(), common::wpa2());
+    m.radio.borrow_mut().rx_no_iv = !reports;
+    common::serve(&mut m, metal::boot_response(&metal::print_number(4242)));
+    until(&mut m, 40_000, "the served bytecode", |m| {
+        m.console().contains("4242")
+    });
+    m
+}
+
+const NO_PN: &str = "the stick reports no packet numbers";
+
+/// The replay check takes each packet number from the words of the
+/// receive descriptor, which nothing has proven the stick fills: one
+/// that left them zero would see every frame after the first dropped
+/// as a replay, a link dead after its handshake. It stays up, the check
+/// left out and the console saying so once; with them, the check is
+/// kept. (r3 never read them.)
+#[test]
+fn a_stick_that_reports_no_packet_numbers_still_carries_traffic() {
+    let m = wpa2_with_a_stick_that_reports_iv(false);
+    if nabemu::testing::is_lapin() {
+        assert_eq!(m.console().matches(NO_PN).count(), 1);
+    }
+    let m = wpa2_with_a_stick_that_reports_iv(true);
+    assert!(!m.console().contains(NO_PN));
+}
