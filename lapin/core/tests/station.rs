@@ -215,7 +215,9 @@ fn scan(w: &mut World, sta: &mut Station) -> Vec<wifi::ScanResult> {
     found
 }
 
-fn join(w: &mut World, sta: &mut Station, key: &[u8], password: &[u8]) -> Vec<Vec<u8>> {
+/// Scan, and set out to join the network found (`shared`: WEP's
+/// shared key authentication).
+fn start_join(w: &mut World, sta: &mut Station, key: &[u8], password: &[u8], shared: bool) {
     let found = scan(w, sta);
     let r = found
         .iter()
@@ -228,21 +230,29 @@ fn join(w: &mut World, sta: &mut Station, key: &[u8], password: &[u8]) -> Vec<Ve
         &r.bssid,
         r.channel,
         r.rateset,
-        false,
+        shared,
         r.encryption,
         key,
         password,
     );
+}
+
+fn join(w: &mut World, sta: &mut Station, key: &[u8], password: &[u8]) -> Vec<Vec<u8>> {
+    start_join(w, sta, key, password, false);
     let mut up = Vec::new();
     run(w, sta, 3000, &mut up);
     up
 }
 
-fn dhcp_like(sta: &mut Station, w: &mut World) {
-    // An IP frame from its LLC header on, to everyone.
+/// An IP frame from its LLC header on, for the station to send.
+fn ip_frame() -> Vec<u8> {
     let mut data = vec![0xAA, 0xAA, 0x03, 0, 0, 0, 0x08, 0x00];
     data.extend_from_slice(&[0x45; 40]);
-    assert!(sta.send(w, &data, &[0xFF; 6], false));
+    data
+}
+
+fn dhcp_like(sta: &mut Station, w: &mut World) {
+    assert!(sta.send(w, &ip_frame(), &[0xFF; 6], false));
     run(w, sta, 20, &mut Vec::new());
 }
 
@@ -275,6 +285,17 @@ fn talks(w: &mut World, sta: &mut Station) {
     assert!(up.iter().any(|f| f.ends_with(b"bonjour")), "{up:?}");
     assert!(up.iter().any(|f| f.ends_with(b"tout le monde")), "{up:?}");
     assert_eq!(w.cipher_errors, 0);
+}
+
+/// The header of a frame with the access point's address, to the
+/// station, of frame control `fc`: what anyone on the air can send.
+fn from_bssid(fc: [u8; 2]) -> Vec<u8> {
+    let mut f = vec![fc[0], fc[1], 0, 0];
+    f.extend_from_slice(&STA);
+    f.extend_from_slice(&BSSID);
+    f.extend_from_slice(&BSSID);
+    f.extend_from_slice(&[0, 0]);
+    f
 }
 
 fn trouble(w: &World) -> Vec<&ApEvent> {
@@ -319,11 +340,7 @@ fn joins_an_open_network() {
 
 #[test]
 fn joins_wpa2() {
-    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Off);
-    let mut sta = Station::new();
-    join(&mut w, &mut sta, &pmk(), &[]);
-    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
-    assert!(!sta.is_wpa3());
+    let (mut w, mut sta) = joins_psk(Security::wpa2(PASSPHRASE));
     talks(&mut w, &mut sta);
     assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
 }
@@ -334,10 +351,7 @@ fn joins_wpa2() {
 #[test]
 fn a_frame_sent_again_goes_up_once() {
     for security in [Security::wpa2(PASSPHRASE), Security::wpa(PASSPHRASE)] {
-        let mut w = World::new(security, Wpa3::Off);
-        let mut sta = Station::new();
-        join(&mut w, &mut sta, &pmk(), &[]);
-        assert_eq!(sta.net_state(), wifi::S_CONNECTED);
+        let (mut w, mut sta) = joins_psk(security);
         for to in [STA, [0xFF; 6]] {
             w.aps[0].send(&mut w.radio, &ethernet(to, [2, 0, 0, 0, 0, 1], b"une fois"));
             let recorded = w.radio.rx.back().unwrap().clone();
@@ -352,20 +366,14 @@ fn a_frame_sent_again_goes_up_once() {
 
 #[test]
 fn joins_wpa_tkip() {
-    let mut w = World::new(Security::wpa(PASSPHRASE), Wpa3::Off);
-    let mut sta = Station::new();
-    join(&mut w, &mut sta, &pmk(), &[]);
-    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    let (mut w, mut sta) = joins_psk(Security::wpa(PASSPHRASE));
     talks(&mut w, &mut sta);
     assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
 }
 
 #[test]
 fn joins_mixed_mode() {
-    let mut w = World::new(Security::wpa2_tkip_group(PASSPHRASE), Wpa3::Off);
-    let mut sta = Station::new();
-    join(&mut w, &mut sta, &pmk(), &[]);
-    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    let (mut w, mut sta) = joins_psk(Security::wpa2_tkip_group(PASSPHRASE));
     talks(&mut w, &mut sta);
     assert_eq!(trouble(&w), Vec::<&ApEvent>::new());
 }
@@ -397,20 +405,7 @@ fn joins_wep_shared_key() {
         Wpa3::Off,
     );
     let mut sta = Station::new();
-    let found = scan(&mut w, &mut sta);
-    let r = found.iter().find(|r| r.bssid == BSSID).unwrap();
-    sta.auth(
-        &mut w,
-        b"Terrier",
-        &r.mac,
-        &r.bssid,
-        r.channel,
-        r.rateset,
-        true,
-        r.encryption,
-        &key,
-        &[],
-    );
+    start_join(&mut w, &mut sta, &key, &[], true);
     run(&mut w, &mut sta, 2000, &mut Vec::new());
     assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
     talks(&mut w, &mut sta);
@@ -418,6 +413,16 @@ fn joins_wep_shared_key() {
         sta: STA,
         shared_key: true
     }));
+}
+
+/// A WPA or WPA2 network, joined with the pre-shared key.
+fn joins_psk(security: Security) -> (World, Station) {
+    let mut w = World::new(security, Wpa3::Off);
+    let mut sta = Station::new();
+    join(&mut w, &mut sta, &pmk(), &[]);
+    assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
+    assert!(!sta.is_wpa3());
+    (w, sta)
 }
 
 fn joins_wpa3(wpa3: Wpa3) -> (World, Station) {
@@ -516,20 +521,7 @@ fn wpa3_says_it_hashed_to_the_curve() {
 fn a_forged_message_1_does_not_lock_the_handshake_out() {
     let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Off);
     let mut sta = Station::new();
-    let found = scan(&mut w, &mut sta);
-    let r = *found.iter().find(|r| r.bssid == BSSID).unwrap();
-    sta.auth(
-        &mut w,
-        &r.ssid[..r.ssid_len],
-        &r.mac,
-        &r.bssid,
-        r.channel,
-        r.rateset,
-        false,
-        r.encryption,
-        &pmk(),
-        &[],
-    );
+    start_join(&mut w, &mut sta, &pmk(), &[], false);
     // Up to the association response, which the access point sends
     // with its message 1.
     let mut buf = vec![0u8; 2400];
@@ -542,11 +534,7 @@ fn a_forged_message_1_does_not_lock_the_handshake_out() {
             sta.input(&mut w, &mut buf, rx);
         }
     }
-    let mut forged = vec![0x08, 0x02, 0, 0];
-    forged.extend_from_slice(&STA);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0]);
+    let mut forged = from_bssid([0x08, 0x02]);
     forged.extend_from_slice(&wifi::LLC_EAPOL);
     let mut e = vec![2, 3, 0, 95, 2, 0x00, 0x8A, 0, 16];
     e.extend_from_slice(&[0xFF; 8]);
@@ -577,11 +565,8 @@ fn wpa3_survives_a_group_rekey_and_ignores_a_forged_deauthentication() {
     w.aps[0].rekey_group(&mut w.radio);
     run(&mut w, &mut sta, 100, &mut Vec::new());
     // Someone else, in clear, with the access point's address.
-    let mut forged = vec![0xC0, 0, 0, 0];
-    forged.extend_from_slice(&STA);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0, 7, 0]);
+    let mut forged = from_bssid([0xC0, 0]);
+    forged.extend_from_slice(&[7, 0]);
     w.radio.rx.push_back(nabemu::rt2573::RxFrame::new(forged));
     run(&mut w, &mut sta, 20, &mut Vec::new());
     assert_eq!(sta.net_state(), wifi::S_CONNECTED);
@@ -628,9 +613,7 @@ fn wpa3_notices_an_access_point_that_forgot_it() {
     let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
     w.aps[0].power_cut();
     // The rabbit talks; the access point says it does not know it.
-    let mut data = vec![0xAA, 0xAA, 0x03, 0, 0, 0, 0x08, 0x00];
-    data.extend_from_slice(&[0x45; 40]);
-    sta.send(&mut w, &data, &[0xFF; 6], false);
+    sta.send(&mut w, &ip_frame(), &[0xFF; 6], false);
     run(&mut w, &mut sta, 500, &mut Vec::new());
     assert!(
         w.ap()
@@ -655,11 +638,8 @@ fn wpa3_notices_an_access_point_that_forgot_it() {
 #[test]
 fn wpa3_keeps_the_link_when_the_access_point_answers_the_query() {
     let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
-    let mut forged = vec![0xC0, 0, 0, 0];
-    forged.extend_from_slice(&STA);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0, 6, 0]);
+    let mut forged = from_bssid([0xC0, 0]);
+    forged.extend_from_slice(&[6, 0]);
     w.radio.rx.push_back(nabemu::rt2573::RxFrame::new(forged));
     run(&mut w, &mut sta, 3000, &mut Vec::new());
     assert_eq!(sta.net_state(), wifi::S_CONNECTED);
@@ -805,17 +785,13 @@ fn rekeys_and_talks(w: &mut World, sta: &mut Station) {
 
 #[test]
 fn wpa2_takes_a_new_pairwise_key_on_the_run() {
-    let mut w = World::new(Security::wpa2(PASSPHRASE), Wpa3::Off);
-    let mut sta = Station::new();
-    join(&mut w, &mut sta, &pmk(), &[]);
+    let (mut w, mut sta) = joins_psk(Security::wpa2(PASSPHRASE));
     rekeys_and_talks(&mut w, &mut sta);
 }
 
 #[test]
 fn wpa_tkip_takes_a_new_pairwise_key_on_the_run() {
-    let mut w = World::new(Security::wpa(PASSPHRASE), Wpa3::Off);
-    let mut sta = Station::new();
-    join(&mut w, &mut sta, &pmk(), &[]);
+    let (mut w, mut sta) = joins_psk(Security::wpa(PASSPHRASE));
     rekeys_and_talks(&mut w, &mut sta);
 }
 
@@ -825,12 +801,19 @@ fn wpa3_takes_a_new_pairwise_key_on_the_run() {
     rekeys_and_talks(&mut w, &mut sta);
 }
 
-#[test]
-fn wpa3_comes_back_without_a_new_password_exchange() {
+/// A WPA3 link the access point ended (reason 3), its key cached on
+/// both sides.
+fn kicked_from_wpa3() -> (World, Station) {
     let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
     w.aps[0].kick(&mut w.radio, STA, 3);
     run(&mut w, &mut sta, 50, &mut Vec::new());
     assert_eq!(sta.net_state(), wifi::S_IDLE);
+    (w, sta)
+}
+
+#[test]
+fn wpa3_comes_back_without_a_new_password_exchange() {
+    let (mut w, mut sta) = kicked_from_wpa3();
     join(&mut w, &mut sta, &pmk(), PASSPHRASE.as_bytes());
     assert_eq!(sta.net_state(), wifi::S_CONNECTED, "{:?}", w.ap().events);
     let events = &w.ap().events;
@@ -851,9 +834,7 @@ fn wpa3_comes_back_without_a_new_password_exchange() {
 
 #[test]
 fn wpa3_runs_the_exchange_again_when_the_access_point_forgot() {
-    let (mut w, mut sta) = joins_wpa3(Wpa3::Only);
-    w.aps[0].kick(&mut w.radio, STA, 3);
-    run(&mut w, &mut sta, 50, &mut Vec::new());
+    let (mut w, mut sta) = kicked_from_wpa3();
     // The access point restarts: its cache is gone.
     let mut fresh = AccessPoint::new("Terrier", BSSID, 6, Security::wpa2(PASSPHRASE));
     fresh.wpa3 = Wpa3::Only;

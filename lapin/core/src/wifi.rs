@@ -2929,26 +2929,9 @@ mod tests {
 
     /// The same, the group key's counter at `rsc`.
     fn group_message_at(s: &Station, counter: u64, key: &[u8], rsc: u64) -> Vec<u8> {
-        let mut e = std::vec![0u8; 99];
-        e[..2].copy_from_slice(&[1, 3]);
-        e[4] = if s.is_wpa1() { 0xFE } else { 2 };
-        // Group, key 1, ack, MIC, secure; version 1.
-        e[5..7].copy_from_slice(&0x0391u16.to_be_bytes());
-        e[9..17].copy_from_slice(&counter.to_be_bytes());
-        e[65..73].copy_from_slice(&rsc.to_le_bytes());
-        e[97..99].copy_from_slice(&(key.len() as u16).to_be_bytes());
-        let mut data = key.to_vec();
-        let mut k = [0u8; 32];
-        k[16..].copy_from_slice(&s.ptk[16..32]);
-        rc4(&k, 256, &mut data);
-        e.extend_from_slice(&data);
-        let n = e.len() as u16 - 4;
-        e[2..4].copy_from_slice(&n.to_be_bytes());
-        let mic = hmac_md5(&s.ptk[..16], &[&e]);
-        e[81..97].copy_from_slice(&mic);
-        let mut body = LLC_EAPOL.to_vec();
-        body.extend_from_slice(&e);
-        from_ap(0, &OWN, &body)
+        let descriptor = if s.is_wpa1() { 0xFE } else { 2 };
+        // Group, key 1, ack, MIC, secure.
+        key_frame(s, descriptor, 0x0390, counter, &[0; 32], rsc, key)
     }
 
     /// The stick opens frames and checks none of their packet numbers
@@ -3197,12 +3180,27 @@ mod tests {
     /// (pairwise, ack, ...), its replay counter, nonce and key data,
     /// which is encrypted (RC4) and signed (MD5) if `s` has keys.
     fn eapol_key(s: &Station, info: u16, counter: u64, nonce: &[u8; 32], data: &[u8]) -> Vec<u8> {
+        key_frame(s, 2, info, counter, nonce, 0, data)
+    }
+
+    /// The same, of any descriptor type, the group key's counter at
+    /// `rsc`.
+    fn key_frame(
+        s: &Station,
+        descriptor: u8,
+        info: u16,
+        counter: u64,
+        nonce: &[u8; 32],
+        rsc: u64,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut e = std::vec![0u8; 99];
         e[..2].copy_from_slice(&[1, 3]);
-        e[4] = 2;
+        e[4] = descriptor;
         e[5..7].copy_from_slice(&(info | 1).to_be_bytes());
         e[9..17].copy_from_slice(&counter.to_be_bytes());
         e[17..49].copy_from_slice(nonce);
+        e[65..73].copy_from_slice(&rsc.to_le_bytes());
         e[97..99].copy_from_slice(&(data.len() as u16).to_be_bytes());
         let mut data = data.to_vec();
         if info & 0x100 != 0 {
