@@ -32,7 +32,15 @@ open(sys.argv[2], 'wb').write(app)
 open(sys.argv[3], 'wb').write(core + app)
 PY
 done
-ls -l ../target/*-full.bin | awk '{print $5, $NF}' 
+ls -l ../target/*-full.bin | awk '{print $5, $NF}'
+
+# The first image, which the C firmware (r3) writes once, as the server
+# sends it to a rabbit that still runs it: the same rescue core, then the
+# application packed (../pack, src/boot.rs). r3 writes the flash with its
+# watchdog unfed; this is short enough for its slowest flash.
+(cd .. && cargo run -q --profile host -p lapin-pack -- target/lapin-full.bin target/lapin-first.bin)
+rescue_len=$(wc -c < ../target/rescue.bin)
+echo "rescue core: $rescue_len bytes of its $((20 * 1024 - 8))"
 
 # The code that runs from RAM while the flash is busy must reach nothing
 # in the flash: every branch in the initialised data stays in RAM, and

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "cref", "fw", "metal", "p256"]
+members = ["core", "cref", "fw", "metal", "p256", "pack"]
 exclude = ["fuzz"]
 
 [workspace.package]

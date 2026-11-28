@@ -4,7 +4,7 @@
 
 #![no_std]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 pub use lapin_p256 as p256;
@@ -14,6 +14,7 @@ pub mod ccmp;
 mod hash;
 pub mod lz;
 pub mod md5;
+pub mod pack;
 pub mod rng;
 pub mod sae;
 pub mod sha1;

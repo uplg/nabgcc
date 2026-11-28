@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "The portable part of the rabbit's firmware: no hardware, no allocation"
 
+[features]
+# The packer of the first image (`pack::pack`), for the build.
+std = []
+
 [dependencies]
 lapin-p256 = { path = "../p256" }
 

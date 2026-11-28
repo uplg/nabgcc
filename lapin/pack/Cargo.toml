@@ -1,0 +1,10 @@
+[package]
+name = "lapin-pack"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Makes lapin-first.bin, the image the C firmware writes once: the rescue core, then the application packed"
+publish = false
+
+[dependencies]
+lapin-core = { path = "../core", features = ["std"] }
