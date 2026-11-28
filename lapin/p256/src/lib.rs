@@ -538,32 +538,98 @@ impl Point {
     /// `scalar` times the point, four bits at a time, with the same
     /// operations and the same memory accesses whatever the scalar.
     pub fn mul(&self, scalar: &Limbs) -> Point {
-        // 0P, 1P, ... 15P.
-        let mut table = [Point::infinity(); 16];
-        let mut i = 1;
-        while i < 16 {
-            table[i] = table[i - 1].add(self);
-            i += 1;
+        let mut m = Mul::new(self, scalar);
+        loop {
+            if let Some(p) = m.step(Mul::UNITS) {
+                return p;
+            }
         }
-        let mut result = Point::infinity();
-        let mut nibble = 64;
-        while nibble > 0 {
-            nibble -= 1;
-            result = result.double().double().double().double();
-            let digit = (scalar[nibble / 8] >> (4 * (nibble % 8))) & 15;
+    }
+}
+
+/// A scalar multiplication done a few digits at a time, so that the
+/// caller can do something else between steps (on the rabbit, keep the
+/// sound fed): `Point::mul` is this, run to its end. Every step of a
+/// given size does the same work whatever the scalar.
+#[derive(Clone)]
+pub struct Mul {
+    /// 0P, 1P, ... 15P.
+    table: [Point; 16],
+    result: Point,
+    scalar: Limbs,
+    /// Table entries still to compute, then four-bit digits still to go.
+    entries: u8,
+    digits: u8,
+}
+
+impl Mul {
+    /// The units of work in all: 64 four-bit digits, each four doublings
+    /// and an addition, after 14 additions for the table.
+    pub const UNITS: usize = 64 + 14;
+
+    pub fn new(point: &Point, scalar: &Limbs) -> Mul {
+        let mut m = Mul::IDLE;
+        m.reset(point, scalar);
+        m
+    }
+
+    /// One with nothing to do, to be `reset`: a place for a
+    /// multiplication to come, in a structure built at compile time.
+    pub const IDLE: Mul = {
+        const ZERO: Point = Point {
+            x: Fe::ZERO,
+            y: Fe::ZERO,
+            z: Fe::ZERO,
+        };
+        Mul {
+            table: [ZERO; 16],
+            result: ZERO,
+            scalar: [0; 8],
+            entries: 0,
+            digits: 0,
+        }
+    };
+
+    /// Start another multiplication, in place (the table is 1.5 KB:
+    /// better not built on the stack and copied).
+    pub fn reset(&mut self, point: &Point, scalar: &Limbs) {
+        self.table[0] = Point::infinity();
+        self.table[1] = *point;
+        self.result = Point::infinity();
+        self.scalar = *scalar;
+        self.entries = 14;
+        self.digits = 64;
+    }
+
+    /// Up to `n` units of work (a table entry, or a digit: four
+    /// doublings and an addition); the product once done.
+    pub fn step(&mut self, n: usize) -> Option<Point> {
+        let mut n = n;
+        while n > 0 && self.entries > 0 {
+            let i = 16 - self.entries as usize;
+            self.table[i] = self.table[i - 1].add(&self.table[1]);
+            self.entries -= 1;
+            n -= 1;
+        }
+        while n > 0 && self.digits > 0 {
+            self.digits -= 1;
+            let nibble = self.digits as usize;
+            self.result = self.result.double().double().double().double();
+            let digit = (self.scalar[nibble / 8] >> (4 * (nibble % 8))) & 15;
             // Read the whole table and keep one entry.
             let mut chosen = Point::infinity();
             let mut k = 0;
             while k < 16 {
                 let mask = ((k as u32 == digit) as u32).wrapping_neg();
-                chosen.x.select(&table[k].x, mask);
-                chosen.y.select(&table[k].y, mask);
-                chosen.z.select(&table[k].z, mask);
+                chosen.x.select(&self.table[k].x, mask);
+                chosen.y.select(&self.table[k].y, mask);
+                chosen.z.select(&self.table[k].z, mask);
                 k += 1;
             }
-            result = result.add(&chosen);
+            self.result = self.result.add(&chosen);
+            n -= 1;
         }
-        result
+        (self.entries == 0 && self.digits == 0).then_some(self.result)
     }
 }
 
@@ -632,6 +698,34 @@ mod tests {
         let mut n1 = N;
         n1[0] -= 1;
         assert!(same(&g.mul(&n1).add(&g.double()), &g));
+    }
+
+    #[test]
+    fn a_multiplication_in_steps_is_the_same_product() {
+        let g = Point::generator().mul(&[3, 1, 4, 1, 5, 9, 2, 6]);
+        let k = [
+            0xDEAD_BEEF,
+            1,
+            0x8000_0000,
+            7,
+            0,
+            0xFFFF_FFFF,
+            42,
+            0x7FFF_FFFF,
+        ];
+        let whole = g.mul(&k).to_bytes();
+        for n in [1, 2, 7, 16, Mul::UNITS] {
+            let mut m = Mul::new(&g, &k);
+            let mut steps = 1;
+            let p = loop {
+                if let Some(p) = m.step(n) {
+                    break p;
+                }
+                steps += 1;
+            };
+            assert_eq!(p.to_bytes(), whole, "steps of {n}");
+            assert_eq!(steps, Mul::UNITS.div_ceil(n), "steps of {n}");
+        }
     }
 
     #[test]
