@@ -211,27 +211,16 @@ mod rescue_network {
         let mut ipv4 = vec![0x45, 0, 0, 40, 0, 1, 0x40, 0, 64, 6, 0, 0];
         ipv4.extend(ip);
         ipv4.extend([192, 168, 0, 1]);
-        let sum = checksum(&ipv4);
+        let sum = nabemu::lan::checksum(&ipv4);
         ipv4[10..12].copy_from_slice(&sum.to_be_bytes());
         let mut pseudo = ipv4[12..20].to_vec();
         pseudo.extend([0, 6, 0, 20]);
         pseudo.extend(&tcp);
-        let sum = checksum(&pseudo);
+        let sum = nabemu::lan::checksum(&pseudo);
         tcp[16..18].copy_from_slice(&sum.to_be_bytes());
         f.extend(ipv4);
         f.extend(tcp);
         f
-    }
-
-    fn checksum(data: &[u8]) -> u16 {
-        let mut s = 0u32;
-        for c in data.chunks(2) {
-            s += (c[0] as u32) << 8 | *c.get(1).unwrap_or(&0) as u32;
-        }
-        while s > 0xFFFF {
-            s = (s & 0xFFFF) + (s >> 16);
-        }
-        !(s as u16)
     }
 
     /// The button held for 20 seconds from the start asks a working
