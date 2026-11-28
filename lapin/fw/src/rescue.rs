@@ -62,6 +62,14 @@ struct Ends {
     theirs: bool,
 }
 
+impl Ends {
+    /// Neither end closed yet.
+    const OPEN: Ends = Ends {
+        ours_acked: false,
+        theirs: false,
+    };
+}
+
 // Word aligned: the flash routine reads it a word at a time.
 #[repr(C, align(4))]
 struct Upload(core::cell::UnsafeCell<[u8; 128 * 1024]>);
@@ -112,6 +120,22 @@ fn fold(mut sum: u32) -> u16 {
     !(sum as u16)
 }
 
+/// Each element of a type, length, value list (802.11's elements,
+/// DHCP's options) to `each`, up to the `end` type if there is one or
+/// an element cut short.
+fn elements<'a>(mut list: &'a [u8], end: Option<u8>, mut each: impl FnMut(u8, &'a [u8])) {
+    while let [kind, len, rest @ ..] = list {
+        if Some(*kind) == end {
+            break;
+        }
+        let Some(value) = rest.get(..*len as usize) else {
+            break;
+        };
+        each(*kind, value);
+        list = &rest[*len as usize..];
+    }
+}
+
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
@@ -142,10 +166,7 @@ impl Rescue {
             request: 0,
             answer: &[],
             after: After::Nothing,
-            ends: Ends {
-                ours_acked: false,
-                theirs: false,
-            },
+            ends: Ends::OPEN,
             last_visit: timer::millis(),
             heard_at: 0,
             scanned: 0,
@@ -264,16 +285,11 @@ impl Rescue {
         match (f[0], f[1] & 3) {
             (0x40, 0) => {
                 let mut name: &[u8] = &[];
-                let mut ies = &f[24..];
-                while let [id, len, rest @ ..] = ies {
-                    let Some(body) = rest.get(..*len as usize) else {
-                        break;
-                    };
-                    if *id == 0 {
+                elements(&f[24..], None, |id, body| {
+                    if id == 0 {
                         name = body;
                     }
-                    ies = &rest[*len as usize..];
-                }
+                });
                 if name.is_empty() || name == self.ssid {
                     let n = self.beacon_like(0x50, &a2);
                     self.send(stick, n, true);
@@ -383,19 +399,11 @@ impl Rescue {
             return;
         }
         let mut kind = 0;
-        let mut o = &m[240..];
-        while let [code, len, rest @ ..] = o {
-            if *code == 255 {
-                break;
-            }
-            let Some(v) = rest.get(..*len as usize) else {
-                break;
-            };
-            if *code == 53 && !v.is_empty() {
+        elements(&m[240..], Some(255), |code, v| {
+            if code == 53 && !v.is_empty() {
                 kind = v[0];
             }
-            o = &rest[*len as usize..];
-        }
+        });
         let reply = match kind {
             1 => 2, // discover: offer
             3 => 5, // request: acknowledge
@@ -521,10 +529,7 @@ impl Rescue {
             self.request = 0;
             self.answer = &[];
             self.after = After::Nothing;
-            self.ends = Ends {
-                ours_acked: false,
-                theirs: false,
-            };
+            self.ends = Ends::OPEN;
             self.tcp = Tcp::SynReceived;
             self.segment(stick, 0x12, self.iss, None);
             return;

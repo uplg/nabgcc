@@ -83,6 +83,14 @@ fn play(stream: &[u8]) {
     }
 }
 
+/// Start a new stream, 16 dB below full volume: the header of a WAV of
+/// `data_len` bytes, the data to follow.
+fn start_wav(adpcm: bool, data_len: u32) {
+    codec::play_start();
+    codec::set_volume(0x20);
+    play(&wav_header(adpcm, data_len));
+}
+
 fn wav_header(adpcm: bool, data_len: u32) -> [u8; 48] {
     let mut h = [0u8; 48];
     h[..4].copy_from_slice(b"RIFF");
@@ -162,9 +170,7 @@ extern "C" fn main() -> ! {
     });
 
     // A second of the note.
-    codec::play_start();
-    codec::set_volume(0x20);
-    play(&wav_header(false, 16000));
+    start_wav(false, 16000);
     let mut period = [0u8; 32];
     for (bytes, sample) in period.as_chunks_mut::<2>().0.iter_mut().zip(NOTE) {
         *bytes = sample.to_le_bytes();
@@ -189,9 +195,7 @@ extern "C" fn main() -> ! {
     number(words as u32);
     uart::write(b" words\n");
 
-    codec::play_start();
-    codec::set_volume(0x20);
-    play(&wav_header(true, words as u32 * 2));
+    start_wav(true, words as u32 * 2);
     for word in &tape[..words] {
         play(&word.to_be_bytes());
     }
