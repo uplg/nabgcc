@@ -417,12 +417,6 @@ impl<'m, H: Host> Vm<'m, H> {
         v
     }
 
-    /// `VDROPN`.
-    #[inline]
-    fn drop_n(&mut self, n: i32) {
-        self.stack = self.stack.wrapping_add(n);
-    }
-
     /// `VCALLSTACKGET`.
     #[inline]
     fn cget(&self, off: i32, n: i32) -> i32 {

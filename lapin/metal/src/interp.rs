@@ -62,26 +62,6 @@ pub(crate) enum Flow {
 }
 
 impl<H: Host> Vm<'_, H> {
-    /// `TFCtest`: does the code at `p` only jump to a `ret`? Then the
-    /// call before it is a tail call.
-    fn tail_call(&self, mut p: i32, pbase: i32) -> bool {
-        while self.b(p) as i32 != RET {
-            if self.b(p) as i32 == GOTO {
-                p += 1;
-                p = pbase.wrapping_add(self.short(p));
-            } else {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// The `len` argument of the string natives: nil means "the rest".
-    #[inline]
-    fn len_or(&self, len: i32, rest: i32) -> i32 {
-        if len == NIL { rest } else { val(len) }
-    }
-
     /// `interpGo`: run the function on top of the stack, its arguments
     /// below it, until it returns.
     ///
@@ -346,8 +326,8 @@ impl<H: Host> Vm<'_, H> {
                             continue;
                         }
                     }
-                    // A call of a function by its number; closures go to the
-                    // cold side.
+                    // A call of a function by its number; a closure goes to
+                    // the cold side, which comes back here with its number.
                     EXEC if get!(0) & 1 == 0 => {
                         let fun = val(get!(0));
                         sp = sp.wrapping_add(1);
@@ -439,164 +419,45 @@ impl<H: Host> Vm<'_, H> {
     }
 
     /// Every opcode the hot loop of [`Self::interp_go`] leaves out, as
-    /// the C runs it, on the machine's own registers (`self.stack`).
+    /// the C runs it, on the machine's own registers (`self.stack`). The
+    /// hot loop's own opcodes never come here.
     #[inline(never)]
     fn cold(&mut self, op: i32, r: &mut Regs) -> Flow {
         match op {
+            // A closure, `[fun args]`: its arguments go on the stack in
+            // its place, then the hot loop calls the function by its
+            // number, which takes the slot the list's nil leaves.
             EXEC => {
-                let mut p = self.sget(0);
-                let fun;
-                if p & 1 != 0 {
-                    p = val(p);
-                    fun = val(self.fetch(p, 0));
-                    self.sset(0, self.fetch(p, 1));
-                    while self.sget(0) != NIL {
-                        self.push(self.fetch(val(self.sget(0)), 1));
-                        self.sset(1, self.fetch(val(self.sget(1)), 0));
-                    }
-                } else {
-                    fun = val(p);
+                let p = val(self.sget(0));
+                let fun = val(self.fetch(p, 0));
+                self.sset(0, self.fetch(p, 1));
+                while self.sget(0) != NIL {
+                    self.push(self.fetch(val(self.sget(0)), 1));
+                    self.sset(1, self.fetch(val(self.sget(1)), 0));
                 }
-                self.pull();
-                if fun < 0 {
-                    return Flow::Again(fun.wrapping_neg());
-                } else {
-                    let mut npc = self.fun_start(fun);
-                    let narg = self.b(npc) as i32;
-                    let nloc = self.short(npc + 1);
-                    npc += 3;
-
-                    if r.callstack <= 0 && self.tail_call(r.pc, r.pcbase) {
-                        r.pc = val(self.cget(r.callstackres, -3));
-                        r.pcbase = val(self.cget(r.callstackres, -2));
-                        let ncall = val(self.cget(r.callstackres, -1));
-                        r.callstackres = val(self.cget(r.callstackres, 0));
-                        for i in 0..narg {
-                            self.cset(r.callstack, i, self.sget(narg - i - 1));
-                        }
-                        self.stack = r.callstack - narg + 1;
-                        r.callstack = ncall;
-                    }
-
-                    for _ in 0..nloc {
-                        self.push(NIL);
-                    }
-                    self.push(int(r.pc));
-                    self.push(int(r.pcbase));
-                    self.push(int(r.callstack));
-                    self.push(int(r.callstackres));
-                    r.callstack = self.stack + 3 + nloc + narg;
-                    r.callstackres = self.stack;
-                    r.pc = npc;
-                    r.pcbase = npc;
-                }
-            }
-            RET => {
-                r.pc = val(self.sget(4));
-                r.pcbase = val(self.sget(3));
-                let ncall = val(self.sget(2));
-                r.callstackres = val(self.sget(1));
-                self.cset(r.callstack, 0, self.sget(0));
-                self.stack = r.callstack;
-                r.callstack = ncall;
-            }
-            INTB => {
-                let v = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
-                self.push(int(v));
-            }
-            INT => {
-                let v = self.int32(r.pc);
-                r.pc = r.pc.wrapping_add(4);
-                self.push(int(v));
-            }
-            NIL_ => {
-                self.push(NIL);
-            }
-            DROP => self.drop_n(1),
-            DUP => {
-                self.push(self.sget(0));
-            }
-            GETLOCALB => {
-                let i = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
-                self.push(self.cget(r.callstack, i));
+                self.sset(0, int(fun));
+                return Flow::Again(EXEC);
             }
             GETLOCAL => {
                 let v = self.cget(r.callstack, val(self.sget(0)));
                 self.sset(0, v);
             }
-            ADD..=SHR => {
-                let (a, b) = (val(self.sget(1)), val(self.sget(0)));
-                let r = match op {
-                    ADD => a.wrapping_add(b),
-                    SUB => a.wrapping_sub(b),
-                    MUL => a.wrapping_mul(b),
-                    DIV => div(a, b),
-                    MOD => rem(a, b),
-                    AND => a & b,
-                    OR => a | b,
-                    EOR => a ^ b,
-                    SHL => shl(a, b),
-                    _ => shr(a, b),
-                };
-                self.sset(1, int(r));
-                self.drop_n(1);
-            }
-            NEG => self.sset(0, int(val(self.sget(0)).wrapping_neg())),
-            NOT => self.sset(0, int(!val(self.sget(0)))),
-            NON => self.sset(0, int((val(self.sget(0)) == 0) as i32)),
-            EQ | NE => {
-                let same = self.sget(1) == self.sget(0);
-                self.sset(1, int((same == (op == EQ)) as i32));
-                self.drop_n(1);
-            }
-            LT..=GE => {
-                let (a, b) = (val(self.sget(1)), val(self.sget(0)));
-                let r = match op {
-                    LT => a < b,
-                    GT => a > b,
-                    LE => a <= b,
-                    _ => a >= b,
-                };
-                self.sset(1, int(r as i32));
-                self.drop_n(1);
-            }
-            GOTO => r.pc = r.pcbase.wrapping_add(self.short(r.pc)),
-            ELSE => {
-                if self.pull() == 0 {
-                    r.pc = r.pcbase.wrapping_add(self.short(r.pc));
+            MKTABB | MKTAB => {
+                let n = if op == MKTABB {
+                    self.operand(r)
                 } else {
-                    r.pc = r.pc.wrapping_add(2);
-                }
-            }
-            MKTABB => {
-                let n = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
+                    val(self.pull())
+                };
                 let p = self.alloc_tab_clear(n);
                 self.push(pnt(p));
             }
-            MKTAB => {
-                let n = val(self.pull());
-                let p = self.alloc_tab_clear(n);
-                self.push(pnt(p));
-            }
-            DEFTABB => {
-                let n = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
+            DEFTABB | DEFTAB => {
+                let n = if op == DEFTABB {
+                    self.operand(r)
+                } else {
+                    val(self.pull())
+                };
                 self.stack_to_tab(n);
-            }
-            DEFTAB => {
-                let n = val(self.pull());
-                self.stack_to_tab(n);
-            }
-            FETCHB => {
-                let i = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
-                let p = self.sget(0);
-                if p != NIL {
-                    self.sset(0, self.fetch(val(p), i));
-                }
             }
             FETCH => {
                 let i = self.pull();
@@ -612,38 +473,21 @@ impl<H: Host> Vm<'_, H> {
                     }
                 }
             }
-            GETGLOBALB => {
-                let i = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
-                self.push(self.cget(self.global_start, i));
-            }
             GETGLOBAL => {
                 let v = self.cget(self.global_start, val(self.sget(0)));
                 self.sset(0, v);
             }
-            SECHO => self.secho(self.sget(0), false),
-            IECHO => self.iecho(self.sget(0), false),
-            SETLOCALB => {
-                let i = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
-                let v = self.pull();
-                self.cset(r.callstack, i, v);
-            }
+            SECHO | SECHOLN => self.secho(self.sget(0), op == SECHOLN),
+            IECHO | IECHOLN => self.iecho(self.sget(0), op == IECHOLN),
             SETLOCAL => {
                 let i = val(self.pull());
                 let v = self.pull();
                 self.cset(r.callstack, i, v);
             }
-            SETGLOBAL => {
-                self.cset(self.global_start, val(self.sget(1)), self.sget(0));
-                self.sset(1, self.sget(0));
-                self.pull();
-            }
             SETSTRUCTB => {
                 // The C checks `i >= 0 || i < size`, which always
                 // holds: the store happens whatever the index.
-                let i = self.b(r.pc) as i32;
-                r.pc = r.pc.wrapping_add(1);
+                let i = self.operand(r);
                 let v = self.pull();
                 let p = self.sget(0);
                 if p != NIL {
@@ -658,25 +502,10 @@ impl<H: Host> Vm<'_, H> {
                     self.store(val(p), val(i), v);
                 }
             }
-            HD | TL => {
-                let p = self.sget(0);
-                if p != NIL {
-                    self.sset(0, self.fetch(val(p), (op == TL) as i32));
-                }
-            }
             SETLOCAL2 => {
                 self.cset(r.callstack, val(self.sget(1)), self.sget(0));
                 self.sset(1, self.sget(0));
                 self.pull();
-            }
-            STORE => {
-                let v = self.pull();
-                let i = self.pull();
-                let p = self.sget(0);
-                if p != NIL && i != NIL && self.indexable(val(p), val(i)) {
-                    self.store(val(p), val(i), v);
-                }
-                self.sset(0, v);
             }
             CALL => {
                 let p = self.sget(0);
@@ -699,36 +528,6 @@ impl<H: Host> Vm<'_, H> {
                     self.push(int(n));
                     return Flow::Again(CALLR);
                 }
-            }
-            CALLRB | CALLR => {
-                let n = if op == CALLRB {
-                    let n = self.b(r.pc) as i32;
-                    r.pc = r.pc.wrapping_add(1);
-                    n
-                } else {
-                    val(self.pull())
-                };
-                let valn = self.sget(n);
-                if valn == NIL {
-                    self.drop_n(n);
-                } else {
-                    let mut i = n;
-                    while i > 0 {
-                        self.sset(i, self.sget(i - 1));
-                        i -= 1;
-                    }
-                    self.sset(0, valn);
-                    return Flow::Again(EXEC);
-                }
-            }
-            FIRST => {
-                let p = self.sget(0);
-                let v = if p != NIL { self.fetch(val(p), 0) } else { NIL };
-                self.push(v);
-            }
-            TIME_MS => {
-                let t = self.host.time_ms() as i32;
-                self.push(int(t));
             }
             TABNEW => {
                 let v = self.pull();
@@ -802,99 +601,37 @@ impl<H: Host> Vm<'_, H> {
                 }
             }
             STRCPY => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.pull());
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let len = self.len_or(len, self.size_bin(q).wrapping_sub(start));
-                    let (lp, lq) = (self.size_bin(p), self.size_bin(q));
-                    self.sys_cpy(
-                        Self::start_bin(p),
-                        index,
-                        lp,
-                        Self::start_bin(q),
-                        start,
-                        lq,
-                        len,
-                    );
+                if let Ok(s) = self.pull_two() {
+                    let len = val_or(s.len, s.lq.wrapping_sub(s.start));
+                    self.sys_cpy(s.p, val(s.index), s.lp, s.q, s.start, s.lq, len);
                 }
             }
             VSTRCMP => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.pull());
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let (lp, lq) = (self.size_bin(p), self.size_bin(q));
-                    let len = if len == NIL {
-                        let l = lq.wrapping_sub(start);
-                        if l < lp.wrapping_sub(index) {
-                            lp.wrapping_sub(index)
-                        } else {
-                            l
-                        }
-                    } else {
-                        val(len)
-                    };
-                    let r = self.sys_cmp(
-                        Self::start_bin(p),
-                        index,
-                        lp,
-                        Self::start_bin(q),
-                        start,
-                        lq,
-                        len,
-                    );
-                    self.sset(0, int(r));
-                } else {
-                    let r = if p != NIL {
-                        1
-                    } else if q != NIL {
-                        -1
-                    } else {
-                        0
-                    };
-                    self.sset(0, int(r));
-                }
+                let r = match self.pull_two() {
+                    Ok(s) => {
+                        let index = val(s.index);
+                        let rest = s.lq.wrapping_sub(s.start).max(s.lp.wrapping_sub(index));
+                        let len = val_or(s.len, rest);
+                        self.sys_cmp(s.p, index, s.lp, s.q, s.start, s.lq, len)
+                    }
+                    Err((p, q)) => nil_order(p, q),
+                };
+                self.sset(0, int(r));
             }
             STRFIND | STRFINDREV => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.pull());
-                let index = self.pull();
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let (lp, lq) = (self.size_bin(p), self.size_bin(q));
-                    let len = self.len_or(len, lq.wrapping_sub(start));
-                    let r = if op == STRFIND {
-                        self.sys_find(
-                            Self::start_bin(p),
-                            val(index),
-                            lp,
-                            Self::start_bin(q),
-                            start,
-                            lq,
-                            len,
-                        )
-                    } else {
-                        let index = if index == NIL { lp - 1 } else { val(index) };
-                        self.sys_findrev(
-                            Self::start_bin(p),
-                            index,
-                            lp,
-                            Self::start_bin(q),
-                            start,
-                            lq,
-                            len,
-                        )
-                    };
-                    self.sset(0, r);
-                } else {
-                    self.sset(0, NIL);
-                }
+                let r = match self.pull_two() {
+                    Ok(s) => {
+                        let len = val_or(s.len, s.lq.wrapping_sub(s.start));
+                        if op == STRFIND {
+                            self.sys_find(s.p, val(s.index), s.lp, s.q, s.start, s.lq, len)
+                        } else {
+                            let index = val_or(s.index, s.lp - 1);
+                            self.sys_findrev(s.p, index, s.lp, s.q, s.start, s.lq, len)
+                        }
+                    }
+                    Err(_) => NIL,
+                };
+                self.sset(0, r);
             }
             STRLEN => {
                 let p = val(self.sget(0));
@@ -916,23 +653,16 @@ impl<H: Host> Vm<'_, H> {
                 let len = self.pull();
                 let start = val(self.pull());
                 let q = val(self.sget(0));
-                if q != NIL {
-                    let lq = self.size_bin(q);
-                    let mut len = self.len_or(len, lq.wrapping_sub(start));
-                    if start.wrapping_add(len) > lq {
-                        len = lq - start;
-                    }
-                    if start >= 0 && len >= 0 {
+                let v = match self.sub_len(q, start, len) {
+                    Some(len) => {
                         let p = self.alloc_bin(len);
                         let from = Self::start_bin(val(self.sget(0))) + start;
                         self.copy_bytes(Self::start_bin(p), from, len);
-                        self.sset(0, pnt(p));
-                    } else {
-                        self.sset(0, NIL);
+                        pnt(p)
                     }
-                } else {
-                    self.sset(0, NIL);
-                }
+                    None => NIL,
+                };
+                self.sset(0, v);
             }
             STRCAT => {
                 let q = val(self.sget(0));
@@ -1024,22 +754,15 @@ impl<H: Host> Vm<'_, H> {
                 let len = self.pull();
                 let start = val(self.pull());
                 let q = val(self.sget(0));
-                if q != NIL {
-                    let lq = self.size_bin(q);
-                    let mut len = self.len_or(len, lq.wrapping_sub(start));
-                    if start.wrapping_add(len) > lq {
-                        len = lq - start;
-                    }
-                    if start >= 0 && len >= 0 {
-                        let n = self.play_feed(Some((Self::start_bin(q) + start, len)));
-                        self.sset(0, int(n));
-                    } else {
-                        self.sset(0, NIL);
-                    }
-                } else {
+                let v = if q == NIL {
                     self.play_feed(None);
-                    self.sset(0, NIL);
-                }
+                    NIL
+                } else if let Some(len) = self.sub_len(q, start, len) {
+                    int(self.play_feed(Some((Self::start_bin(q) + start, len))))
+                } else {
+                    NIL
+                };
+                self.sset(0, v);
             }
             PLAYSTOP => {
                 self.play_stop();
@@ -1066,23 +789,19 @@ impl<H: Host> Vm<'_, H> {
                 }
             }
             LOAD | SAVE => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.pull());
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let lp = self.size_bin(p);
-                    let len = self.len_or(len, lp.wrapping_sub(index));
-                    let n = if op == LOAD {
-                        self.sys_load(Self::start_bin(p), index, lp, start, len)
-                    } else {
-                        self.sys_save(Self::start_bin(p), index, lp, start, len)
-                    };
-                    self.sset(0, int(n));
-                } else {
-                    self.sset(0, NIL);
-                }
+                let v = match self.pull_two() {
+                    Ok(s) => {
+                        let index = val(s.index);
+                        let len = val_or(s.len, s.lp.wrapping_sub(index));
+                        int(if op == LOAD {
+                            self.sys_load(s.p, index, s.lp, s.start, len)
+                        } else {
+                            self.sys_save(s.p, index, s.lp, s.start, len)
+                        })
+                    }
+                    Err(_) => NIL,
+                };
+                self.sset(0, v);
             }
             GC => {
                 self.gc();
@@ -1122,8 +841,6 @@ impl<H: Host> Vm<'_, H> {
                 }
             }
             LOOPCB => self.cset(self.sys_start, SYS_CBLOOP, self.sget(0)),
-            SECHOLN => self.secho(self.sget(0), true),
-            IECHOLN => self.iecho(self.sget(0), true),
             ENVGET => {
                 self.push(self.cget(self.sys_start, SYS_ENV));
             }
@@ -1133,10 +850,7 @@ impl<H: Host> Vm<'_, H> {
                 None => {
                     self.push(NIL);
                 }
-                Some(id) => {
-                    let p = self.alloc_str(&id);
-                    self.push(pnt(p));
-                }
+                Some(id) => self.push_str(&id),
             },
             PLAYTIME => {
                 let t = self.play_time();
@@ -1147,27 +861,16 @@ impl<H: Host> Vm<'_, H> {
                 let speed = val(self.pull());
                 let indmac = val(self.pull());
                 let q = val(self.pull());
-                let len = self.pull();
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let lp = self.size_bin(p);
-                    let len = self.len_or(len, lp.wrapping_sub(index));
-                    let lq = self.size_bin(q);
-                    let r = self.net_send(
-                        Self::start_bin(p),
-                        index,
-                        len,
-                        lp,
-                        Self::start_bin(q),
-                        indmac,
-                        lq,
-                        speed,
-                    );
-                    self.sset(0, int(r));
-                } else {
-                    self.sset(0, NIL);
-                }
+                let r = match self.pull_span() {
+                    Some(s) if q != NIL => {
+                        let (mac, lmac) = (Self::start_bin(q), self.size_bin(q));
+                        let r =
+                            self.net_send(s.at, s.index, s.len, s.size, mac, indmac, lmac, speed);
+                        int(r)
+                    }
+                    _ => NIL,
+                };
+                self.sset(0, r);
             }
             NETSTATE => {
                 let s = self.host.net_state();
@@ -1175,22 +878,15 @@ impl<H: Host> Vm<'_, H> {
             }
             NETMAC => {
                 let mac = self.host.net_mac();
-                let p = self.alloc_str(&mac);
-                self.push(pnt(p));
+                self.push_str(&mac);
             }
             NETCHK => {
                 let v = val(self.pull());
-                let len = self.pull();
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL {
-                    let lp = self.size_bin(p);
-                    let len = self.len_or(len, lp.wrapping_sub(index));
-                    let r = self.net_chk(Self::start_bin(p), index, len, lp, v as u32);
-                    self.sset(0, int(r as i32));
-                } else {
-                    self.sset(0, int(v));
-                }
+                let r = match self.pull_span() {
+                    Some(s) => self.net_chk(s.at, s.index, s.len, s.size, v as u32) as i32,
+                    None => v,
+                };
+                self.sset(0, int(r));
             }
             NETSETMODE => {
                 let chn = val(self.pull());
@@ -1247,36 +943,20 @@ impl<H: Host> Vm<'_, H> {
                     self.sset(0, int(v));
                 }
             }
-            ITOA => {
+            ITOA | CTOA | ITOH | CTOH | ITOBIN2 => {
                 let v = val(self.pull());
-                self.itoa(v);
+                match op {
+                    ITOA => self.itoa(v),
+                    CTOA => self.ctoa(v),
+                    ITOH => self.itoh(v),
+                    CTOH => self.ctoh(v),
+                    _ => self.itobin2(v),
+                }
             }
-            CTOA => {
-                let v = val(self.pull());
-                self.ctoa(v);
-            }
-            ITOH => {
-                let v = val(self.pull());
-                self.itoh(v);
-            }
-            CTOH => {
-                let v = val(self.pull());
-                self.ctoh(v);
-            }
-            ITOBIN2 => {
-                let v = val(self.pull());
-                self.itobin2(v);
-            }
-            LISTSWITCH => {
+            LISTSWITCH | LISTSWITCHSTR => {
                 let key = self.pull();
                 let p = val(self.sget(0));
-                let v = self.listswitch(p, key);
-                self.sset(0, v);
-            }
-            LISTSWITCHSTR => {
-                let key = self.pull();
-                let p = val(self.sget(0));
-                let v = if key == NIL {
+                let v = if op == LISTSWITCH || key == NIL {
                     self.listswitch(p, key)
                 } else {
                     self.listswitchstr(p, Self::start_bin(val(key)))
@@ -1304,26 +984,17 @@ impl<H: Host> Vm<'_, H> {
             }
             SNDFEED => {
                 let len = self.pull();
-                let start = self.pull();
+                let start = val_or(self.pull(), 0);
                 let q = val(self.sget(0));
-                let start = if start == NIL { 0 } else { val(start) };
-                if q != NIL {
-                    let lq = self.size_bin(q);
-                    let mut len = self.len_or(len, lq.wrapping_sub(start));
-                    if start.wrapping_add(len) > lq {
-                        len = lq - start;
-                    }
-                    if start >= 0 && len >= 0 {
+                let v = match self.sub_len(q, start, len) {
+                    Some(len) => {
                         let heap = crate::bytes(&self.mem.heap);
                         let data = crate::natives::clip(heap, Self::start_bin(q) + start, len);
-                        let k = self.host.codec_feed(data) as i32;
-                        self.sset(0, int(k));
-                    } else {
-                        self.sset(0, NIL);
+                        int(self.host.codec_feed(data) as i32)
                     }
-                } else {
-                    self.sset(0, NIL);
-                }
+                    None => NIL,
+                };
+                self.sset(0, v);
             }
             SNDAMPLI => {
                 let on = val(self.sget(0)) as u8;
@@ -1353,36 +1024,20 @@ impl<H: Host> Vm<'_, H> {
             STRCMP => {
                 let q = val(self.pull());
                 let p = val(self.sget(0));
-                if p != NIL && q != NIL {
+                let r = if p != NIL && q != NIL {
                     let (pl, ql) = (self.size_bin(p), self.size_bin(q));
-                    let r = self.memcmp(Self::start_bin(p), Self::start_bin(q), pl.max(ql));
-                    self.sset(0, int(r));
+                    self.memcmp(Self::start_bin(p), Self::start_bin(q), pl.max(ql))
                 } else {
-                    let r = if p != NIL {
-                        1
-                    } else if q != NIL {
-                        -1
-                    } else {
-                        0
-                    };
-                    self.sset(0, int(r));
-                }
+                    nil_order(p, q)
+                };
+                self.sset(0, int(r));
             }
             ADP2WAV | WAV2ADP | ALAW2WAV | WAV2ALAW => {
-                let mu = if op == ALAW2WAV || op == WAV2ALAW {
-                    val(self.pull()) != 0
-                } else {
-                    false
-                };
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.pull());
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL && q != NIL {
-                    let (lp, lq) = (self.size_bin(p), self.size_bin(q));
-                    let len = self.len_or(len, lq.wrapping_sub(start));
-                    let (dp, dq) = (Self::start_bin(p), Self::start_bin(q));
+                let mu = (op == ALAW2WAV || op == WAV2ALAW) && val(self.pull()) != 0;
+                if let Ok(s) = self.pull_two() {
+                    let (dp, index, lp, dq, start, lq) =
+                        (s.p, val(s.index), s.lp, s.q, s.start, s.lq);
+                    let len = val_or(s.len, lq.wrapping_sub(start));
                     match op {
                         ADP2WAV => self.adp2wav(dp, index, lp, dq, start, lq, len),
                         WAV2ADP => self.wav2adp(dp, index, lp, dq, start, lq, len),
@@ -1401,8 +1056,7 @@ impl<H: Host> Vm<'_, H> {
                     let ssid = crate::natives::cstr(heap, Self::start_bin(ssid));
                     let key = crate::natives::cstr(heap, Self::start_bin(key));
                     let pmk = self.host.net_pmk(ssid, key);
-                    let p = self.alloc_str(&pmk);
-                    self.push(pnt(p));
+                    self.push_str(&pmk);
                 }
             }
             FLASHFIRMWARE => {
@@ -1417,21 +1071,15 @@ impl<H: Host> Vm<'_, H> {
             CRYPT | UNCRYPT => {
                 let alpha = val(self.pull());
                 let key = val(self.pull());
-                let len = self.pull();
-                let index = val(self.pull());
-                let p = val(self.sget(0));
-                if p != NIL {
-                    let lp = self.size_bin(p);
-                    let len = self.len_or(len, lp.wrapping_sub(index));
-                    let r = if op == CRYPT {
-                        self.crypt(Self::start_bin(p), index, len, lp, key, alpha)
+                let r = match self.pull_span() {
+                    Some(s) => int(if op == CRYPT {
+                        self.crypt(s.at, s.index, s.len, s.size, key, alpha)
                     } else {
-                        self.uncrypt(Self::start_bin(p), index, len, lp, key, alpha)
-                    };
-                    self.sset(0, int(r));
-                } else {
-                    self.sset(0, NIL);
-                }
+                        self.uncrypt(s.at, s.index, s.len, s.size, key, alpha)
+                    }),
+                    None => NIL,
+                };
+                self.sset(0, r);
             }
             NETRSSI => {
                 let r = self.host.net_rssi();
@@ -1476,5 +1124,111 @@ impl<H: Host> Vm<'_, H> {
             _ => {}
         }
         Flow::Next
+    }
+
+    /// The byte after the opcode.
+    fn operand(&self, r: &mut Regs) -> i32 {
+        let v = self.b(r.pc) as i32;
+        r.pc = r.pc.wrapping_add(1);
+        v
+    }
+
+    /// Pull `len` and `index`, the arguments of the natives on a part of
+    /// a string; the string stays on the stack for the result. None when
+    /// it is nil.
+    fn pull_span(&mut self) -> Option<Span> {
+        let len = self.pull();
+        let index = val(self.pull());
+        let p = val(self.sget(0));
+        (p != NIL).then(|| {
+            let size = self.size_bin(p);
+            Span {
+                at: Self::start_bin(p),
+                size,
+                index,
+                len: val_or(len, size.wrapping_sub(index)),
+            }
+        })
+    }
+
+    /// Pull `index q start len`, the arguments of the natives from one
+    /// string to another; the first string stays on the stack for the
+    /// result. Both strings, as blocks, when either is nil.
+    fn pull_two(&mut self) -> Result<Two, (i32, i32)> {
+        let len = self.pull();
+        let start = val(self.pull());
+        let q = val(self.pull());
+        let index = self.pull();
+        let p = val(self.sget(0));
+        if p == NIL || q == NIL {
+            return Err((p, q));
+        }
+        Ok(Two {
+            p: Self::start_bin(p),
+            lp: self.size_bin(p),
+            index,
+            q: Self::start_bin(q),
+            lq: self.size_bin(q),
+            start,
+            len,
+        })
+    }
+
+    /// How many bytes `strsub` and the sound natives take from the string
+    /// `q` at `start`: `len`, or the rest when nil, cut at its end. None
+    /// for a nil string, or a part that starts before it or ends before
+    /// it starts.
+    fn sub_len(&self, q: i32, start: i32, len: i32) -> Option<i32> {
+        if q == NIL {
+            return None;
+        }
+        let lq = self.size_bin(q);
+        let mut len = val_or(len, lq.wrapping_sub(start));
+        if start.wrapping_add(len) > lq {
+            len = lq - start;
+        }
+        (start >= 0 && len >= 0).then_some(len)
+    }
+}
+
+/// A part of a string, from [`Vm::pull_span`]: the string's first byte
+/// and its size, the index and the length asked for (nil already read
+/// as the rest).
+struct Span {
+    at: i32,
+    size: i32,
+    index: i32,
+    len: i32,
+}
+
+/// Two strings and where in them, from [`Vm::pull_two`]: each string's
+/// first byte and size, then the other arguments. The index and the
+/// length are as the stack holds them: what nil stands for there is the
+/// native's business.
+struct Two {
+    p: i32,
+    lp: i32,
+    index: i32,
+    q: i32,
+    lq: i32,
+    start: i32,
+    len: i32,
+}
+
+/// The integer a word holds, or `nil` when the word is nil: the natives'
+/// optional arguments.
+fn val_or(v: i32, nil: i32) -> i32 {
+    if v == NIL { nil } else { val(v) }
+}
+
+/// The order of two strings when one is nil (`p` and `q` are blocks): a
+/// string comes after nil.
+fn nil_order(p: i32, q: i32) -> i32 {
+    if p != NIL {
+        1
+    } else if q != NIL {
+        -1
+    } else {
+        0
     }
 }

@@ -277,6 +277,12 @@ impl<H: Host> Vm<'_, H> {
         p
     }
 
+    /// The same, pushed.
+    pub(crate) fn push_str(&mut self, src: &[u8]) {
+        let p = self.alloc_str(src);
+        self.push(pnt(p));
+    }
+
     /// `vmemAllocString` from bytes of the heap, read after the
     /// allocation as the C reads them.
     pub(crate) fn alloc_str_heap(&mut self, src: i32, len: i32) -> i32 {

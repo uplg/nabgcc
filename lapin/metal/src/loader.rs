@@ -95,11 +95,6 @@ impl<H: Host> Vm<'_, H> {
         }
         src
     }
-
-    /// `loaderFunstart`.
-    pub(crate) fn fun_start(&self, fun: i32) -> i32 {
-        self.int32(self.tabfun.wrapping_add(fun << 2))
-    }
 }
 
 /// `(n + 3) >> 2` on the C's `uint32_t`.
