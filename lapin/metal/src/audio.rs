@@ -109,6 +109,8 @@ pub(crate) struct Audio {
     play_state: u8,
     rec_state: u8,
     try_to_feed: i32,
+    /// Zeros still to send after a stream that ended (state 3).
+    end_fill: i32,
     predicted: i16,
     step_index: u8,
     vol: i32,
@@ -122,6 +124,7 @@ impl Audio {
             play_state: 0,
             rec_state: 0,
             try_to_feed: 2048,
+            end_fill: 0,
             predicted: 0,
             step_index: 0,
             vol: 0,
@@ -135,9 +138,11 @@ impl Audio {
     }
 
     /// The step the index points at. The C indexes its table with the
-    /// saved byte, unchecked: a bad block header reads past it.
+    /// saved byte, unchecked: a bad block header reads past it, whatever
+    /// lies there. Here an index past the table is its last one, as the
+    /// decoding itself keeps it.
     fn step(&self) -> i32 {
-        STEPS.get(self.step_index as usize).copied().unwrap_or(0) as i32
+        STEPS[(self.step_index as usize).min(STEPS.len() - 1)] as i32
     }
 
     /// What decoding and encoding share once a nibble's difference is
@@ -320,10 +325,42 @@ impl<H: Host> Vm<'_, H> {
         v
     }
 
+    /// The byte last taken from the ring goes back to its head.
+    fn play_unfetch(&mut self) {
+        self.audio.play_r -= 1;
+        if self.audio.play_r < 0 {
+            self.audio.play_r += AUDIO_FIFOPLAY as i32;
+        }
+    }
+
+    /// After the end of a stream: the zeros the VS1003 wants after a
+    /// file so that it plays its last frames (2048, data sheet 9.3),
+    /// then the amplifier off. The C sent nothing and left it on.
+    fn play_end_fill(&mut self) {
+        const ZEROS: [u8; 32] = [0; 32];
+        while self.audio.end_fill > 0 && self.host.codec_ready() {
+            self.host.watchdog();
+            let n = (self.audio.end_fill as usize).min(ZEROS.len());
+            let took = self.host.codec_feed(&ZEROS[..n]);
+            if took == 0 {
+                break;
+            }
+            self.audio.end_fill -= took as i32;
+        }
+        if self.audio.end_fill <= 0 {
+            self.host.amplifier(false);
+            self.audio.play_state = 0;
+        }
+    }
+
     /// `play_check`: feed the codec while it asks, refilling the ring
     /// from the bytecode unless `nocb`.
     pub(crate) fn play_check(&mut self, nocb: bool) {
         if self.audio.play_state == 0 || !self.host.codec_ready() {
+            return;
+        }
+        if self.audio.play_state == 3 {
+            self.play_end_fill();
             return;
         }
         let mut nocb = nocb;
@@ -338,16 +375,25 @@ impl<H: Host> Vm<'_, H> {
             self.host.watchdog();
             let mut v = self.play_fetch_byte();
             if v < 0 && nb + nb >= self.audio.try_to_feed && !nocb {
+                // Once: the C asks a second time at once and drops what
+                // that call says (B41).
                 nocb = !self.play_try_feed(self.audio.try_to_feed);
-                self.play_try_feed(self.audio.try_to_feed);
                 v = self.play_fetch_byte();
             }
             if v >= 0 {
+                if self.host.codec_feed(&[v as u8]) == 0 {
+                    // DREQ fell meanwhile, in the bytecode's refill: the
+                    // byte waits in the ring for the codec. Lost, one
+                    // byte would swap every 16-bit sample after it.
+                    self.play_unfetch();
+                    break;
+                }
                 nb += 1;
-                self.host.codec_feed(&[v as u8]);
             } else {
                 if self.audio.play_state == 2 {
-                    self.audio.play_state = 0;
+                    self.audio.play_state = 3;
+                    self.audio.end_fill = 2048;
+                    self.play_end_fill();
                 }
                 break;
             }
@@ -433,7 +479,8 @@ impl<H: Host> Vm<'_, H> {
 
     /// `audioRecVol`: the loudness of a 256-byte ADPCM block.
     pub(crate) fn rec_vol(&mut self, src: i32, len: i32, start: i32) -> i32 {
-        if start.wrapping_add(256) > len {
+        // The C reads before the string from a negative start (B38).
+        if start < 0 || start.wrapping_add(256) > len {
             return 0;
         }
         self.decode_block(src + start, None);
