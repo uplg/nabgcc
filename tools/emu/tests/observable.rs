@@ -535,3 +535,36 @@ fn net_pmk_of_a_name_too_long() {
         assert_eq!(printed(&m), []);
     }
 }
+
+/// Frames for the bytecode that came before it scans are still there
+/// after: the C driver had queued them, lapin threw them away.
+#[test]
+fn frames_that_came_before_a_scan_are_kept() {
+    let mut main = busy(0, 2000);
+    main.extend([NIL, NETSCAN, DROP]);
+    main.extend(metal::int(1));
+    main.extend([NETCB, DROP]);
+    let main = program(&main);
+    let mut callback = vec![2, 0, 0];
+    callback.extend(metal::int(6666));
+    callback.extend([IECHOLN, metal::OP_RET]);
+    let mut m = common::under_test();
+    m.serve(&metal::bytecode_functions(&[], &[&main, &callback]));
+    until(&mut m, 40_000, "the program", |m| {
+        find(&m.soc.uart_tx, b"7770").is_some()
+    });
+    let mut eth = DEFAULT_MAC.to_vec();
+    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
+    eth.extend_from_slice(&[0x5A; 200]);
+    for _ in 0..20 {
+        m.air[0].send(&mut m.radio.borrow_mut(), &eth);
+        wait(&mut m, 20);
+    }
+    until(&mut m, 20_000, "the program's end", |m| {
+        find(&m.soc.uart_tx, b"8880").is_some()
+    });
+    wait(&mut m, 2000);
+    let c = m.console();
+    let delivered = c[c.find("8880").unwrap()..].matches("6666").count();
+    assert!(delivered >= 20, "{delivered} delivered");
+}

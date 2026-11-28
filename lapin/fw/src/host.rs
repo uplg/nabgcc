@@ -342,6 +342,9 @@ impl Host for Board {
     }
 
     fn net_scan(&mut self, ssid: Option<&[u8]>) -> usize {
+        // What came before stays for the bytecode, as in the C driver's
+        // queue: the scan takes what comes during it.
+        self.pump(false);
         let frame = &mut *self.frame;
         let scan = &mut *self.scan;
         let mut n = 0;
@@ -369,7 +372,6 @@ impl Host for Board {
                     scan[slot] = heard;
                 }
             });
-        self.inbox.clear();
         self.scanned = n;
         n
     }
