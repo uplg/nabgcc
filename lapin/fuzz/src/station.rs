@@ -14,8 +14,7 @@ use lapin_core::aes::{self, Aes};
 use lapin_core::ccmp;
 use lapin_core::md5::{hmac_md5, rc4};
 use lapin_core::sae::{self, Commit, Session};
-use lapin_core::sha1::{hmac_sha1, prf};
-use lapin_core::sha256;
+use lapin_core::sha1::hmac_sha1;
 use lapin_core::wifi::{self, HwCipher, LLC_EAPOL, Link, Mac, Rx, Station, Tx};
 
 use crate::input::Input;
@@ -209,28 +208,6 @@ impl Air {
         }
     }
 
-    fn derive(&self, snonce: &[u8; 32]) -> [u8; 64] {
-        let (lo, hi) = if STA < AP { (STA, AP) } else { (AP, STA) };
-        let a = self.keys.anonce;
-        let (n_lo, n_hi) = if *snonce < a {
-            (*snonce, a)
-        } else {
-            (a, *snonce)
-        };
-        let mut seed = [0u8; 76];
-        seed[..6].copy_from_slice(&lo);
-        seed[6..12].copy_from_slice(&hi);
-        seed[12..44].copy_from_slice(&n_lo);
-        seed[44..].copy_from_slice(&n_hi);
-        let mut ptk = [0u8; 64];
-        if self.sae_kind() {
-            sha256::kdf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk[..48]);
-        } else {
-            prf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk);
-        }
-        ptk
-    }
-
     fn tk(&self) -> Option<[u8; 16]> {
         let ptk = self.keys.ptk?;
         let mut tk = [0u8; 16];
@@ -288,7 +265,14 @@ impl Air {
         }
         if nonce != [0; 32] {
             // Message 2.
-            self.keys.pending = Some(self.derive(&nonce));
+            self.keys.pending = Some(wifi::pairwise_keys(
+                &self.pmk,
+                &STA,
+                &AP,
+                &self.keys.anonce,
+                &nonce,
+                self.sae_kind(),
+            ));
         } else if let Some(p) = self.keys.pending.take() {
             // Message 4.
             self.keys.ptk = Some(p);

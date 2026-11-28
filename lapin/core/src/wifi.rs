@@ -502,6 +502,38 @@ fn txtime(len: usize, rate: u8) -> u16 {
     (26 + 4 * (bits / rate) + if !bits.is_multiple_of(rate) { 4 } else { 0 }) as u16
 }
 
+/// The pairwise keys of a handshake (IEEE 802.11-2020 12.7.1.3) from
+/// the PMK, both addresses and both nonces, each pair in either order:
+/// PRF-512, or the SHA-256 KDF (48 bytes) after SAE. The access point
+/// the fuzzer plays derives them with this too.
+pub fn pairwise_keys(
+    pmk: &[u8; 32],
+    a: &Mac,
+    b: &Mac,
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+    sae: bool,
+) -> [u8; 64] {
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    let (n_lo, n_hi) = if snonce < anonce {
+        (snonce, anonce)
+    } else {
+        (anonce, snonce)
+    };
+    let mut seed = [0u8; 76];
+    seed[..6].copy_from_slice(lo);
+    seed[6..12].copy_from_slice(hi);
+    seed[12..44].copy_from_slice(n_lo);
+    seed[44..].copy_from_slice(n_hi);
+    let mut ptk = [0u8; 64];
+    if sae {
+        sha256::kdf(pmk, b"Pairwise key expansion", &seed, &mut ptk[..48]);
+    } else {
+        prf(pmk, b"Pairwise key expansion", &seed, &mut ptk);
+    }
+    ptk
+}
+
 /// Walk the elements of a frame body.
 fn elements(mut ies: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
     core::iter::from_fn(move || {
@@ -2111,7 +2143,14 @@ impl Station {
             self.renew_snonce = false;
         }
         let snonce = self.snonce;
-        let ptk = self.derive_ptk(&link.mac(), &snonce);
+        let ptk = pairwise_keys(
+            &self.pmk,
+            &link.mac(),
+            &self.ap,
+            &self.anonce,
+            &snonce,
+            self.is_wpa3(),
+        );
         if rekey {
             self.next_ptk = Some(ptk);
         } else {
@@ -2129,33 +2168,6 @@ impl Station {
         self.install_pairwise(link, false);
         self.ap_keyed = false;
         self.keys = KeyState::Msg3;
-    }
-
-    /// The pairwise keys from the PMK and both nonces (PRF-512, or the
-    /// SHA-256 KDF after SAE).
-    fn derive_ptk(&self, own: &Mac, snonce: &[u8; 32]) -> [u8; 64] {
-        let (lo, hi) = if *own < self.ap {
-            (*own, self.ap)
-        } else {
-            (self.ap, *own)
-        };
-        let (n_lo, n_hi) = if *snonce < self.anonce {
-            (*snonce, self.anonce)
-        } else {
-            (self.anonce, *snonce)
-        };
-        let mut seed = [0u8; 76];
-        seed[..6].copy_from_slice(&lo);
-        seed[6..12].copy_from_slice(&hi);
-        seed[12..44].copy_from_slice(&n_lo);
-        seed[44..].copy_from_slice(&n_hi);
-        let mut ptk = [0u8; 64];
-        if self.is_wpa3() {
-            sha256::kdf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk[..48]);
-        } else {
-            prf(&self.pmk, b"Pairwise key expansion", &seed, &mut ptk);
-        }
-        ptk
     }
 
     /// Put `self.ptk`'s temporal key to use: in the stick, or (WPA3) in
