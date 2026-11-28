@@ -208,13 +208,14 @@ fn every_driver_does_its_job() {
     assert!(console.contains("tag d0021a0352c4667f\n"), "{console}");
     assert!(console.contains("block 6d69616d\n"), "{console}");
     assert!(console.contains("written\n"), "{console}");
-    assert_eq!(m.soc.board.rfid.tags[0].blocks[9], *b"lapi");
+    // ...and what it held put back.
+    assert_eq!(m.soc.board.rfid.tags[0].blocks[9], [0; 4]);
 
-    // Flash: the settings sector rewritten from RAM, nothing else touched.
+    // Flash: the settings sector rewritten from RAM, then put back as it
+    // was; nothing else touched.
     assert!(console.contains("flash ok\n"), "{console}");
-    assert_eq!(m.soc.flash[0x1F000..0x1F008], *b"LAPINCFG");
-    assert!(m.soc.flash[0x1F008..].iter().all(|b| *b == 0xFF));
-    assert_eq!(m.soc.flash_erases, 1);
+    assert!(m.soc.flash[0x1F000..].iter().all(|b| *b == 0xFF));
+    assert_eq!(m.soc.flash_erases, 2);
     assert_eq!(m.soc.flash_reads_while_busy, 0, "the routine ran from RAM");
     let fresh = machine(&image);
     assert_eq!(m.soc.flash[..0x1F000], fresh.soc.flash[..0x1F000]);

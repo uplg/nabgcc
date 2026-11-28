@@ -1,6 +1,11 @@
 //! Exercises every driver of the board in turn and reports on the
 //! serial port: the ears, the tag reader, the flash, the loudspeaker,
 //! the microphone. The emulator's tests check each answer.
+//!
+//! On a real rabbit: it writes the first 8 bytes of the settings sector
+//! (where the server's address is) and block 2 of the first tag it sees,
+//! then puts back what was there. A power cut in between leaves them
+//! written: take a copy of the settings first.
 
 #![no_std]
 #![no_main]
@@ -153,17 +158,29 @@ extern "C" fn main() -> ! {
                 Ok(block) => hex(&block),
                 Err(_) => uart::write(b"unreadable"),
             }
-            uart::write(if rfid::write_block(&uid, 2, b"lapi").is_ok() {
+            // Written, read back, then what it held put back.
+            let before = rfid::read_block(&uid, 2);
+            let written = rfid::write_block(&uid, 2, b"lapi").is_ok()
+                && rfid::read_block(&uid, 2) == Ok(*b"lapi");
+            uart::write(if written {
                 b"\nwritten\n"
             } else {
                 b"\nnot written\n"
             });
+            if let Ok(before) = before {
+                let _ = rfid::write_block(&uid, 2, &before);
+            }
         }
         Err(_) => uart::write(b"tag reader silent\n"),
     }
 
+    // The settings' first bytes, written then put back.
+    let mut kept = [0u8; 8];
+    kept.copy_from_slice(&flash::settings()[..8]);
     flash::write_settings(b"LAPINCFG");
-    uart::write(if flash::settings().starts_with(b"LAPINCFG") {
+    let ok = flash::settings().starts_with(b"LAPINCFG");
+    flash::write_settings(&kept);
+    uart::write(if ok && flash::settings().starts_with(&kept) {
         b"flash ok\n"
     } else {
         b"flash WRONG\n"
