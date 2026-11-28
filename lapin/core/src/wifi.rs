@@ -388,6 +388,37 @@ struct SaeRun {
     quiet: u8,
 }
 
+/// The password exchange's arithmetic, more than a second of it on the
+/// rabbit: done a bounded step per `poll`, so that the main loop keeps
+/// the sound (and the watchdog) fed between steps. The multiplications
+/// run in the station's `sae_mul`.
+#[derive(Clone)]
+enum SaeStage {
+    /// The password element by hunting and pecking.
+    Hunt(sae::Hunt),
+    /// The network's point for hash-to-element, to keep under its key.
+    Point(sae::PointHunt, [u8; 32]),
+    /// The password element from that point.
+    Element,
+    /// Our commit.
+    Commit(sae::Starting),
+    /// The shared secret, from the access point's commit.
+    Shared(sae::Shared),
+}
+
+/// What a step of the exchange's arithmetic came to: built and taken
+/// apart at once, so its size does not matter (and nothing is boxed
+/// here).
+#[allow(clippy::large_enum_variant)]
+enum SaeOutcome {
+    Busy,
+    Failed,
+    Point([u8; 32], Point),
+    Element(Point),
+    Commit(sae::Session),
+    Shared(Point),
+}
+
 /// How many times a commit or confirm is sent again (hostapd's
 /// dot11RSNASAESync).
 const SAE_SYNC: u8 = 5;
@@ -432,6 +463,12 @@ pub struct Station {
     gtk_set: u8,
     soft: Option<SoftKeys>,
     sae: Option<SaeRun>,
+    /// The exchange's arithmetic under way, a step per `poll`.
+    sae_job: Option<SaeStage>,
+    /// Whether the exchange under way hashes to the curve.
+    sae_h2e: bool,
+    /// Where its scalar multiplications run (1.6 KB, kept in place).
+    sae_mul: crate::p256::Mul,
     /// The hash-to-element password point of the last network, kept:
     /// computing it takes an eighth of a second.
     pt: Option<([u8; 32], Point)>,
@@ -677,6 +714,9 @@ impl Station {
             gtk_set: 0,
             soft: None,
             sae: None,
+            sae_job: None,
+            sae_h2e: false,
+            sae_mul: crate::p256::Mul::IDLE,
             pt: None,
             retry_assoc_at: None,
             next_ptk: None,
@@ -1091,6 +1131,7 @@ impl Station {
         self.shared_auth = false;
         self.soft = None;
         self.sae = None;
+        self.sae_job = None;
         self.retry_assoc_at = None;
         // What an authenticated message 3 showed of this network beats
         // what a scan heard, which anyone can forge or crowd out.
@@ -1394,10 +1435,12 @@ impl Station {
     pub fn tick(&mut self, link: &mut impl Link) {
         if self.mode == Mode::Managed {
             if self.state == State::Auth
+                && self.sae_job.is_none()
                 && let Some(run) = self.sae.as_mut()
             {
                 // No answer for a tick (802.11's retransmission timer):
-                // send it again, a few times.
+                // send it again, a few times. Not while the answer is
+                // being worked on.
                 run.quiet += 1;
                 if run.quiet >= 2 && run.sync < SAE_SYNC {
                     run.sync += 1;
@@ -1431,10 +1474,20 @@ impl Station {
         }
     }
 
+    /// Whether the password exchange has arithmetic under way, which
+    /// `poll` advances a step at a time.
+    pub fn working(&self) -> bool {
+        self.sae_job.is_some()
+    }
+
     /// As often as possible: what waits on a clock (an association to
-    /// try again after the access point said to come back).
+    /// try again after the access point said to come back), and a step
+    /// of the password exchange's arithmetic.
     #[inline(never)]
     pub fn poll(&mut self, link: &mut impl Link) {
+        if self.sae_job.is_some() {
+            self.sae_step(link);
+        }
         if self.sa_query.sent != 0 {
             let now = link.millis();
             if self.state != State::Run {
@@ -2584,47 +2637,129 @@ impl Station {
 
     // ---- WPA3: the password exchange --------------------------------------
 
+    /// Start the exchange: the work towards our commit, done in steps
+    /// by `poll`, which sends the commit at the end.
     #[inline(never)]
     fn sae_commit(&mut self, link: &mut impl Link, h2e: bool) {
         let own = link.mac();
-        let password_len = self.password_len;
-        let password = self.password;
-        let password = &password[..password_len];
-        let element = if h2e {
+        let password = &self.password[..self.password_len];
+        let stage = if h2e {
             let mut id = [0u8; 32];
             id.copy_from_slice(&sha256::sha256(&[
                 &self.ssid[..self.ssid_len],
                 &[0],
                 password,
             ]));
-            let point = match &self.pt {
-                Some((k, p)) if *k == id => Some(*p),
-                _ => sae::password_point(&self.ssid[..self.ssid_len], password, &[]),
-            };
-            link.pause();
-            let Some(point) = point else {
-                self.state = State::Idle;
-                return;
-            };
-            let e = sae::password_element_from_point(&point, &own, &self.ap);
-            self.pt = Some((id, point));
-            e
+            match &self.pt {
+                Some((k, p)) if *k == id => {
+                    sae::element_from_point(p, &own, &self.ap, &mut self.sae_mul);
+                    SaeStage::Element
+                }
+                _ => SaeStage::Point(
+                    sae::PointHunt::new(&self.ssid[..self.ssid_len], password, &[]),
+                    id,
+                ),
+            }
         } else {
-            match sae::password_element_looping(&own, &self.ap, password) {
-                Some(e) => e,
-                None => {
-                    self.state = State::Idle;
-                    return;
+            SaeStage::Hunt(sae::Hunt::new(&own, &self.ap))
+        };
+        // Whatever the last exchange left is over.
+        self.sae = None;
+        self.sae_h2e = h2e;
+        self.sae_job = Some(stage);
+        self.timeout = AUTH_TIMEOUT;
+    }
+
+    /// One bounded step of the exchange's arithmetic, and what follows
+    /// when a stage is done.
+    #[inline(never)]
+    fn sae_step(&mut self, link: &mut impl Link) {
+        if self.mode != Mode::Managed || self.state != State::Auth {
+            self.sae_job = None;
+            return;
+        }
+        // Work on our side: the access point is not the one late.
+        self.timeout = AUTH_TIMEOUT;
+        let Some(stage) = self.sae_job.as_mut() else {
+            return;
+        };
+        let mul = &mut self.sae_mul;
+        let outcome = match stage {
+            SaeStage::Hunt(hunt) => {
+                match hunt.step(&self.password[..self.password_len], sae::STEP_ROUNDS) {
+                    sae::Progress::Busy => SaeOutcome::Busy,
+                    sae::Progress::Done(e) => SaeOutcome::Element(e),
+                    sae::Progress::Failed => SaeOutcome::Failed,
                 }
             }
+            SaeStage::Point(hunt, id) => match hunt.step() {
+                sae::Progress::Busy => SaeOutcome::Busy,
+                sae::Progress::Done(p) => SaeOutcome::Point(*id, p),
+                sae::Progress::Failed => SaeOutcome::Failed,
+            },
+            SaeStage::Element => mul
+                .step(sae::STEP_UNITS)
+                .map_or(SaeOutcome::Busy, SaeOutcome::Element),
+            SaeStage::Commit(starting) => starting
+                .step(mul, sae::STEP_UNITS)
+                .map_or(SaeOutcome::Busy, SaeOutcome::Commit),
+            SaeStage::Shared(shared) => shared
+                .step(mul, sae::STEP_UNITS)
+                .map_or(SaeOutcome::Busy, SaeOutcome::Shared),
         };
         link.pause();
-        let mut rand = [0u8; 32];
-        let mut mask = [0u8; 32];
-        link.random(&mut rand);
-        link.random(&mut mask);
-        let session = sae::Session::new(element, &rand, &mask);
-        link.pause();
+        match outcome {
+            SaeOutcome::Busy => {}
+            SaeOutcome::Failed => {
+                self.sae_job = None;
+                self.state = State::Idle;
+            }
+            SaeOutcome::Point(id, p) => {
+                self.pt = Some((id, p));
+                let own = link.mac();
+                sae::element_from_point(&p, &own, &self.ap, &mut self.sae_mul);
+                self.sae_job = Some(SaeStage::Element);
+            }
+            SaeOutcome::Element(element) => {
+                // The element found: our commit, with two fresh numbers.
+                let mut rand = [0u8; 32];
+                let mut mask = [0u8; 32];
+                link.random(&mut rand);
+                link.random(&mut mask);
+                let starting = sae::Session::start(element, &rand, &mask, &mut self.sae_mul);
+                self.sae_job = Some(SaeStage::Commit(starting));
+            }
+            SaeOutcome::Commit(session) => {
+                self.sae_job = None;
+                self.sae_send_commit(link, session, self.sae_h2e);
+            }
+            SaeOutcome::Shared(point) => {
+                if let Some(SaeStage::Shared(shared)) = self.sae_job.take() {
+                    self.sae_send_confirm(link, &shared, &point);
+                }
+            }
+        }
+    }
+    /// Our confirm, once the shared secret is known.
+    fn sae_send_confirm(&mut self, link: &mut impl Link, shared: &sae::Shared, point: &Point) {
+        let Some(run) = self.sae.as_mut() else {
+            return;
+        };
+        if run.session.finish_commit(shared, point).is_err() {
+            return;
+        }
+        let Some(confirm) = run.session.confirm(1) else {
+            return;
+        };
+        run.confirmed = true;
+        run.send_confirm = 1;
+        run.quiet = 0;
+        self.send_confirm(link, 1, &confirm);
+        self.timeout = AUTH_TIMEOUT;
+    }
+
+    /// Our commit, computed: send it.
+    fn sae_send_commit(&mut self, link: &mut impl Link, session: sae::Session, h2e: bool) {
         let mut commit = [0u8; 6 + sae::COMMIT_LEN];
         commit[..6].copy_from_slice(&[3, 0, 1, 0, if h2e { 126 } else { 0 }, 0]);
         commit[6..].copy_from_slice(&session.commit().to_bytes());
@@ -2747,21 +2882,17 @@ impl Station {
                     self.sae_send_again(link);
                 }
             }
+            // Its commit again, while ours is worked out from the first.
+            1 if self.sae_job.is_some() => {}
             1 => {
                 let Some(theirs) = sae::Commit::from_bytes(body) else {
                     return;
                 };
-                if run.session.process_commit(&theirs).is_err() {
-                    return;
-                }
-                link.pause();
-                let run = self.sae.as_mut().unwrap();
-                let Some(confirm) = run.session.confirm(1) else {
+                let Ok(shared) = run.session.begin_commit(&theirs, &mut self.sae_mul) else {
                     return;
                 };
-                run.confirmed = true;
-                run.send_confirm = 1;
-                self.send_confirm(link, 1, &confirm);
+                // The confirm goes once `poll` has the shared secret.
+                self.sae_job = Some(SaeStage::Shared(shared));
                 self.timeout = AUTH_TIMEOUT;
             }
             2 if run.confirmed => {
@@ -3414,6 +3545,10 @@ mod tests {
                 &[0; 32],
                 b"carotte",
             );
+            // The commit goes once worked out, a step per poll.
+            while air.sent.is_empty() {
+                s.poll(air);
+            }
             // Algorithm 3: SAE; 0: open, with the cached key.
             le16(&air.sent[0], 24) == 3
         };

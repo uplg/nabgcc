@@ -289,6 +289,9 @@ pub struct AccessPoint {
     /// Only take WPA3 stations that derive the password element by
     /// hashing to the curve.
     pub require_h2e: bool,
+    /// Say in the beacons that hash-to-element is understood (the RSN
+    /// extension element); off, a station hunts and pecks.
+    pub offer_h2e: bool,
     /// Open password exchanges from which a new commit has to come
     /// back with an anti-clogging token; 0 demands one every time.
     /// hostapd's default is 5.
@@ -481,6 +484,7 @@ impl AccessPoint {
             probes_answered: 0,
             probes_ignored: 0,
             require_h2e: false,
+            offer_h2e: true,
             anti_clogging_threshold: 5,
             sa_query_max_tu: 1000,
             sa_query_retry_tu: 201,
@@ -575,7 +579,10 @@ impl AccessPoint {
 
     /// The RSN extension element: says hash-to-element is understood.
     fn own_extension(&self) -> Vec<u8> {
-        if self.wpa3 == Wpa3::Off || self.psk_params().is_none_or(|(wpa2, ..)| !wpa2) {
+        if !self.offer_h2e
+            || self.wpa3 == Wpa3::Off
+            || self.psk_params().is_none_or(|(wpa2, ..)| !wpa2)
+        {
             Vec::new()
         } else {
             vec![244, 1, 0x20]

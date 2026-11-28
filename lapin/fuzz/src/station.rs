@@ -797,15 +797,22 @@ pub struct World {
 }
 
 impl World {
-    /// Hand over everything queued, as the main loop does.
+    /// Hand over everything queued, as the main loop does, and give the
+    /// station the turns its password exchange's arithmetic takes.
     fn pump(&mut self, oracle: &mut Oracle) {
-        while let Some(rx) = self.air.receive(&mut self.buffer) {
-            let len = rx.len;
-            let protected = self.buffer[1] & 0x40 != 0;
-            if let Some(d) = self.sta.input(&mut self.air, &mut self.buffer, rx) {
-                assert!(d.start >= 24 && d.start + d.len <= len, "{d:?} of {len}");
-                oracle.check(&self.air, rx.decrypted, protected);
+        loop {
+            while let Some(rx) = self.air.receive(&mut self.buffer) {
+                let len = rx.len;
+                let protected = self.buffer[1] & 0x40 != 0;
+                if let Some(d) = self.sta.input(&mut self.air, &mut self.buffer, rx) {
+                    assert!(d.start >= 24 && d.start + d.len <= len, "{d:?} of {len}");
+                    oracle.check(&self.air, rx.decrypted, protected);
+                }
             }
+            if !self.sta.working() {
+                break;
+            }
+            self.sta.poll(&mut self.air);
         }
     }
 
@@ -923,6 +930,7 @@ impl World {
             &key,
             password,
         );
+        self.pump(&mut Oracle::off());
     }
 
     fn step(&mut self, step: Step) {
@@ -1376,6 +1384,7 @@ fn op(w: &mut World, input: &mut Input, oracle: &mut Oracle) {
                         &key[..key.len().min(32)],
                         &password[..password.len().min(64)],
                     );
+                    w.pump(oracle);
                 }
             }
         }
@@ -1403,6 +1412,7 @@ fn op(w: &mut World, input: &mut Input, oracle: &mut Oracle) {
                 &key[..key.len().min(32)],
                 &password[..password.len().min(64)],
             );
+            w.pump(oracle);
         }
         15 => {
             let master = input.bool();

@@ -87,9 +87,16 @@ pecking, 1.35 s by hash-to-element, in 15 KB with everything it needs.
 `tools/emu/tests/lapin.rs` checks all of the above on every run and
 fails if the timings drift.
 
-The watchdog bites after 2.09 s: the station feeds it between these
-steps. Joining a WPA3 network takes 1.6 s after the scan on the
-emulated rabbit.
+None of these runs at once: the station does them in steps of at most
+twelve units of a scalar multiplication (a unit is four doublings and
+an addition, about 5 ms here) or three rounds of hunting and pecking,
+one step each time the main loop polls it, so that the loop keeps the
+sound and the watchdog (which bites after 2.09 s) fed in between: a
+sound plays on through a WPA3 join (`tools/emu/tests/wpa3_sound.rs`),
+and the watchdog goes at most 160 ms unfed during one, by hashing to
+the curve or by hunting and pecking (`tools/emu/tests/limits.rs`).
+Joining a WPA3 network takes 2.0 s after the scan on the emulated
+rabbit.
 
 A rescue core holds the first 20 KB of the flash, which updates never
 rewrite: a power cut during an update, or an image that keeps

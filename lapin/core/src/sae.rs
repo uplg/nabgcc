@@ -7,7 +7,7 @@
 //! received, and prove it with a confirm.
 
 use crate::ccmp::constant_eq;
-use crate::p256::{self, Fe, Limbs, Point};
+use crate::p256::{self, Fe, Limbs, Mul, Point};
 use crate::sha256::{hkdf_expand, hmac, kdf};
 
 pub const GROUP: u16 = 19;
@@ -33,38 +33,89 @@ fn ordered(a: &Mac, b: &Mac) -> [u8; 12] {
     out
 }
 
-/// The password element by hunting and pecking: try counters until one
-/// hashes to the x coordinate of a point. `None` has one chance in
-/// 2^40 of happening.
+/// The computations of an exchange go in steps, so that the rabbit can
+/// do something else between them (keep its sound fed, its watchdog
+/// too): each step is a few units of a scalar multiplication (a unit is
+/// four point doublings and an addition, about 5 ms on the rabbit)...
+pub const STEP_UNITS: usize = 12;
+/// ... or a few rounds of hunting and pecking (about 23 ms each).
+pub const STEP_ROUNDS: u8 = 3;
+
+/// Where a computation in steps stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress<T> {
+    Busy,
+    Done(T),
+    /// No result: the password gives no element (one chance in 2^40).
+    Failed,
+}
+
+/// Hunting and pecking: forty rounds, the same work whatever happens.
+const ROUNDS: u8 = 40;
+
+/// The password element by hunting and pecking, in steps: try counters
+/// until one hashes to the x coordinate of a point.
+#[derive(Clone)]
+pub struct Hunt {
+    addresses: [u8; 12],
+    counter: u8,
+    x: Fe,
+    y: Fe,
+    found: u32,
+}
+
+impl Hunt {
+    pub fn new(a: &Mac, b: &Mac) -> Hunt {
+        Hunt {
+            addresses: ordered(a, b),
+            counter: 0,
+            x: Fe::ZERO,
+            y: Fe::ZERO,
+            found: 0,
+        }
+    }
+
+    /// Up to `rounds` more rounds; the element once all forty are done.
+    pub fn step(&mut self, password: &[u8], rounds: u8) -> Progress<Point> {
+        let prime = p256::to_bytes(&p256::P);
+        // Every round does the same work, so that neither the count nor
+        // the time tells which counter gave the point: the first that
+        // does is kept by masks, not by a branch.
+        for _ in 0..rounds.min(ROUNDS - self.counter) {
+            self.counter += 1;
+            let seed = hmac(&self.addresses, &[password, &[self.counter]]);
+            let mut value = [0u8; 32];
+            kdf(&seed, b"SAE Hunting and Pecking", &prime, &mut value);
+            let x = p256::from_bytes(&value);
+            let in_field = (p256::less(&x, &p256::P) as u32).wrapping_neg();
+            let x = Fe::new(&x);
+            let (mut y, root) = p256::curve_rhs(&x).sqrt_masked();
+            let flip = ((y.is_odd() != (seed[31] & 1 != 0)) as u32).wrapping_neg();
+            let negated = y.neg();
+            y.select(&negated, flip);
+            let take = in_field & root & !self.found;
+            self.x.select(&x, take);
+            self.y.select(&y, take);
+            self.found |= take;
+        }
+        if self.counter < ROUNDS {
+            return Progress::Busy;
+        }
+        match Point::from_affine(&self.x, &self.y) {
+            Some(p) if self.found != 0 => Progress::Done(p),
+            _ => Progress::Failed,
+        }
+    }
+}
+
+/// The password element by hunting and pecking, at once. `None` has one
+/// chance in 2^40 of happening.
 pub fn password_element_looping(a: &Mac, b: &Mac, password: &[u8]) -> Option<Point> {
-    let addresses = ordered(a, b);
-    let prime = p256::to_bytes(&p256::P);
-    let mut found_x = Fe::ZERO;
-    let mut found_y = Fe::ZERO;
-    let mut found = 0u32;
-    // Forty rounds whatever happens, each doing the same work, so that
-    // neither the count nor the time tells which counter gave the point:
-    // the first that does is kept by masks, not by a branch.
-    for counter in 1..=40u8 {
-        let seed = hmac(&addresses, &[password, &[counter]]);
-        let mut value = [0u8; 32];
-        kdf(&seed, b"SAE Hunting and Pecking", &prime, &mut value);
-        let x = p256::from_bytes(&value);
-        let in_field = (p256::less(&x, &p256::P) as u32).wrapping_neg();
-        let x = Fe::new(&x);
-        let (mut y, root) = p256::curve_rhs(&x).sqrt_masked();
-        let flip = ((y.is_odd() != (seed[31] & 1 != 0)) as u32).wrapping_neg();
-        let negated = y.neg();
-        y.select(&negated, flip);
-        let take = in_field & root & !found;
-        found_x.select(&x, take);
-        found_y.select(&y, take);
-        found |= take;
+    let mut hunt = Hunt::new(a, b);
+    match hunt.step(password, ROUNDS) {
+        Progress::Done(p) => Some(p),
+        _ => None,
     }
-    if found == 0 {
-        return None;
-    }
-    Point::from_affine(&found_x, &found_y)
 }
 
 /// Simplified SWU map of a field element to a point (RFC 9380, 6.6.2).
@@ -96,15 +147,28 @@ fn map_to_curve(u: &Fe) -> Option<Point> {
     Point::from_affine(&x, &y)
 }
 
-/// The network's secret point for hash-to-element: it depends on the
-/// network name and the password only, so it is computed once and kept.
-pub fn password_point(ssid: &[u8], password: &[u8], identifier: &[u8]) -> Option<Point> {
-    // HKDF-Extract with the network name as salt.
-    let seed = hmac(ssid, &[password, identifier]);
-    let half = |label: &[u8]| {
+/// The network's secret point for hash-to-element, in two steps (a map
+/// to the curve each): it depends on the network name and the password
+/// only, so it is computed once and kept.
+#[derive(Clone)]
+pub struct PointHunt {
+    seed: [u8; 32],
+    first: Option<Point>,
+}
+
+impl PointHunt {
+    pub fn new(ssid: &[u8], password: &[u8], identifier: &[u8]) -> PointHunt {
+        PointHunt {
+            // HKDF-Extract with the network name as salt.
+            seed: hmac(ssid, &[password, identifier]),
+            first: None,
+        }
+    }
+
+    fn half(&self, label: &[u8]) -> Option<Point> {
         // 48 bytes, reduced modulo p, so the result is close to uniform.
         let mut wide = [0u8; 48];
-        hkdf_expand(&seed, label, &mut wide);
+        hkdf_expand(&self.seed, label, &mut wide);
         let mut hi = [0u8; 32];
         hi[16..].copy_from_slice(&wide[..16]);
         let mut lo = [0u8; 32];
@@ -113,13 +177,42 @@ pub fn password_point(ssid: &[u8], password: &[u8], identifier: &[u8]) -> Option
             &p256::from_bytes(&hi),
             &p256::from_bytes(&lo),
         ))
-    };
-    Some(half(b"SAE Hash to Element u1 P1")?.add(&half(b"SAE Hash to Element u2 P2")?))
+    }
+
+    /// One half more; the point once both are done.
+    pub fn step(&mut self) -> Progress<Point> {
+        match self.first {
+            None => match self.half(b"SAE Hash to Element u1 P1") {
+                Some(p) => {
+                    self.first = Some(p);
+                    Progress::Busy
+                }
+                None => Progress::Failed,
+            },
+            Some(first) => match self.half(b"SAE Hash to Element u2 P2") {
+                Some(p) => Progress::Done(first.add(&p)),
+                None => Progress::Failed,
+            },
+        }
+    }
+}
+
+/// The network's secret point, at once.
+pub fn password_point(ssid: &[u8], password: &[u8], identifier: &[u8]) -> Option<Point> {
+    let mut hunt = PointHunt::new(ssid, password, identifier);
+    loop {
+        match hunt.step() {
+            Progress::Busy => {}
+            Progress::Done(p) => return Some(p),
+            Progress::Failed => return None,
+        }
+    }
 }
 
 /// The password element for one pair of stations, from the network's
-/// secret point.
-pub fn password_element_from_point(point: &Point, a: &Mac, b: &Mac) -> Point {
+/// secret point: the multiplication to run, in steps, set up in `mul`
+/// (its table takes 1.5 KB: the caller keeps one in place).
+pub fn element_from_point(point: &Point, a: &Mac, b: &Mac, mul: &mut Mul) {
     let value = hmac(&[0; 32], &[&ordered(a, b)]);
     // Into 1..=n-1.
     let mut order_less_one = p256::N;
@@ -130,7 +223,23 @@ pub fn password_element_from_point(point: &Point, a: &Mac, b: &Mac) -> Point {
         &one,
         &p256::N,
     );
-    point.mul(&scalar)
+    mul.reset(point, &scalar);
+}
+
+/// The same, at once.
+pub fn password_element_from_point(point: &Point, a: &Mac, b: &Mac) -> Point {
+    let mut mul = Mul::IDLE;
+    element_from_point(point, a, b, &mut mul);
+    finish(&mut mul)
+}
+
+/// A multiplication run to its end.
+fn finish(m: &mut Mul) -> Point {
+    loop {
+        if let Some(p) = m.step(Mul::UNITS) {
+            return p;
+        }
+    }
 }
 
 /// What a station sends first: a scalar and an element.
@@ -189,26 +298,86 @@ fn private_number(bytes: &[u8; 32]) -> Limbs {
     n
 }
 
-impl Session {
-    /// Start a run with the password element and two fresh random
-    /// numbers (`rand` stays secret, `mask` hides it in the commit).
-    pub fn new(element: Point, rand: &[u8; 32], mask: &[u8; 32]) -> Session {
-        let rand = private_number(rand);
-        let mask = private_number(mask);
-        let scalar = p256::add_mod(&rand, &mask, &p256::N);
+/// A run starting: the mask times the element, in steps (in the `Mul`
+/// given to `Session::start`), for the commit.
+#[derive(Clone)]
+pub struct Starting {
+    element: Point,
+    rand: Limbs,
+    scalar: Limbs,
+}
+
+impl Starting {
+    /// Up to `units` more of the multiplication; the session, with its
+    /// commit, once done.
+    pub fn step(&self, mul: &mut Mul, units: usize) -> Option<Session> {
+        let hidden = mul.step(units)?;
         // A multiple of a point of prime order is never infinity.
-        let hidden = element.mul(&mask).neg().to_bytes().unwrap_or([0; 64]);
-        Session {
-            element,
-            rand,
+        let hidden = hidden.neg().to_bytes().unwrap_or([0; 64]);
+        Some(Session {
+            element: self.element,
+            rand: self.rand,
             own: Commit {
-                scalar: p256::to_bytes(&scalar),
+                scalar: p256::to_bytes(&self.scalar),
                 element: hidden,
             },
             peer: None,
             kck: [0; 32],
             pmk: [0; 32],
             pmkid: [0; 16],
+        })
+    }
+}
+
+/// The peer's commit taken in: the shared secret, in steps (two
+/// multiplications, in the `Mul` given to `Session::begin_commit`).
+#[derive(Clone)]
+pub struct Shared {
+    peer: Commit,
+    scalar: Limbs,
+    element: Point,
+    rand: Limbs,
+    /// The second multiplication, by our secret, is under way.
+    second: bool,
+}
+
+impl Shared {
+    /// Up to `units` more; the shared point once both multiplications
+    /// are done.
+    pub fn step(&mut self, mul: &mut Mul, units: usize) -> Option<Point> {
+        let p = mul.step(units)?;
+        if self.second {
+            return Some(p);
+        }
+        mul.reset(&p.add(&self.element), &self.rand);
+        self.second = true;
+        None
+    }
+}
+
+impl Session {
+    /// Start a run with the password element and two fresh random
+    /// numbers (`rand` stays secret, `mask` hides it in the commit),
+    /// the commit's multiplication set up in `mul`.
+    pub fn start(element: Point, rand: &[u8; 32], mask: &[u8; 32], mul: &mut Mul) -> Starting {
+        let rand = private_number(rand);
+        let mask = private_number(mask);
+        mul.reset(&element, &mask);
+        Starting {
+            element,
+            rand,
+            scalar: p256::add_mod(&rand, &mask, &p256::N),
+        }
+    }
+
+    /// The same, at once.
+    pub fn new(element: Point, rand: &[u8; 32], mask: &[u8; 32]) -> Session {
+        let mut mul = Mul::IDLE;
+        let s = Session::start(element, rand, mask, &mut mul);
+        loop {
+            if let Some(session) = s.step(&mut mul, Mul::UNITS) {
+                return session;
+            }
         }
     }
 
@@ -216,8 +385,9 @@ impl Session {
         &self.own
     }
 
-    /// Take the peer's commit and derive the keys.
-    pub fn process_commit(&mut self, peer: &Commit) -> Result<(), SaeError> {
+    /// Check the peer's commit, and set up the computation of the
+    /// shared secret from it, its first multiplication in `mul`.
+    pub fn begin_commit(&self, peer: &Commit, mul: &mut Mul) -> Result<Shared, SaeError> {
         if *peer == self.own {
             return Err(SaeError::Reflection);
         }
@@ -227,13 +397,24 @@ impl Session {
             return Err(SaeError::BadScalar);
         }
         let element = Point::from_bytes(&peer.element).ok_or(SaeError::BadElement)?;
-        let shared = self.element.mul(&scalar).add(&element).mul(&self.rand);
-        let (k, _) = shared.affine().ok_or(SaeError::NoSharedKey)?;
+        mul.reset(&self.element, &scalar);
+        Ok(Shared {
+            peer: peer.clone(),
+            scalar,
+            element,
+            rand: self.rand,
+            second: false,
+        })
+    }
 
+    /// Derive the keys from the shared secret `point` that `shared`
+    /// computed.
+    pub fn finish_commit(&mut self, shared: &Shared, point: &Point) -> Result<(), SaeError> {
+        let (k, _) = point.affine().ok_or(SaeError::NoSharedKey)?;
         let keyseed = hmac(&[0; 32], &[&k.to_bytes()]);
         let sum = p256::to_bytes(&p256::add_mod(
             &p256::from_bytes(&self.own.scalar),
-            &scalar,
+            &shared.scalar,
             &p256::N,
         ));
         let mut keys = [0u8; 64];
@@ -241,8 +422,19 @@ impl Session {
         self.kck.copy_from_slice(&keys[..32]);
         self.pmk.copy_from_slice(&keys[32..]);
         self.pmkid.copy_from_slice(&sum[..16]);
-        self.peer = Some(peer.clone());
+        self.peer = Some(shared.peer.clone());
         Ok(())
+    }
+
+    /// Take the peer's commit and derive the keys, at once.
+    pub fn process_commit(&mut self, peer: &Commit) -> Result<(), SaeError> {
+        let mut mul = Mul::IDLE;
+        let mut shared = self.begin_commit(peer, &mut mul)?;
+        loop {
+            if let Some(point) = shared.step(&mut mul, Mul::UNITS) {
+                return self.finish_commit(&shared, &point);
+            }
+        }
     }
 
     fn confirm_value(&self, counter: u16, first: &Commit, second: &Commit) -> [u8; 32] {
@@ -345,6 +537,53 @@ mod tests {
             .unwrap();
         assert_eq!(session.pmk, vector::PMK);
         assert_eq!(session.pmkid, vector::PMKID);
+    }
+
+    /// The same, a step at a time, as the station runs it.
+    #[test]
+    fn in_steps_the_exchange_matches_the_ieee_vectors() {
+        let mut hunt = Hunt::new(&vector::ADDR1, &vector::ADDR2);
+        let element = loop {
+            match hunt.step(vector::PASSWORD, STEP_ROUNDS) {
+                Progress::Busy => {}
+                Progress::Done(e) => break e,
+                Progress::Failed => panic!("no element"),
+            }
+        };
+        let mut mul = Mul::IDLE;
+        let starting = Session::start(element, &vector::RAND, &vector::MASK, &mut mul);
+        let mut session = loop {
+            if let Some(s) = starting.step(&mut mul, STEP_UNITS) {
+                break s;
+            }
+        };
+        assert_eq!(session.commit().to_bytes(), vector::LOCAL_COMMIT);
+        let peer = Commit::from_bytes(&vector::PEER_COMMIT).unwrap();
+        let mut shared = session.begin_commit(&peer, &mut mul).unwrap();
+        let point = loop {
+            if let Some(p) = shared.step(&mut mul, STEP_UNITS) {
+                break p;
+            }
+        };
+        session.finish_commit(&shared, &point).unwrap();
+        assert_eq!(session.pmk, vector::PMK);
+        assert_eq!(session.pmkid, vector::PMKID);
+
+        let mut point = PointHunt::new(vector::SSID, vector::PASSWORD, vector::IDENTIFIER);
+        let point = loop {
+            match point.step() {
+                Progress::Busy => {}
+                Progress::Done(p) => break p,
+                Progress::Failed => panic!("no point"),
+            }
+        };
+        element_from_point(&point, &vector::ADDR1B, &vector::ADDR2B, &mut mul);
+        let element = loop {
+            if let Some(e) = mul.step(STEP_UNITS) {
+                break e;
+            }
+        };
+        assert_eq!(element.to_bytes(), Some(vector::ELEMENT));
     }
 
     #[test]

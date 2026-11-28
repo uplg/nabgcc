@@ -71,6 +71,31 @@ fn wpa3_and_garenne() {
     check(&m, "WPA3 and garenne");
 }
 
+/// WPA3 with an access point that does not offer hash-to-element: the
+/// rabbit hunts and pecks (forty rounds, close to a second of work),
+/// and no step of it holds the watchdog long. The steps of the
+/// exchange are bounded whatever the processor's speed, so the margin
+/// is wide here: a slower flash would stretch each step, not add them
+/// up.
+#[test]
+fn wpa3_by_hunting_and_pecking() {
+    let Some(image) = lapin() else { return };
+    let mut m = on_wpa3_network(&image);
+    m.air[0].offer_h2e = false;
+    until_every(&mut m, 20, 30_000, "joined", |m| {
+        ap_saw(
+            m,
+            &ApEvent::SaeComplete {
+                sta: nabemu::DEFAULT_MAC,
+                hash_to_element: false,
+            },
+        ) && authorized(m)
+    });
+    check(&m, "WPA3 by hunting and pecking");
+    let unfed = ms(m.soc.watchdog_longest.max(m.soc.watchdog_unfed()));
+    assert!(unfed <= WATCHDOG_BUDGET_MS / 4, "watchdog unfed {unfed} ms");
+}
+
 /// The setup page saves a WPA2 network: the key is derived from the
 /// passphrase on the rabbit (PBKDF2, seconds of work), then it joins.
 #[test]
