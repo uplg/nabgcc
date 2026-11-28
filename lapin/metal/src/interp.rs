@@ -71,6 +71,12 @@ impl<H: Host> Vm<'_, H> {
     /// registers brought up to date before and read back after. Memory
     /// is reached with one bounds check per access, as elsewhere:
     /// outside it, reads give zero and writes are dropped.
+    ///
+    /// The macros below repeat the machine's accessors (`w`, `set`, `b`,
+    /// `sget`, `push`...) on those copies, and the call repeats the
+    /// loader's function table and `TFCtest`, on purpose: going through
+    /// the machine would spill the copies at every access, which is the
+    /// time this loop exists to save.
     #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
     pub fn interp_go(&mut self) {
         let (mut pc, mut pcbase, mut callstack, mut callstackres) = (-1i32, -1i32, 1i32, 1i32);
@@ -651,10 +657,8 @@ impl<H: Host> Vm<'_, H> {
                 }
             }
             STRSUB => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.sget(0));
-                let v = match self.sub_len(q, start, len) {
+                let (_, start, len) = self.pull_sub(val(NIL));
+                let v = match len {
                     Some(len) => {
                         let p = self.alloc_bin(len);
                         let from = Self::start_bin(val(self.sget(0))) + start;
@@ -741,16 +745,15 @@ impl<H: Host> Vm<'_, H> {
                 self.play_start(k);
             }
             PLAYFEED => {
-                let len = self.pull();
-                let start = val(self.pull());
-                let q = val(self.sget(0));
-                let v = if q == NIL {
-                    self.play_feed(None);
-                    NIL
-                } else if let Some(len) = self.sub_len(q, start, len) {
-                    int(self.play_feed(Some((Self::start_bin(q) + start, len))))
-                } else {
-                    NIL
+                let v = match self.pull_sub(val(NIL)) {
+                    (NIL, _, _) => {
+                        self.play_feed(None);
+                        NIL
+                    }
+                    (q, start, Some(len)) => {
+                        int(self.play_feed(Some((Self::start_bin(q) + start, len))))
+                    }
+                    _ => NIL,
                 };
                 self.sset(0, v);
             }
@@ -973,16 +976,13 @@ impl<H: Host> Vm<'_, H> {
                 self.sset(0, int(v));
             }
             SNDFEED => {
-                let len = self.pull();
-                let start = val_or(self.pull(), 0);
-                let q = val(self.sget(0));
-                let v = match self.sub_len(q, start, len) {
-                    Some(len) => {
+                let v = match self.pull_sub(0) {
+                    (q, start, Some(len)) => {
                         let heap = crate::bytes(&self.mem.heap);
                         let data = crate::natives::clip(heap, Self::start_bin(q) + start, len);
                         int(self.host.codec_feed(data) as i32)
                     }
-                    None => NIL,
+                    _ => NIL,
                 };
                 self.sset(0, v);
             }
@@ -1176,20 +1176,25 @@ impl<H: Host> Vm<'_, H> {
         })
     }
 
-    /// How many bytes `strsub` and the sound natives take from the string
-    /// `q` at `start`: `len`, or the rest when nil, cut at its end. None
-    /// for a nil string, or a part that starts before it or ends before
-    /// it starts.
-    fn sub_len(&self, q: i32, start: i32, len: i32) -> Option<i32> {
+    /// Pull `start len`, the arguments of `strsub` and the sound natives,
+    /// `start` read as `nil_start` when nil; the string stays on the
+    /// stack for the result. The string, as a block, `start`, and how
+    /// many bytes to take from it: `len`, or the rest when nil, cut at
+    /// its end. None for a nil string, or a part that starts before it
+    /// or ends before it starts.
+    fn pull_sub(&mut self, nil_start: i32) -> (i32, i32, Option<i32>) {
+        let len = self.pull();
+        let start = val_or(self.pull(), nil_start);
+        let q = val(self.sget(0));
         if q == NIL {
-            return None;
+            return (q, start, None);
         }
         let lq = self.size_bin(q);
         let mut len = val_or(len, lq.wrapping_sub(start));
         if start.wrapping_add(len) > lq {
             len = lq - start;
         }
-        (start >= 0 && len >= 0).then_some(len)
+        (q, start, (start >= 0 && len >= 0).then_some(len))
     }
 }
 
