@@ -38,6 +38,16 @@ pub enum Trap {
     Fiq,
 }
 
+/// The width of a single data transfer, and how a load extends it.
+#[derive(Clone, Copy)]
+enum Width {
+    Byte,
+    Word,
+    Half,
+    SignedByte,
+    SignedHalf,
+}
+
 #[derive(Clone)]
 pub struct Cpu {
     /// r[15] is the address of the next instruction to fetch.
@@ -510,6 +520,13 @@ impl Cpu {
         (res, wide >> 32 != 0, (!(a ^ b) & (a ^ res)) >> 31 != 0)
     }
 
+    /// Word load. At an unaligned address the core returns the aligned
+    /// word rotated so that the addressed byte comes lowest.
+    #[inline]
+    fn load_word<B: Bus>(bus: &mut B, addr: u32) -> u32 {
+        bus.read32(addr & !3).rotate_right((addr & 3) * 8)
+    }
+
     /// Halfword load. At an odd address the core returns the aligned
     /// halfword rotated by a byte.
     #[inline]
@@ -525,6 +542,16 @@ impl Cpu {
             bus.read8(addr) as i8 as i32 as u32
         } else {
             bus.read16(addr) as i16 as i32 as u32
+        }
+    }
+
+    /// A Thumb LDR or STR of a word, by bit 11, once its address is known.
+    #[inline(always)]
+    fn thumb_word<B: Bus>(&mut self, bus: &mut B, op: u32, rd: usize, addr: u32) {
+        if op & (1 << 11) != 0 {
+            self.r[rd] = Self::load_word(bus, addr);
+        } else {
+            bus.write32(addr & !3, self.r[rd]);
         }
     }
 
@@ -764,72 +791,52 @@ impl Cpu {
             bus.write8(addr, src as u8);
             self.r[rd] = old as u32;
         } else {
-            let old = bus.read32(addr & !3).rotate_right((addr & 3) * 8);
+            let old = Self::load_word(bus, addr);
             bus.write32(addr & !3, src);
             self.r[rd] = old;
         }
     }
 
     fn arm_halfword<B: Bus>(&mut self, bus: &mut B, op: u32) {
-        let pre = op & (1 << 24) != 0;
-        let up = op & (1 << 23) != 0;
-        let wb = op & (1 << 21) != 0;
-        let load = op & (1 << 20) != 0;
-        let rn = ((op >> 16) & 15) as usize;
-        let rd = ((op >> 12) & 15) as usize;
         let off = if op & (1 << 22) != 0 {
             ((op >> 4) & 0xF0) | (op & 0xF)
         } else {
             self.reg((op & 15) as usize)
         };
-        let base = self.reg(rn);
-        let moved = if up {
-            base.wrapping_add(off)
-        } else {
-            base.wrapping_sub(off)
+        let width = match (op >> 5) & 3 {
+            1 => Width::Half,
+            2 => Width::SignedByte,
+            _ => Width::SignedHalf,
         };
-        let addr = if pre { moved } else { base };
-        let writeback = !pre || wb;
-        if load {
-            let v = match (op >> 5) & 3 {
-                1 => Self::load_half(bus, addr),
-                2 => bus.read8(addr) as i8 as i32 as u32,
-                _ => Self::load_half_signed(bus, addr),
-            };
-            if writeback && rn != 15 {
-                self.r[rn] = moved;
-            }
-            if rd == 15 {
-                self.branch(v);
-            } else {
-                self.r[rd] = v;
-            }
-        } else {
-            let mut v = self.reg(rd);
-            if rd == 15 {
-                v = v.wrapping_add(4);
-            }
-            bus.write16(addr & !1, v as u16);
-            if writeback && rn != 15 {
-                self.r[rn] = moved;
-            }
-        }
+        self.single_transfer(bus, op, off, width);
     }
 
     fn arm_ldr_str<B: Bus>(&mut self, bus: &mut B, op: u32) {
-        let pre = op & (1 << 24) != 0;
-        let up = op & (1 << 23) != 0;
-        let byte = op & (1 << 22) != 0;
-        let wb = op & (1 << 21) != 0;
-        let load = op & (1 << 20) != 0;
-        let rn = ((op >> 16) & 15) as usize;
-        let rd = ((op >> 12) & 15) as usize;
         let off = if op & (1 << 25) != 0 {
             let v = self.reg((op & 15) as usize);
             self.shift_imm((op >> 5) & 3, v, (op >> 7) & 31).0
         } else {
             op & 0xFFF
         };
+        let width = if op & (1 << 22) != 0 {
+            Width::Byte
+        } else {
+            Width::Word
+        };
+        self.single_transfer(bus, op, off, width);
+    }
+
+    /// What LDR/STR and LDRH/STRH/LDRSB/LDRSH share once their offset
+    /// is decoded: indexing, write-back and the transfer itself. Inlined
+    /// so that each caller keeps its own straight-line code.
+    #[inline(always)]
+    fn single_transfer<B: Bus>(&mut self, bus: &mut B, op: u32, off: u32, width: Width) {
+        let pre = op & (1 << 24) != 0;
+        let up = op & (1 << 23) != 0;
+        let wb = op & (1 << 21) != 0;
+        let load = op & (1 << 20) != 0;
+        let rn = ((op >> 16) & 15) as usize;
+        let rd = ((op >> 12) & 15) as usize;
         let base = self.reg(rn);
         let moved = if up {
             base.wrapping_add(off)
@@ -839,10 +846,12 @@ impl Cpu {
         let addr = if pre { moved } else { base };
         let writeback = !pre || wb;
         if load {
-            let v = if byte {
-                bus.read8(addr) as u32
-            } else {
-                bus.read32(addr & !3).rotate_right((addr & 3) * 8)
+            let v = match width {
+                Width::Byte => bus.read8(addr) as u32,
+                Width::Word => Self::load_word(bus, addr),
+                Width::Half => Self::load_half(bus, addr),
+                Width::SignedByte => bus.read8(addr) as i8 as i32 as u32,
+                Width::SignedHalf => Self::load_half_signed(bus, addr),
             };
             if writeback && rn != 15 {
                 self.r[rn] = moved;
@@ -857,10 +866,14 @@ impl Cpu {
             if rd == 15 {
                 v = v.wrapping_add(4);
             }
-            if byte {
-                bus.write8(addr, v as u8);
-            } else {
-                bus.write32(addr & !3, v);
+            // The halfword encodings store a halfword whatever their
+            // sign bit says: ARMv4 has no signed stores.
+            match width {
+                Width::Byte => bus.write8(addr, v as u8),
+                Width::Word => bus.write32(addr & !3, v),
+                Width::Half | Width::SignedByte | Width::SignedHalf => {
+                    bus.write16(addr & !1, v as u16)
+                }
             }
             if writeback && rn != 15 {
                 self.r[rn] = moved;
@@ -1017,7 +1030,7 @@ impl Cpu {
                     1 => bus.write16(addr & !1, self.r[rd] as u16),
                     2 => bus.write8(addr, self.r[rd] as u8),
                     3 => self.r[rd] = bus.read8(addr) as i8 as i32 as u32,
-                    4 => self.r[rd] = bus.read32(addr & !3).rotate_right((addr & 3) * 8),
+                    4 => self.r[rd] = Self::load_word(bus, addr),
                     5 => self.r[rd] = Self::load_half(bus, addr),
                     6 => self.r[rd] = bus.read8(addr) as u32,
                     _ => self.r[rd] = Self::load_half_signed(bus, addr),
@@ -1025,11 +1038,7 @@ impl Cpu {
             }
             0b01100 | 0b01101 => {
                 let addr = self.r[rs].wrapping_add(((op >> 6) & 31) * 4);
-                if op & (1 << 11) != 0 {
-                    self.r[rd] = bus.read32(addr & !3).rotate_right((addr & 3) * 8);
-                } else {
-                    bus.write32(addr & !3, self.r[rd]);
-                }
+                self.thumb_word(bus, op, rd, addr);
             }
             0b01110 | 0b01111 => {
                 let addr = self.r[rs].wrapping_add((op >> 6) & 31);
@@ -1050,11 +1059,7 @@ impl Cpu {
             0b10010 | 0b10011 => {
                 let rd = ((op >> 8) & 7) as usize;
                 let addr = self.r[13].wrapping_add((op & 0xFF) * 4);
-                if op & (1 << 11) != 0 {
-                    self.r[rd] = bus.read32(addr & !3).rotate_right((addr & 3) * 8);
-                } else {
-                    bus.write32(addr & !3, self.r[rd]);
-                }
+                self.thumb_word(bus, op, rd, addr);
             }
             0b10100 | 0b10101 => {
                 let rd = ((op >> 8) & 7) as usize;
