@@ -202,6 +202,27 @@ fn a_watchdog_restart_counts_even_if_the_ram_lost_its_words() {
     taken_over(&mut m, 0, 3);
 }
 
+/// At power-on the rescue core checks the application's CRC before it
+/// hands over, interrupts held back (nothing is set up to take them):
+/// four bits at a time from a table in the flash, 83 ms. A byte at a
+/// time now, from a table it builds in RAM, in ARM code. Power-on to
+/// the application's first instruction, and the interrupts held back
+/// all that time.
+#[test]
+fn the_rescue_core_checks_the_application_quickly() {
+    let Some(image) = lapin() else { return };
+    let mut m = common::machine(&image);
+    let app = 0x0800_0000 + RESCUE as u32;
+    while m.cpu.pc() < app || m.cpu.pc() >= 0x0801_F000 {
+        assert!(m.soc.millis() < 1000, "the application never started");
+        m.step();
+    }
+    let ms = m.soc.cycles as f64 * 1000.0 / nabemu::soc::CLOCK_HZ as f64;
+    eprintln!("power-on → the application: {ms:.2} ms");
+    assert!(ms < 35.0, "power-on → the application: {ms:.2} ms");
+    assert_eq!(m.events, []);
+}
+
 #[test]
 fn the_rescue_core_refuses_what_is_not_a_rabbit_image() {
     let Some(image) = lapin() else { return };

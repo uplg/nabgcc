@@ -118,9 +118,21 @@ impl Slots {
     }
 }
 
-/// CRC-32 (`lapin_core::pack::crc32`), the watchdog fed on the way.
+/// CRC-32 (`lapin_core::pack::crc32`), the watchdog fed every 4 KB: the
+/// words of `data` a load each (the flash and the RAM take an aligned
+/// word in one access), the odd bytes at its ends one by one.
 pub fn crc32(data: &[u8]) -> u32 {
-    lapin_core::pack::crc32(data, crate::watchdog::feed)
+    use lapin_core::pack::{crc_bytes, crc_table, crc_words};
+    let table = crc_table();
+    // SAFETY: any four bytes are a `u32`; `align_to` gives the words
+    // only where they are aligned.
+    let (head, words, tail) = unsafe { data.align_to::<u32>() };
+    let mut c = crc_bytes(&table, !0, head);
+    for chunk in words.chunks(1024) {
+        crate::watchdog::feed();
+        c = crc_words(&table, c, chunk);
+    }
+    !crc_bytes(&table, c, tail)
 }
 
 fn word(image: &[u8], at: usize) -> Option<u32> {

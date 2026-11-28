@@ -171,38 +171,65 @@ pub fn thumb_calls(code: &mut [u8], back: bool) {
     }
 }
 
-/// CRC-32 (IEEE 802.3, as zlib's), four bits at a time, `tick` called
-/// every 4 KB (the firmware feeds its watchdog: a whole application
-/// takes tens of milliseconds).
+/// CRC-32 (IEEE 802.3, as zlib's), `tick` called every 4 KB (the
+/// firmware feeds its watchdog; it reads the flash a word at a time,
+/// `lapin_fw::boot::crc32`).
 pub fn crc32(data: &[u8], mut tick: impl FnMut()) -> u32 {
-    const T: [u32; 16] = [
-        0x0000_0000,
-        0x1DB7_1064,
-        0x3B6E_20C8,
-        0x26D9_30AC,
-        0x76DC_4190,
-        0x6B6B_51F4,
-        0x4DB2_6158,
-        0x5005_713C,
-        0xEDB8_8320,
-        0xF00F_9344,
-        0xD6D6_A3E8,
-        0xCB61_B38C,
-        0x9B64_C2B0,
-        0x86D3_D2D4,
-        0xA00A_E278,
-        0xBDBD_F21C,
-    ];
+    let table = crc_table();
     let mut c = !0u32;
-    for (i, &b) in data.iter().enumerate() {
-        if i % 4096 == 0 {
-            tick();
-        }
-        c ^= b as u32;
-        c = (c >> 4) ^ T[(c & 15) as usize];
-        c = (c >> 4) ^ T[(c & 15) as usize];
+    for chunk in data.chunks(4096) {
+        tick();
+        c = crc_bytes(&table, c, chunk);
     }
     !c
+}
+
+/// The remainders of the 256 bytes, for [`crc_bytes`] and
+/// [`crc_words`]. Built at each check, on the stack: the rescue core,
+/// which checks the whole application at every power-on, has no room
+/// left for it in its flash, nor the internal RAM to keep it. Building
+/// it takes a fraction of a millisecond; four bits at a time, from a
+/// table of 16 in the flash, the check took the rescue core 83 ms.
+pub fn crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for (i, t) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg());
+        }
+        *t = c;
+    }
+    table
+}
+
+/// The CRC register `c` (inverted, as it runs) carried over `data`.
+/// This and [`crc_words`] are ARM code, whose shifts come with the
+/// operation that takes them; plain operators and no call, which the
+/// compiler would not inline into them from Thumb.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+pub fn crc_bytes(table: &[u32; 256], mut c: u32, data: &[u8]) -> u32 {
+    let mut i = 0;
+    while i < data.len() {
+        c = table[((c ^ data[i] as u32) & 0xFF) as usize] ^ (c >> 8);
+        i += 1;
+    }
+    c
+}
+
+/// The same over the bytes of `words` as a little-endian processor
+/// holds them (the rabbit's): one load for four bytes.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+pub fn crc_words(table: &[u32; 256], mut c: u32, words: &[u32]) -> u32 {
+    let mut i = 0;
+    while i < words.len() {
+        c ^= words[i];
+        c = table[(c & 0xFF) as usize] ^ (c >> 8);
+        c = table[(c & 0xFF) as usize] ^ (c >> 8);
+        c = table[(c & 0xFF) as usize] ^ (c >> 8);
+        c = table[(c & 0xFF) as usize] ^ (c >> 8);
+        i += 1;
+    }
+    c
 }
 
 #[cfg(any(test, feature = "std"))]
@@ -587,6 +614,20 @@ mod tests {
         assert_eq!(crc32(b"123456789", || ticks += 1), 0xCBF4_3926);
         assert_eq!(crc32(&[0; 8193], || ticks += 1), 0x25B8_4C49);
         assert_eq!(ticks, 4);
+    }
+
+    /// Four bytes at a time from words, as the firmware reads the flash:
+    /// the same CRC.
+    #[test]
+    fn crc_of_words_is_that_of_their_bytes() {
+        let table = crc_table();
+        let words: Vec<u32> = (0..1000u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(
+            crc_words(&table, !0, &words),
+            crc_bytes(&table, !0, &bytes)
+        );
+        assert_eq!(!crc_bytes(&table, !0, &bytes), crc32(&bytes, || {}));
     }
 
     #[test]
