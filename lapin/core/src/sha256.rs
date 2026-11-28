@@ -1,7 +1,7 @@
 //! SHA-256 and what is built on it: HMAC, the 802.11 key derivation
 //! function, HKDF-Expand. Small rather than fast.
 
-use crate::hash::{Engine, Keyed};
+use crate::hash::{Engine, Keyed, hasher};
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -23,13 +23,7 @@ const START: Engine = Engine::new(
     true,
 );
 
-pub struct Sha256(Engine);
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+hasher!(Sha256, sha256, 32);
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
@@ -69,34 +63,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 }
 
-impl Sha256 {
-    pub fn new() -> Self {
-        Sha256(START)
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    pub fn finish(mut self) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        self.0.finish(&mut out);
-        out
-    }
-}
-
-pub fn sha256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    for p in parts {
-        h.update(p);
-    }
-    h.finish()
-}
-
 pub fn hmac(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    Keyed::new(&START, 32, key).sign(parts, &mut out);
-    out
+    Keyed::new(&START, 32, key).code(parts)
 }
 
 /// The 802.11 key derivation function: fills `out` from a key, a label
@@ -121,16 +89,8 @@ pub fn hkdf_expand(key: &[u8], info: &[u8], out: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
     use super::*;
-    use std::vec::Vec;
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::hex;
 
     #[test]
     fn digests_match_the_published_ones() {

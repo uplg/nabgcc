@@ -1,7 +1,7 @@
 //! SHA-1 and what WPA and WPA2 build on it: HMAC, the passphrase to key
 //! derivation (PBKDF2, 4096 rounds) and the pairwise key expansion PRF.
 
-use crate::hash::{Engine, Keyed};
+use crate::hash::{Engine, Keyed, hasher};
 
 const START: Engine = Engine::new(
     [
@@ -11,14 +11,7 @@ const START: Engine = Engine::new(
     true,
 );
 
-#[derive(Clone)]
-pub struct Sha1(Engine);
-
-impl Default for Sha1 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+hasher!(Sha1, sha1, 20);
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
@@ -54,42 +47,12 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 }
 
-impl Sha1 {
-    pub const fn new() -> Self {
-        Sha1(START)
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    pub fn finish(mut self) -> [u8; 20] {
-        let mut out = [0u8; 20];
-        self.0.finish(&mut out);
-        out
-    }
-}
-
-pub fn sha1(parts: &[&[u8]]) -> [u8; 20] {
-    let mut h = Sha1::new();
-    for p in parts {
-        h.update(p);
-    }
-    h.finish()
-}
-
 fn keyed(key: &[u8]) -> Keyed {
     Keyed::new(&START, 20, key)
 }
 
-fn sign(key: &Keyed, parts: &[&[u8]]) -> [u8; 20] {
-    let mut out = [0u8; 20];
-    key.sign(parts, &mut out);
-    out
-}
-
 pub fn hmac_sha1(key: &[u8], parts: &[&[u8]]) -> [u8; 20] {
-    sign(&keyed(key), parts)
+    keyed(key).code(parts)
 }
 
 /// The pairwise master key of a WPA or WPA2 network from its passphrase
@@ -103,10 +66,10 @@ pub fn passphrase_to_pmk(
     let key = keyed(passphrase);
     let mut pmk = [0u8; 40];
     for (block, out) in pmk.chunks_mut(20).enumerate() {
-        let mut u = sign(&key, &[ssid, &(block as u32 + 1).to_be_bytes()]);
+        let mut u = key.code::<20>(&[ssid, &(block as u32 + 1).to_be_bytes()]);
         let mut sum = u;
         for round in 1..4096 {
-            u = sign(&key, &[&u]);
+            u = key.code(&[&u]);
             for (s, x) in sum.iter_mut().zip(u) {
                 *s ^= x;
             }
@@ -126,7 +89,7 @@ pub fn passphrase_to_pmk(
 pub fn prf(key: &[u8], label: &[u8], data: &[u8], out: &mut [u8]) {
     let key = keyed(key);
     for (i, chunk) in out.chunks_mut(20).enumerate() {
-        let block = sign(&key, &[label, &[0], data, &[i as u8]]);
+        let block: [u8; 20] = key.code(&[label, &[0], data, &[i as u8]]);
         chunk.copy_from_slice(&block[..chunk.len()]);
     }
 }
@@ -134,15 +97,7 @@ pub fn prf(key: &[u8], label: &[u8], data: &[u8], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(s: &str) -> std::vec::Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    extern crate std;
+    use crate::hex;
 
     #[test]
     fn hashes() {

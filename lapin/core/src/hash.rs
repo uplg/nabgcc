@@ -113,4 +113,52 @@ impl Keyed {
         outer.update(digest);
         outer.finish(out);
     }
+
+    /// The code of the concatenation of `parts`, `N` the digest's length.
+    pub(crate) fn code<const N: usize>(&self, parts: &[&[u8]]) -> [u8; N] {
+        let mut out = [0u8; N];
+        self.sign(parts, &mut out);
+        out
+    }
 }
+
+/// A hash's public face, from the module's `START` engine: `$name`,
+/// to be given the message in pieces, and `$digest`, the digest
+/// (`$size` bytes) of the concatenation of a few.
+macro_rules! hasher {
+    ($name:ident, $digest:ident, $size:literal) => {
+        #[derive(Clone)]
+        pub struct $name(crate::hash::Engine);
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl $name {
+            pub const fn new() -> Self {
+                $name(START)
+            }
+
+            pub fn update(&mut self, data: &[u8]) {
+                self.0.update(data);
+            }
+
+            pub fn finish(mut self) -> [u8; $size] {
+                let mut out = [0u8; $size];
+                self.0.finish(&mut out);
+                out
+            }
+        }
+
+        pub fn $digest(parts: &[&[u8]]) -> [u8; $size] {
+            let mut h = $name::new();
+            for p in parts {
+                h.update(p);
+            }
+            h.finish()
+        }
+    };
+}
+pub(crate) use hasher;

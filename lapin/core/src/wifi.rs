@@ -2751,7 +2751,6 @@ impl Station {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate std;
     use std::vec::Vec;
 
     const AP: Mac = [0x02, 0, 0, 0, 0, 0xA1];

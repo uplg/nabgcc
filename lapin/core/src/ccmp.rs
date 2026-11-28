@@ -153,16 +153,7 @@ pub fn bip_check(igtk: &[u8; 16], frame: &[u8]) -> Option<(u16, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate std;
-    use std::vec::Vec;
-
-    fn hex(s: &str) -> Vec<u8> {
-        let s: std::string::String = s.split_whitespace().collect();
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::hex;
 
     /// IEEE 802.11-2012 M.9.2: a unicast deauthentication.
     #[test]

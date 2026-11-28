@@ -44,7 +44,6 @@ pub fn unpack(packed: &[u8], out: &mut [u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
     use super::unpack;
     use std::vec::Vec;
 

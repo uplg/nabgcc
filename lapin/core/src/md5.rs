@@ -1,7 +1,7 @@
 //! MD5 and HMAC-MD5, for the integrity code of WPA's (TKIP) handshake,
 //! and RC4, which carries its group key.
 
-use crate::hash::{Engine, Keyed};
+use crate::hash::{Engine, Keyed, hasher};
 
 const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
 
@@ -27,14 +27,7 @@ const START: Engine = Engine::new(
     false,
 );
 
-#[derive(Clone)]
-pub struct Md5(Engine);
-
-impl Default for Md5 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+hasher!(Md5, md5, 16);
 
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut m = [0u32; 16];
@@ -60,26 +53,8 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 }
 
-impl Md5 {
-    pub const fn new() -> Self {
-        Md5(START)
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    pub fn finish(mut self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        self.0.finish(&mut out);
-        out
-    }
-}
-
 pub fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    Keyed::new(&START, 16, key).sign(parts, &mut out);
-    out
+    Keyed::new(&START, 16, key).code(parts)
 }
 
 /// RC4 over `data` in place, after throwing away the first `skip`
@@ -105,26 +80,16 @@ pub fn rc4(key: &[u8], skip: usize, data: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    extern crate std;
-
-    fn hex(s: &str) -> std::vec::Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::hex;
 
     #[test]
     fn md5_rfc1321() {
-        let h = |s: &[u8]| {
-            let mut m = Md5::new();
-            m.update(s);
-            m.finish()
-        };
-        assert_eq!(h(b"")[..], hex("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(md5(&[])[..], hex("d41d8cd98f00b204e9800998ecf8427e"));
         assert_eq!(
-            h(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890")
-                [..],
+            md5(&[
+                b"1234567890123456789012345678901234567890",
+                b"1234567890123456789012345678901234567890"
+            ])[..],
             hex("57edf4a22be3c955ac49da2e2107b67a")
         );
     }
