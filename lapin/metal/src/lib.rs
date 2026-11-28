@@ -362,6 +362,8 @@ impl<'m, H: Host> Vm<'m, H> {
     }
 
     /// [`Self::w`] and [`Self::set`] inline, for the collector's loops.
+    /// Copies rather than calls: the collector is ARM code, and the Thumb
+    /// accessors could not be inlined into it.
     #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
     #[inline(always)]
     fn wf(&self, i: i32) -> i32 {

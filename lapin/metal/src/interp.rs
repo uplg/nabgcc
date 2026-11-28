@@ -696,30 +696,19 @@ impl<H: Host> Vm<'_, H> {
                 }
             }
             STRCATLIST => {
+                // Walked twice: the allocation may move the strings.
                 let mut len = 0;
-                let mut p = val(self.sget(0));
-                while p != NIL {
-                    let q = val(self.fetch(p, 0));
-                    if q != NIL {
-                        len += self.size_bin(q);
-                    }
-                    p = val(self.fetch(p, 1));
-                }
+                self.each_string(|vm, q| len += vm.size_bin(q));
                 let r = self.alloc_bin(len);
                 if r < 0 {
                     return Flow::Return;
                 }
-                let mut len = 0;
-                let mut p = val(self.sget(0));
-                while p != NIL {
-                    let q = val(self.fetch(p, 0));
-                    if q != NIL {
-                        let lq = self.size_bin(q);
-                        self.copy_bytes(Self::start_bin(r) + len, Self::start_bin(q), lq);
-                        len += lq;
-                    }
-                    p = val(self.fetch(p, 1));
-                }
+                let mut at = Self::start_bin(r);
+                self.each_string(|vm, q| {
+                    let lq = vm.size_bin(q);
+                    vm.copy_bytes(at, Self::start_bin(q), lq);
+                    at += lq;
+                });
                 self.sset(0, pnt(r));
             }
             LED => {
@@ -1124,6 +1113,19 @@ impl<H: Host> Vm<'_, H> {
             _ => {}
         }
         Flow::Next
+    }
+
+    /// Each string of the list on top of the stack, as a block, nil ones
+    /// left out.
+    fn each_string(&mut self, mut f: impl FnMut(&mut Self, i32)) {
+        let mut p = val(self.sget(0));
+        while p != NIL {
+            let q = val(self.fetch(p, 0));
+            if q != NIL {
+                f(self, q);
+            }
+            p = val(self.fetch(p, 1));
+        }
     }
 
     /// The byte after the opcode.

@@ -28,10 +28,16 @@ impl<H: Host> Vm<'_, H> {
             return;
         }
         let size = ((self.start - HEADER_LENGTH - start) << 2) - 1;
-        self.set(start, (size << 8) + TYPE_BINARY);
-        self.set(start + HEADER_GC, 0);
-        self.set(start + HEADER_LIST, 0);
+        self.header(start, (size << 8) + TYPE_BINARY);
         self.start = start;
+    }
+
+    /// A block's three header words: its size and kind, the collector's
+    /// two cleared.
+    fn header(&mut self, p: i32, first: i32) {
+        self.set(p, first);
+        self.set(p + HEADER_GC, 0);
+        self.set(p + HEADER_LIST, 0);
     }
 
     #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
@@ -252,14 +258,18 @@ impl<H: Host> Vm<'_, H> {
     /// `vmemAllocBin`: a string of `size` bytes, its last word zeroed.
     pub(crate) fn alloc_bin(&mut self, size: i32) -> i32 {
         let wsize = HEADER_LENGTH.wrapping_add(size.wrapping_add(4) >> 2);
+        self.alloc(wsize, (size << 8) + TYPE_BINARY)
+    }
+
+    /// What both allocations do: room for `wsize` words, the header, the
+    /// last word zeroed. -1 when there is no room.
+    fn alloc(&mut self, wsize: i32, first: i32) -> i32 {
         if !self.check(wsize) {
             return -1;
         }
         let p = self.heapindex;
         self.heapindex = self.heapindex.wrapping_add(wsize);
-        self.set(p, (size << 8) + TYPE_BINARY);
-        self.set(p + HEADER_GC, 0);
-        self.set(p + HEADER_LIST, 0);
+        self.header(p, first);
         self.set(p.wrapping_add(wsize).wrapping_sub(1), 0);
         p
     }
@@ -296,18 +306,8 @@ impl<H: Host> Vm<'_, H> {
 
     /// `vmemAllocTab`: a table of `size` words, the last one zeroed.
     pub(crate) fn alloc_tab(&mut self, size: i32) -> i32 {
-        let wsize = HEADER_LENGTH.wrapping_add(size);
-        if !self.check(wsize) {
-            return -1;
-        }
-        let p = self.heapindex;
-        self.heapindex = self.heapindex.wrapping_add(wsize);
         let bytes = (size << 2) - 1;
-        self.set(p, (bytes << 8) + TYPE_TAB);
-        self.set(p + HEADER_GC, 0);
-        self.set(p + HEADER_LIST, 0);
-        self.set(p.wrapping_add(wsize).wrapping_sub(1), 0);
-        p
+        self.alloc(HEADER_LENGTH.wrapping_add(size), (bytes << 8) + TYPE_TAB)
     }
 
     /// `vmemAllocTabClear`: the same, all nil.
