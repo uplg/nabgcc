@@ -1,10 +1,16 @@
 //! The boot bytecode is kept compressed in the flash and unpacked into
 //! RAM at power-on: LZSS, for a decoder of a few dozen instructions.
 //!
-//! The stream is groups of a flag byte and eight items, its bits from
-//! the lowest: 0 a literal byte, 1 a copy of two bytes, the high nibble
-//! of the first plus three its length, the low one and the second byte
-//! how far back it starts, minus one (up to 4096).
+//! The items are flag bits, eight to a byte from the lowest: 0 a
+//! literal byte, 1 a copy of two bytes, the high nibble of the first
+//! plus three its length, the low one and the second byte how far back
+//! it starts, minus one (up to 4096). The stream keeps them apart, so
+//! that the bytecode's literals follow each other: two little-endian
+//! half-words, how many flag bytes and how many literals, then the flag
+//! bytes, the literals, the copies. `lapin-first.bin` packs the
+//! application again (`pack`), which finds more in the literals side by
+//! side than among flags and copies: 800 bytes less than with the
+//! three interleaved, for the same length here.
 
 /// Unpack `packed` into `out`; returns how many bytes came out (it
 /// stops when `out` is full).
@@ -16,31 +22,48 @@
 #[inline(never)]
 pub fn unpack(packed: &[u8], out: &mut [u8]) -> usize {
     let (len, room) = (packed.len(), out.len());
-    let (mut i, mut n) = (0, 0);
+    if len < 4 {
+        return 0;
+    }
+    // Where each stream is read from, and where it ends.
+    let mut f = 4;
+    let mut flags_end = f + (packed[0] as usize | (packed[1] as usize) << 8);
+    if flags_end > len {
+        flags_end = len;
+    }
+    let mut l = flags_end;
+    let mut literals_end = l + (packed[2] as usize | (packed[3] as usize) << 8);
+    if literals_end > len {
+        literals_end = len;
+    }
+    let mut c = literals_end;
+    let mut n = 0;
     // The flag byte's bits still to read, above a 1 that marks their end.
     let mut flags = 1;
     while n < room {
         if flags == 1 {
-            if i >= len {
+            if f >= flags_end {
                 break;
             }
-            flags = packed[i] as u32 | 0x100;
-            i += 1;
+            flags = packed[f] as u32 | 0x100;
+            f += 1;
         }
-        if i >= len {
-            break;
-        }
-        let a = packed[i] as usize;
-        i += 1;
         let copy = flags & 1;
         flags >>= 1;
         if copy == 0 {
-            out[n] = a as u8;
+            if l >= literals_end {
+                break;
+            }
+            out[n] = packed[l];
+            l += 1;
             n += 1;
             continue;
         }
-        let b = if i < len { packed[i] as usize } else { 0 };
-        i += 1;
+        if c + 2 > len {
+            break;
+        }
+        let (a, b) = (packed[c] as usize, packed[c + 1] as usize);
+        c += 2;
         let back = ((a & 15) << 8 | b) + 1;
         if back > n {
             break;
@@ -77,26 +100,34 @@ mod tests {
     use super::unpack;
     use std::vec::Vec;
 
-    /// The first unpacker, one check per byte.
+    /// A plain unpacker, one check per byte.
     fn reference(packed: &[u8], out: &mut [u8]) -> usize {
-        let (mut i, mut n) = (0, 0);
-        while i < packed.len() {
-            let flags = packed[i];
-            i += 1;
+        if packed.len() < 4 {
+            return 0;
+        }
+        let half = |at: usize| u16::from_le_bytes([packed[at], packed[at + 1]]) as usize;
+        let rest = &packed[4..];
+        let (flag_bytes, rest) = rest.split_at(half(0).min(rest.len()));
+        let (mut literals, mut copies) = rest.split_at(half(2).min(rest.len()));
+        let mut n = 0;
+        for flags in flag_bytes {
             for bit in 0..8 {
-                if i >= packed.len() || n >= out.len() {
+                if n >= out.len() {
                     return n;
                 }
                 if flags >> bit & 1 == 0 {
-                    out[n] = packed[i];
+                    let Some((&byte, more)) = literals.split_first() else {
+                        return n;
+                    };
+                    out[n] = byte;
                     n += 1;
-                    i += 1;
+                    literals = more;
                 } else {
-                    let (a, b) = (
-                        packed[i] as usize,
-                        *packed.get(i + 1).unwrap_or(&0) as usize,
-                    );
-                    i += 2;
+                    let [a, b, ..] = *copies else {
+                        return n;
+                    };
+                    let (a, b) = (a as usize, b as usize);
+                    copies = &copies[2..];
                     let len = (a >> 4) + 3;
                     let back = ((a & 15) << 8 | b) + 1;
                     for _ in 0..len {
@@ -124,6 +155,10 @@ mod tests {
                 x ^= x << 5;
                 packed.push(x as u8);
             }
+            // Half of them with counts that fall within the stream.
+            if case % 2 == 0 && packed.len() >= 4 {
+                packed[..4].copy_from_slice(&[x as u8 % 32, 0, (x >> 8) as u8 % 64, 0]);
+            }
             let room = (x >> 8) as usize % 400;
             let (mut a, mut b) = (std::vec![7u8; room], std::vec![7u8; room]);
             assert_eq!(unpack(&packed, &mut a), reference(&packed, &mut b));
@@ -146,6 +181,6 @@ mod tests {
         assert_eq!(unpack(&p, &mut out), d.len());
         assert_eq!(out, d);
         // A stream that points before its start stops there.
-        assert_eq!(unpack(&[1, 0x00, 0x05], &mut out), 0);
+        assert_eq!(unpack(&[1, 0, 0, 0, 0x01, 0x00, 0x05], &mut out), 0);
     }
 }

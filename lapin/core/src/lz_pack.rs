@@ -5,12 +5,12 @@
 use std::collections::HashMap;
 use std::vec::Vec;
 
-/// Pack `d` as `lz::unpack` reads it: flag bytes,
-/// literals, two-byte copies (length 3 to 18, up to 4096 back), the
+/// Pack `d` as `lz::unpack` reads it: the counts, the flag bytes, the
+/// literals, the two-byte copies (length 3 to 18, up to 4096 back), the
 /// longest and then the nearest.
 pub fn pack(d: &[u8]) -> Vec<u8> {
     let mut chains: HashMap<[u8; 3], Vec<usize>> = HashMap::new();
-    let mut out = Vec::new();
+    let (mut flag_bytes, mut literals, mut copies) = (Vec::new(), Vec::new(), Vec::new());
     let mut i = 0;
     let note = |chains: &mut HashMap<[u8; 3], Vec<usize>>, at: usize| {
         if at + 3 <= d.len() {
@@ -21,8 +21,8 @@ pub fn pack(d: &[u8]) -> Vec<u8> {
         }
     };
     while i < d.len() {
-        let flags_at = out.len();
-        out.push(0u8);
+        let flags_at = flag_bytes.len();
+        flag_bytes.push(0u8);
         for bit in 0..8 {
             if i >= d.len() {
                 break;
@@ -45,19 +45,28 @@ pub fn pack(d: &[u8]) -> Vec<u8> {
                 }
             }
             if best >= 3 {
-                out[flags_at] |= 1 << bit;
-                out.push(((best - 3) << 4 | (off - 1) >> 8) as u8);
-                out.push((off - 1) as u8);
+                flag_bytes[flags_at] |= 1 << bit;
+                copies.push(((best - 3) << 4 | (off - 1) >> 8) as u8);
+                copies.push((off - 1) as u8);
                 for at in i..i + best {
                     note(&mut chains, at);
                 }
                 i += best;
             } else {
-                out.push(d[i]);
+                literals.push(d[i]);
                 note(&mut chains, i);
                 i += 1;
             }
         }
     }
+    let count = |v: &Vec<u8>| {
+        u16::try_from(v.len())
+            .expect("too long to count")
+            .to_le_bytes()
+    };
+    let mut out = [count(&flag_bytes), count(&literals)].concat();
+    out.extend(flag_bytes);
+    out.extend(literals);
+    out.extend(copies);
     out
 }
