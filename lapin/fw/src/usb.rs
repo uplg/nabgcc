@@ -387,7 +387,9 @@ fn retire(td: usize) {
         // controller leaves as it is: one of ours, or the descriptor is
         // not one this driver queued.
         let buffer = (word(td + 12).read() as usize + 1).wrapping_sub(RX_CHUNK);
-        if !(RX_BUFFERS..TX_BUFFER).contains(&buffer) || (buffer - RX_BUFFERS) % RX_CHUNK != 0 {
+        if !(RX_BUFFERS..TX_BUFFER).contains(&buffer)
+            || !(buffer - RX_BUFFERS).is_multiple_of(RX_CHUNK)
+        {
             return;
         }
         let len = moved(td, buffer, RX_CHUNK).min(RX_CHUNK);

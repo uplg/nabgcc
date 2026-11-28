@@ -39,6 +39,10 @@ fn add(a: u32, b: u32) -> u32 {
 /// since the compiler will not inline the library's (Thumb) iterators
 /// into it.
 #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+// The rotations written out: `rotate_left` is the library's (Thumb)
+// function, not inlined into ARM code: a call each round, and the
+// firmware 112 bytes larger (measured).
+#[allow(clippy::manual_rotate)]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
     let mut i = 0;

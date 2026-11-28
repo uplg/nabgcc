@@ -84,8 +84,8 @@ fn seen(low: u32, high: u32) -> Option<(usize, bool)> {
     // SAFETY: see `Seen`.
     let set = unsafe { &*SEEN_SET.0.get() };
     let scan = SCAN.get();
-    let mut i = ((low >> 8 ^ high).wrapping_mul(0x9E37_79B1) >> 23) as usize;
-    for _ in 0..16 {
+    let start = ((low >> 8 ^ high).wrapping_mul(0x9E37_79B1) >> 23) as usize;
+    for i in start..start + 16 {
         let [a, b] = set[i % SEEN];
         if b >> 16 != scan {
             return Some((i % SEEN, false));
@@ -93,7 +93,6 @@ fn seen(low: u32, high: u32) -> Option<(usize, bool)> {
         if a == low && b == high | scan << 16 {
             return Some((i % SEEN, true));
         }
-        i += 1;
     }
     None
 }

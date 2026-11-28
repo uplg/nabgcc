@@ -23,10 +23,18 @@ jobs:
             lapin
             lapin/fuzz
       - run: sudo apt-get update && sudo apt-get install -y binutils-arm-none-eabi
-      - run: cargo test --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref
-      - name: The fuzzing harness's own tests
+      - run: cargo fmt --all --check
+      - run: cargo clippy --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref -p lapin-pack --all-targets -- -D warnings
+      - name: The firmware's lints
+        working-directory: lapin/fw
+        run: cargo clippy --release -- -D warnings
+      - run: cargo test --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref -p lapin-pack
+      - name: The fuzzing harness's own lints and tests
         working-directory: lapin/fuzz
-        run: cargo test --release
+        run: |
+          cargo fmt --check
+          cargo clippy --release --all-targets -- -D warnings
+          cargo test --release
       - run: ./build.sh
       - uses: actions/upload-artifact@v7
         with:
