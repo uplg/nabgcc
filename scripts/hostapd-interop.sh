@@ -41,6 +41,7 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('192.168.50.1', 80), H).serve_forever()
 PY
 
+pass=carotte-violette
 common="interface=IFACE
 driver=nl80211
 ssid=Terrier
@@ -50,22 +51,22 @@ channel=6
 declare -A security=(
   [open]=""
   [wpa]="wpa=1
-wpa_passphrase=carotte-violette
+wpa_passphrase=$pass
 wpa_key_mgmt=WPA-PSK
 wpa_pairwise=TKIP"
   [wpa2]="wpa=2
-wpa_passphrase=carotte-violette
+wpa_passphrase=$pass
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP"
   [transition]="wpa=2
-wpa_passphrase=carotte-violette
-sae_password=carotte-violette
+wpa_passphrase=$pass
+sae_password=$pass
 wpa_key_mgmt=WPA-PSK SAE
 rsn_pairwise=CCMP
 ieee80211w=1
 sae_pwe=2"
   [wpa3]="wpa=2
-sae_password=carotte-violette
+sae_password=$pass
 wpa_key_mgmt=SAE
 rsn_pairwise=CCMP
 ieee80211w=2
@@ -73,7 +74,7 @@ sae_pwe=2"
   # Hash-to-element only: the association has to carry the RSN
   # extension element that says so.
   [wpa3h2e]="wpa=2
-sae_password=carotte-violette
+sae_password=$pass
 wpa_key_mgmt=SAE
 rsn_pairwise=CCMP
 ieee80211w=2
@@ -81,9 +82,10 @@ sae_pwe=1"
 )
 declare -A config=([open]=open [wpa]=wpa [wpa2]=wpa2 [transition]=wpa2 [wpa3]=wpa2 [wpa3h2e]=wpa2)
 
-status=0
+stop() { pkill -x hostapd || true; pkill -x dnsmasq || true; pkill -f serve.py || true; }
+
 for kind in ${KINDS:-open wpa wpa2 transition wpa3 wpa3h2e}; do
-    pkill -x hostapd || true; pkill -x dnsmasq || true; pkill -f serve.py || true
+    stop
     modprobe -r mac80211_hwsim 2>/dev/null || true
     modprobe mac80211_hwsim radios=1
     sleep 1
@@ -100,9 +102,9 @@ for kind in ${KINDS:-open wpa wpa2 transition wpa3 wpa3h2e}; do
         --address=/#/192.168.50.1 --pid-file="$work/dnsmasq.pid" --log-facility="$work/dnsmasq.log"
     python3 "$work/serve.py" "$work/bc" & sleep 1
     echo "== $kind (radio $radio on $iface)"
-    if NABEMU_FIRMWARE=lapin NABEMU_HOSTAPD_RADIO="$radio" NABEMU_HOSTAPD_WIFI="${config[$kind]}" \
-        "$test_bin" --nocapture --test-threads=1 2>&1 | grep -E "frames to hostapd|test result|panicked|never ran|hwsim refused|cipher errors|wifi|scan|state|^[0-9]+$" ; then :; fi
+    NABEMU_FIRMWARE=lapin NABEMU_HOSTAPD_RADIO="$radio" NABEMU_HOSTAPD_WIFI="${config[$kind]}" \
+        "$test_bin" --nocapture --test-threads=1 2>&1 |
+        grep -E "frames to hostapd|test result|panicked|never ran|hwsim refused|cipher errors|wifi|scan|state|^[0-9]+$" || true
     grep -E "AP-STA-CONNECTED|EAPOL-4WAY-HS-COMPLETED|authenticated|SAE" "$work/$kind.log" | grep -v "^$" | tail -3 || true
 done
-pkill -x hostapd || true; pkill -x dnsmasq || true; pkill -f serve.py || true
-exit $status
+stop
