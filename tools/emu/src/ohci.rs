@@ -110,6 +110,16 @@ pub struct Ohci {
     /// before the handler's end (and its CILCL write).
     stt_ohci: bool,
     pub latched: bool,
+    /// The device's data toggles on its bulk endpoints, by number: the
+    /// one it expects next out (`[ep][0]`), the one it sends next in
+    /// (`[ep][1]`). Back to DATA0 at a bus reset, SET_CONFIGURATION,
+    /// SET_INTERFACE, and CLEAR_FEATURE(ENDPOINT_HALT) for the endpoint.
+    toggles: [[bool; 2]; 16],
+    /// Packets thrown away for a toggle that repeats the last one (USB
+    /// 2.0, 8.6.4): an OUT packet the device takes for a retry of one it
+    /// has, an IN packet the host takes for one it has. Both are
+    /// acknowledged all the same.
+    pub toggle_drops: u64,
 }
 
 struct Ram<'a>(&'a mut [u8]);
@@ -151,6 +161,8 @@ impl Ohci {
             rhsc_level: std::env::var_os("NABEMU_RHSC_LEVEL").is_some(),
             stt_ohci: false,
             latched: false,
+            toggles: [[false; 2]; 16],
+            toggle_drops: 0,
         }
     }
 
@@ -175,6 +187,7 @@ impl Ohci {
     /// Plug a device in (it comes up from power-off).
     pub fn plug(&mut self, mut device: Box<dyn UsbDevice>) {
         device.power_cycle();
+        self.toggles = [[false; 2]; 16];
         self.device = Some(device);
         if self.port & PS_PPS != 0 {
             self.port |= PS_CCS | PS_CSC;
@@ -316,6 +329,7 @@ impl Ohci {
             if self.reset_left == 0 {
                 self.port = (self.port & !PS_PRS) | PS_PES | PS_PRSC;
                 self.int_status |= INTR_RHSC;
+                self.toggles = [[false; 2]; 16];
                 if let Some(d) = &mut self.device {
                     d.bus_reset();
                 }
@@ -437,6 +451,29 @@ impl Ohci {
             _ => (td_ctl >> 19) & 3,
         };
 
+        // The toggle of the next packet: the descriptor's own once it
+        // has one (its top bit set), else the endpoint's carry.
+        let mut toggle = if td_ctl & (1 << 25) != 0 {
+            td_ctl & (1 << 24) != 0
+        } else {
+            head_raw & ED_CARRY != 0
+        };
+        // Only the bulk endpoints' toggles are the device's to check
+        // here; endpoint 0's are set by every stage's descriptor.
+        let bulk = ep != 0;
+        let mut device_toggles = self.toggles[ep as usize];
+        let mut drops = 0;
+        // Packets that went through, and the descriptor as they leave
+        // it: its toggle field, once a packet moved.
+        let mut packets_ok = 0u32;
+        let td_toggle = |td_ctl: u32, packets_ok: u32, toggle: bool| {
+            if packets_ok == 0 {
+                td_ctl & (3 << 24)
+            } else {
+                (2 | toggle as u32) << 24
+            }
+        };
+
         let Some(dev) = self.device.as_mut() else {
             return Some(false);
         };
@@ -448,7 +485,21 @@ impl Ohci {
                     let m = ram.range(cbp, 8)?;
                     let mut pkt = [0u8; 8];
                     pkt.copy_from_slice(m);
-                    dev.setup(pkt)
+                    let x = dev.setup(pkt);
+                    if let Xfer::Done(_) = x {
+                        packets_ok += 1;
+                        toggle = !toggle;
+                        // Requests that put the data toggles back to DATA0.
+                        match (pkt[0], pkt[1]) {
+                            (0x00, 9) | (0x01, 11) => self.toggles = [[false; 2]; 16],
+                            (0x02, 1) if pkt[2] == 0 && pkt[3] == 0 => {
+                                let n = (pkt[4] & 0xF) as usize;
+                                self.toggles[n][(pkt[4] >> 7) as usize] = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                    x
                 }
                 1 => {
                     let data = if len == 0 {
@@ -458,12 +509,43 @@ impl Ohci {
                     };
                     let mut sent = 0;
                     let mut result = None;
-                    if data.is_empty() {
-                        result = Some(dev.data_out(ep, &[]));
-                    }
-                    for packet in data.chunks(mps) {
-                        match dev.data_out(ep, packet) {
-                            Xfer::Done(_) => sent += packet.len(),
+                    let packets: Vec<&[u8]> = if data.is_empty() {
+                        vec![&[]]
+                    } else {
+                        data.chunks(mps).collect()
+                    };
+                    for packet in packets {
+                        // A repeated toggle: the device takes the packet
+                        // for a retry of the last it has, acknowledges it,
+                        // and throws it away.
+                        let fresh = !bulk || toggle == device_toggles[0];
+                        let x = if fresh {
+                            dev.data_out(ep, packet)
+                        } else {
+                            drops += 1;
+                            Xfer::Done(packet.len())
+                        };
+                        match x {
+                            Xfer::Done(_) => {
+                                sent += packet.len();
+                                packets_ok += 1;
+                                toggle = !toggle;
+                                if bulk && fresh {
+                                    device_toggles[0] = !device_toggles[0];
+                                }
+                            }
+                            Xfer::Nak if sent > 0 => {
+                                // What went out stays out: come back next
+                                // frame for the rest, with its toggle.
+                                ram.wr32(
+                                    td,
+                                    (td_ctl & !(3 << 24)) | td_toggle(td_ctl, packets_ok, toggle),
+                                )?;
+                                ram.wr32(td + 4, cbp + sent as u32)?;
+                                self.toggles[ep as usize] = device_toggles;
+                                self.toggle_drops += drops;
+                                return Some(false);
+                            }
                             other => {
                                 result = Some(other);
                                 break;
@@ -480,6 +562,19 @@ impl Ohci {
                     loop {
                         match dev.data_in(ep, &mut packet) {
                             Xfer::Done(n) => {
+                                // The device sent it with its toggle, and
+                                // goes on to the next once acknowledged;
+                                // the host throws away one it has.
+                                let fresh = !bulk || toggle == device_toggles[1];
+                                if bulk {
+                                    device_toggles[1] = !device_toggles[1];
+                                }
+                                if !fresh {
+                                    drops += 1;
+                                    continue;
+                                }
+                                packets_ok += 1;
+                                toggle = !toggle;
                                 let take = n.min(len - got);
                                 if take > 0 {
                                     ram.range(cbp + got as u32, take)?
@@ -495,7 +590,13 @@ impl Ohci {
                             }
                             Xfer::Nak if got > 0 => {
                                 // Keep what arrived, come back next frame.
+                                ram.wr32(
+                                    td,
+                                    (td_ctl & !(3 << 24)) | td_toggle(td_ctl, packets_ok, toggle),
+                                )?;
                                 ram.wr32(td + 4, cbp + got as u32)?;
+                                self.toggles[ep as usize] = device_toggles;
+                                self.toggle_drops += drops;
                                 return Some(false);
                             }
                             other => break other,
@@ -504,6 +605,10 @@ impl Ohci {
                 }
             })
         };
+        if bulk {
+            self.toggles[ep as usize] = device_toggles;
+        }
+        self.toggle_drops += drops;
 
         let (cc, moved) = match outcome {
             None => (CC_NOT_RESPONDING, 0),
@@ -516,20 +621,15 @@ impl Ohci {
 
         // Retire the TD: status, buffer pointer, toggle, done queue.
         let new_cbp = if moved == len { 0 } else { cbp + moved as u32 };
-        ram.wr32(td, (td_ctl & 0x03FF_FFFF) | (cc << 28))?;
+        let t = td_toggle(td_ctl, packets_ok, toggle);
+        ram.wr32(td, (td_ctl & 0x00FF_FFFF) | t | (cc << 28))?;
         ram.wr32(td + 4, new_cbp)?;
         let done = self.r(HC_DONE_HEAD);
         ram.wr32(td + 8, done)?;
         self.regs[(HC_DONE_HEAD / 4) as usize] = td;
 
-        let packets = moved.div_ceil(mps).max(1) as u32;
-        let mut carry = head_raw & ED_CARRY;
-        if td_ctl & (1 << 25) != 0 {
-            carry = if td_ctl & (1 << 24) != 0 { ED_CARRY } else { 0 };
-        }
-        if (cc == CC_NO_ERROR || cc == CC_DATA_UNDERRUN) && packets & 1 != 0 {
-            carry ^= ED_CARRY;
-        }
+        // The endpoint carries the toggle of the next packet.
+        let carry = if toggle { ED_CARRY } else { 0 };
         let halt = if cc != CC_NO_ERROR { ED_HALT } else { 0 };
         ram.wr32(ed + 8, (next & !0xF) | carry | halt)?;
         Some(true)

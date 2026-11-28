@@ -121,6 +121,13 @@ pub struct Radio {
     /// The bulk endpoint out answers NAK to every packet while set: a
     /// stick that has stopped taking frames to send.
     pub tx_stuck: bool,
+    /// Once this many packets of the frame being handed over are in
+    /// (the first of the pair), the bulk endpoint out answers NAK for
+    /// so many milliseconds (the second): a stick whose transmit queue
+    /// fills up in the middle of a frame.
+    pub tx_stall_after: Option<(usize, u32)>,
+    /// Milliseconds the endpoint out still answers NAK.
+    pub tx_stall_ms: u32,
     /// The bulk endpoint in stalls every transfer while set: a stick
     /// that has stopped delivering what it receives.
     pub rx_stall: bool,
@@ -562,6 +569,10 @@ impl UsbDevice for Rt2573 {
     /// Once a millisecond: when the beacon generator is on, the chip
     /// sends the frame stored in its beacon memory at every interval.
     fn frame(&mut self) {
+        {
+            let mut radio = self.radio.borrow_mut();
+            radio.tx_stall_ms = radio.tx_stall_ms.saturating_sub(1);
+        }
         let csr9 = self.word(TXRX_CSR9);
         if csr9 & (1 << 20) == 0 {
             self.beacon_wait = 0;
@@ -647,6 +658,17 @@ impl UsbDevice for Rt2573 {
         match ep {
             0 => self.ctrl.data_out(data),
             1 if self.radio.borrow().tx_stuck => Xfer::Nak,
+            1 if self.radio.borrow().tx_stall_ms > 0 => Xfer::Nak,
+            1 if self
+                .radio
+                .borrow()
+                .tx_stall_after
+                .is_some_and(|(n, _)| self.out.len() >= n * PACKET) =>
+            {
+                let mut radio = self.radio.borrow_mut();
+                radio.tx_stall_ms = radio.tx_stall_after.take().map_or(0, |(_, ms)| ms);
+                Xfer::Nak
+            }
             1 => {
                 self.out.extend_from_slice(data);
                 if data.len() < PACKET {

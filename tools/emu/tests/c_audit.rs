@@ -214,6 +214,85 @@ fn a_stick_that_fails_its_bring_up_once_gets_another_try() {
 /// enumerates it again and the bytecode joins anew (Known defect: after
 /// a watchdog restart the unplugging causes); lapin brought it up once
 /// only, at boot.
+/// The bytecode's body: wait `ms` on the rabbit's clock, from `base`.
+fn pause(base: usize, ms: i32) -> Vec<u8> {
+    let mut b = vec![TIME_MS];
+    b.extend(metal::int(ms));
+    b.push(ADD);
+    let top = (base + b.len()) as u16;
+    b.extend([DUP, TIME_MS, GT, ELSE, 0, 0]);
+    let exit = b.len() - 2;
+    b.push(GOTO);
+    b.extend(top.to_le_bytes());
+    let end = (base + b.len()) as u16;
+    b[exit..exit + 2].copy_from_slice(&end.to_le_bytes());
+    b.push(DROP);
+    b
+}
+
+/// The stick stops taking a frame after its first packet, for longer
+/// than lapin waits (a second): lapin takes the transfer back, and the
+/// next frame's first packet must carry the toggle the stick expects
+/// next, the one after the packet it took. lapin put back the toggle
+/// the transfer had started with: the stick took the packet for a
+/// retry of the one it had and threw it away (USB's duplicate
+/// detection). With that packet the only one of its frame, the stick
+/// went on gluing what came to the frame it was given half of, and the
+/// frame after was lost too. r3 never takes a transfer back.
+#[test]
+fn the_toggle_after_a_transfer_taken_back_is_the_sticks() {
+    let send = |body: &mut Vec<u8>, frame: u8| {
+        body.extend([GETGLOBALB, frame]);
+        body.extend(metal::int(0));
+        body.extend([NIL, GETGLOBALB, 3]);
+        body.extend(metal::int(0));
+        body.extend(metal::int(0));
+        body.extend([NETSEND, DROP]);
+    };
+    // 7770, half a second, frame 0 (three packets), 1.1 s, frame 1
+    // (one), 0.3 s, frame 2 (three), 7771.
+    let mut body = metal::int(7770);
+    body.extend([IECHOLN, DROP]);
+    for (frame, ms) in [(0, 500), (1, 1100), (2, 300)] {
+        body.extend(pause(body.len(), ms));
+        send(&mut body, frame);
+    }
+    body.extend(metal::int(7771));
+    body.extend([IECHOLN, DROP]);
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.extend(body);
+    f.push(RET);
+    let frames: [&[u8]; 5] = [&[0xF1; 100], &[0xF2; 4], &[0xF3; 100], &[0xFF; 6], &[0; 4]];
+    let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&frames, &f));
+    until(&mut m, 60_000, "the program", |m| {
+        m.console().contains("\n7770")
+    });
+    assert_eq!(m.soc.ohci.toggle_drops, 0);
+    m.radio.borrow_mut().tx_stall_after = Some((1, 1250));
+    until(&mut m, 10_000, "the frames sent", |m| {
+        m.console().contains("\n7771")
+    });
+    wait(&mut m, 200);
+    let sent = |m: &Machine, payload: &[u8]| {
+        m.radio
+            .borrow()
+            .tx
+            .iter()
+            .any(|t| t.data.ends_with(payload))
+    };
+    assert_eq!(m.soc.ohci.toggle_drops, 0, "a packet taken for a retry");
+    if is_lapin() {
+        assert!(!sent(&m, &[0xF1; 100]), "the first frame went whole");
+        assert!(sent(&m, &[0xF3; 100]), "the frame after it lost");
+    } else {
+        // r3 takes nothing back: it waits for the stick, and every
+        // frame goes once it takes them again.
+        for payload in [&[0xF1; 100][..], &[0xF2; 4], &[0xF3; 100]] {
+            assert!(sent(&m, payload), "{payload:02x?} lost");
+        }
+    }
+}
+
 #[test]
 fn a_stick_plugged_back_in_is_brought_up_again() {
     let mut m = with_an_address(open());
@@ -753,6 +832,9 @@ fn a_transfer_that_timed_out_leaves_the_bus_free() {
 const WAV2ALAW: u8 = 141;
 const SNDVOL: u8 = 100;
 const LT: u8 = 24;
+const GT: u8 = 25;
+const DUP: u8 = 6;
+const NETSEND: u8 = 104;
 
 /// Known defect (B36): wav2alaw with a negative length writes over the
 /// heap and r3 restarts, and restarts again as the server gives it the
