@@ -285,14 +285,20 @@ fn the_rescue_core_unpacks_the_first_image_and_writes_the_application() {
     let mut m = first_start(&after_r3(&first));
     let mut unfed = 0;
     let mut resets_at = Vec::new();
+    let mut unpacked_at = Vec::new();
     installed(&mut m, |m| {
         unfed = unfed.max(m.soc.watchdog_unfed() * 1000 / CLOCK_HZ);
         if m.events.len() > resets_at.len() {
             resets_at.push(m.soc.millis());
         }
+        let said = m.console().matches("secours: unpacked").count();
+        if said > unpacked_at.len() {
+            unpacked_at.push(m.soc.millis());
+        }
     });
     eprintln!(
-        "restarts at {resets_at:?} ms, {} erases, the watchdog unfed {unfed} ms at most",
+        "unpacked at {unpacked_at:?} ms, restarts at {resets_at:?} ms, {} erases, \
+         the watchdog unfed {unfed} ms at most",
         m.soc.flash_erases
     );
     assert_eq!(
