@@ -374,6 +374,14 @@ pub struct Soc {
     pub trace: Option<Trace>,
     /// The I2C bus held low by a broken device: the master never gets it.
     pub i2c_jammed: bool,
+    /// The USB controller's interrupt line (EXINT2) takes a while to
+    /// fall once its cause is cleared: the processor can still take it
+    /// then, and the controller has nothing to name (IRN 0, an illegal
+    /// interrupt, manual 6.5.6 and 6.6.2). On with `NABEMU_IRQ_LAG`.
+    pub irq_lag: bool,
+    /// Lines still seen high, and until when.
+    falling_lines: u64,
+    falling_until: u64,
     /// Counts every access that may change the board's state (a store
     /// that changes memory, any peripheral access but feeding the
     /// watchdog): two turns of a loop with the same count in between
@@ -438,6 +446,9 @@ impl Soc {
             unmodelled: BTreeSet::new(),
             trace: None,
             i2c_jammed: false,
+            irq_lag: std::env::var_os("NABEMU_IRQ_LAG").is_some(),
+            falling_lines: 0,
+            falling_until: 0,
             touched: 0,
             feeds: 0,
         }
@@ -581,6 +592,11 @@ impl Soc {
         if level {
             self.irq_lines |= 1 << source;
         } else {
+            if self.irq_lag && source == INT_EXINT2_USB && self.irq_lines & 1 << source != 0 {
+                self.falling_lines |= 1 << source;
+                // Two microseconds: an open-drain line and its pull-up.
+                self.falling_until = self.cycles + 64;
+            }
             self.irq_lines &= !(1 << source);
         }
     }
@@ -826,9 +842,12 @@ impl Soc {
 
     /// The pending source the controller would hand out now, if any.
     fn best_irq(&self) -> Option<(u32, u32)> {
+        self.best_of(self.irq_lines)
+    }
+
+    fn best_of(&self, mut lines: u64) -> Option<(u32, u32)> {
         let floor = self.current_level();
         let mut best: Option<(u32, u32)> = None;
-        let mut lines = self.irq_lines;
         while lines != 0 {
             let n = lines.trailing_zeros();
             lines &= lines - 1;
@@ -843,7 +862,11 @@ impl Soc {
     /// State of the nIRQ input of the core.
     #[inline]
     pub fn irq_asserted(&self) -> bool {
-        self.irq_lines != 0 && self.best_irq().is_some()
+        let mut lines = self.irq_lines;
+        if self.cycles < self.falling_until {
+            lines |= self.falling_lines;
+        }
+        lines != 0 && self.best_of(lines).is_some()
     }
 
     // ---- memory-mapped registers --------------------------------------
