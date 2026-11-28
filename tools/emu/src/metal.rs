@@ -4,6 +4,13 @@
 //! A bytecode is: the globals (preceded by their total length), the
 //! code (preceded by its length), then the function table. Function 0
 //! runs when the bytecode is loaded.
+//!
+//! A bytecode the server sends (started by the boot bytecode's
+//! `OPbytecode`) loses its last global once its main function has
+//! returned, on r3 and lapin alike: the stack's top is then one past
+//! it, and a callback's frame lands on it. A test that reads its
+//! globals in a callback keeps a spare one last (see
+//! `tests/observable.rs`, `the_last_global_lies_above_the_stack_once_main_returned`).
 
 pub const OP_RET: u8 = 1;
 pub const OP_INT: u8 = 3;

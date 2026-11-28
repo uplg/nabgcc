@@ -840,6 +840,12 @@ impl<H: Host> Vm<'_, H> {
                     self.push(int(0));
                     self.interp_go();
                     self.pull();
+                    // Out at once, as the C: whoever called the machine
+                    // for the old bytecode then pulls the value it had
+                    // pushed, from the new stack, and the new bytecode's
+                    // last global lies above the top from then on (the
+                    // next push writes over it, the collector no longer
+                    // marks it). Bytecodes have lived with it; kept.
                     return Flow::Return;
                 }
             }

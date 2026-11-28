@@ -569,3 +569,48 @@ fn frames_that_came_before_a_scan_are_kept() {
     let delivered = c[c.find("8880").unwrap()..].matches("6666").count();
     assert!(delivered >= 20, "{delivered} delivered");
 }
+
+/// The last global of a served bytecode is not the bytecode's to keep,
+/// on r3 and on lapin alike. `OPbytecode` loads the new bytecode over
+/// a fresh stack (the system slots, then the globals, the last on top),
+/// runs its main function, then leaves the interpreter at once; whoever
+/// had called the interpreter for the old bytecode (the main loop, for
+/// a callback) then pulls the value it had pushed, and the stack's top
+/// is one past the last global. That global now lies above the stack:
+/// the next push writes over it (in a loop callback, the callback's
+/// frame puts the saved program counter, -1, there), and the
+/// collector, which marks from the top, no longer sees it. Read in the
+/// main function it is intact. Tests that need their globals in a
+/// callback keep a spare one last (`tests/scan_connected.rs`).
+#[test]
+fn the_last_global_lies_above_the_stack_once_main_returned() {
+    const SECHOLN: u8 = 96;
+    const LOOPCB: u8 = 94;
+    // main: print the last global, then set the loop callback.
+    let mut main = vec![metal::OP_GETGLOBALB, 1, SECHOLN, DROP];
+    main.extend(metal::int(1));
+    main.extend([LOOPCB, DROP]);
+    let main = program(&main);
+    // The callback: both globals, the first a string still, the last
+    // the callback's own saved program counter.
+    let mut callback = metal::FUNCTION_HEADER.to_vec();
+    callback.extend([metal::OP_GETGLOBALB, 0, SECHOLN, DROP]);
+    callback.extend([metal::OP_GETGLOBALB, 1, IECHOLN, DROP]);
+    callback.extend(metal::int(9990));
+    callback.extend([IECHOLN, metal::OP_RET]);
+    let mut m = common::under_test();
+    m.serve(&metal::bytecode_functions(
+        &[b"first", b"last"],
+        &[&main, &callback],
+    ));
+    until(&mut m, 40_000, "the callback", |m| {
+        find(&m.soc.uart_tx, b"9990").is_some()
+    });
+    let c = m.console();
+    let main_ran = c.find("7770").expect("the program ran");
+    let in_main = &c[main_ran..c.find("8880").unwrap()];
+    assert!(in_main.contains("last"), "{in_main:?}");
+    let called = &c[c.find("8880").unwrap() + 4..c.find("9990").unwrap()];
+    let lines: Vec<&str> = called.split_whitespace().collect();
+    assert_eq!(lines, ["first", "-1"], "{called:?}");
+}

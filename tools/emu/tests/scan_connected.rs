@@ -70,8 +70,10 @@ fn program() -> Vec<u8> {
 
     let mut globals = u32::MAX.to_le_bytes().to_vec();
     // The key the setup page derived from the passphrase. (Not last:
-    // on both machines the last global of this bytecode reads empty by
-    // the time the callback runs.)
+    // the last global of a served bytecode lies above the stack once
+    // its main function returned, and the callback's frame writes over
+    // it, on both machines: `tests/observable.rs`,
+    // `the_last_global_lies_above_the_stack_once_main_returned`.)
     globals.extend(global_str(&nabemu::crypto::wpa_psk(PASSPHRASE, SSID)));
     globals.extend(global_str(SSID.as_bytes()));
     globals.extend(global_str(&BSSID));
