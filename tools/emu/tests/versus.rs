@@ -2,10 +2,11 @@
 //! what a person beside the rabbit, or its server, can feel. Each
 //! scenario runs the same way on both firmwares, timed on the board's
 //! own clock, and gives table rows: the measure, r3, lapin, the unit,
-//! and whether lapin does better, worse or the same. Nothing is asserted
-//! but that every scenario ran to its end on both: the rows lapin loses
-//! are the goals. It picks both images itself, so it runs once (it is
-//! in `lapin_fixed`), and skips when lapin is not built.
+//! and whether lapin does better, worse or the same. Asserted: that every
+//! scenario ran to its end on both, and the rows lapin was made to win
+//! (`NOT_WORSE`, `AT_MOST`, `HIGH_AT_MOST`); the rows it loses are the
+//! goals. It picks both images itself, so it runs once (it is in
+//! `lapin_fixed`), and skips when lapin is not built.
 //!
 //! `VERSUS=<part of a scenario's name>` runs only those scenarios. The
 //! table goes to the test's output (`--nocapture`) and to `versus.txt`
@@ -70,6 +71,39 @@ const PEAKS: [(&str, &str); 6] = [
     ("interrupts held back: longest, running", "ms"),
     ("program stack: deepest", "bytes"),
     ("interrupt stack: deepest", "bytes"),
+];
+
+/// The rows where lapin must not do worse than r3, by the table's own
+/// verdict (a tie is allowed).
+const NOT_WORSE: &[&str] = &[
+    "loop of 100 000 turns",
+    "fib 20 (21 891 calls)",
+    "strcat ×2000 (32 + 32 bytes)",
+    "strsub ×2000 (17 bytes)",
+    "itoa ×2000",
+    "table store and fetch ×5000",
+    "20 000 pairs kept and 20 000 strings dropped",
+    "collection with 17 000 pairs live",
+    "button → first sound out, mean of 10",
+    "playStart → first sound out (from the ear's start), mean of 10",
+];
+
+/// Rows where lapin is still behind r3, held to what it takes now: the
+/// application's part of the boot (unpacking the boot bytecode, loading
+/// it) is 42 ms of it, the rescue core's check of the application before
+/// the first console line most of the rest.
+const AT_MOST: &[(&str, f64)] = &[
+    ("open: power-on → boot bytecode running", 150.0),
+    ("WPA2: power-on → boot bytecode running", 150.0),
+];
+
+/// Highs held to a limit: the high, the scenario (empty: all of them),
+/// the most lapin may reach. A native ran 769 ms unfed in the update
+/// when strings were copied byte by byte; the deepest stack is now the
+/// rescue core's check, the application's own (WPA3) 4.6 KB.
+const HIGH_AT_MOST: &[(&str, &str, f64)] = &[
+    ("watchdog: longest unfed, running", "update", 300.0),
+    ("program stack: deepest", "", 5.0 * 1024.0),
 ];
 
 /// What a scenario measured on one firmware.
@@ -1509,12 +1543,20 @@ fn scorecard() {
             .collect::<Vec<_>>(),
     ];
     let mut failures = Vec::new();
+    let mut missed = Vec::new();
     let mut peaks = [[(0.0, ""); 6]; 2];
     for pair in cards.chunks(2) {
         let (r3, lapin) = (&pair[0].0, &pair[1].0);
         for (fw, (card, failed)) in ["r3", "lapin"].iter().zip(pair) {
             if let Some(why) = failed {
                 failures.push(format!("{} on {fw}: {why}", card.scenario));
+            }
+        }
+        for &(high, scenario, limit) in HIGH_AT_MOST {
+            let i = PEAKS.iter().position(|(name, _)| *name == high).unwrap();
+            let b = lapin.peaks[i].0;
+            if (scenario.is_empty() || scenario == lapin.scenario) && b > limit {
+                missed.push(format!("{high} in {}: {b}, over {limit}", lapin.scenario));
             }
         }
         let mut row = vec![r3.scenario.to_string()];
@@ -1543,12 +1585,26 @@ fn scorecard() {
                     .and_then(|m| m.value)
             };
             let (a, b) = (value(r3), value(lapin));
+            let judged = verdict(a, b, row.unit, row.better);
+            if NOT_WORSE.contains(&row.metric.as_str()) && !matches!(judged, "better" | "equal") {
+                missed.push(format!(
+                    "{}: {} on r3, {} on lapin",
+                    row.metric,
+                    show(a),
+                    show(b)
+                ));
+            }
+            for &(metric, limit) in AT_MOST {
+                if metric == row.metric && b.is_none_or(|b| b > limit) {
+                    missed.push(format!("{metric}: {}, over {limit}", show(b)));
+                }
+            }
             table.push(vec![
                 row.metric.clone(),
                 show(a),
                 show(b),
                 row.unit.into(),
-                verdict(a, b, row.unit, row.better).into(),
+                judged.into(),
             ]);
         }
     }
@@ -1576,5 +1632,10 @@ fn scorecard() {
         failures.is_empty(),
         "scenarios that did not run to their end:\n{}",
         failures.join("\n")
+    );
+    assert!(
+        missed.is_empty(),
+        "lapin fell behind where it had won:\n{}",
+        missed.join("\n")
     );
 }
