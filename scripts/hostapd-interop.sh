@@ -83,16 +83,18 @@ sae_pwe=1"
 declare -A config=([open]=open [wpa]=wpa [wpa2]=wpa2 [transition]=wpa2 [wpa3]=wpa2 [wpa3h2e]=wpa2)
 
 stop() { pkill -x hostapd || true; pkill -x dnsmasq || true; pkill -f serve.py || true; }
+# The first entry of the directories given, by name.
+first() { find "$@" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | head -1 || true; }
 
 for kind in ${KINDS:-open wpa wpa2 transition wpa3 wpa3h2e}; do
     stop
     modprobe -r mac80211_hwsim 2>/dev/null || true
     modprobe mac80211_hwsim radios=1
     sleep 1
-    iface=$(ls /sys/class/ieee80211/phy*/device/net 2>/dev/null | head -1)
+    iface=$(first /sys/class/ieee80211/phy*/device/net)
     [ -n "$iface" ] || iface=$(iw dev | awk '/Interface/ {print $2; exit}')
-    phy=$(ls /sys/class/ieee80211 | head -1)
-    radio=$(cat /sys/class/ieee80211/$phy/macaddress)
+    phy=$(first /sys/class/ieee80211)
+    radio=$(cat "/sys/class/ieee80211/$phy/macaddress")
     printf '%s%s\n' "${common//IFACE/$iface}" "${security[$kind]}" > "$work/$kind.conf"
     hostapd -B -P "$work/hostapd.pid" -f "$work/$kind.log" -dd "$work/$kind.conf"
     sleep 2

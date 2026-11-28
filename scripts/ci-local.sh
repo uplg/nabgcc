@@ -27,15 +27,14 @@ rustup target add aarch64-unknown-linux-gnu >/dev/null
 cargo clippy --release --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 # The suites that follow NABEMU_FIRMWARE run on each firmware; those that
 # pick their images themselves (lapin_fixed) run once, with lapin.
-read -ra suites < <(sed -n 's/^lapin_suites: //p' "$root/.github/lapin-suites")
-read -ra fixed < <(sed -n 's/^lapin_fixed: //p' "$root/.github/lapin-suites")
-skip="not ($(printf 'binary(%s) | ' "${fixed[@]}" | sed 's/ | $//'))"
+on_r3=$("$root/scripts/lapin-suites.sh" r3)
+on_lapin=$("$root/scripts/lapin-suites.sh" lapin)
+read -ra suites <<<"$on_lapin"
 step "emulator: every test, on r3"
 # nextest runs every test of every binary at once, on every core.
-cargo nextest run --release --no-fail-fast -E "$skip"
+cargo nextest run --release --no-fail-fast -E "$on_r3"
 cargo test --release --doc
 step "the acceptance tests, on lapin"
-for t in "${fixed[@]}"; do suites+=(--test "$t"); done
 NABEMU_FIRMWARE=lapin cargo nextest run --release --no-fail-fast "${suites[@]}"
 step "the browser build"
 cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings

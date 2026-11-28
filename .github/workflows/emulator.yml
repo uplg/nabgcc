@@ -2,9 +2,9 @@ name: emulator
 
 on:
   push:
-    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", "scripts/ci-local.sh", ".github/**"]
+    paths: &paths ["tools/emu/**", "lapin/**", "artifacts/*.sim", "scripts/ci-local.sh", "scripts/lapin-suites.sh", ".github/**"]
   pull_request:
-    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", "scripts/ci-local.sh", ".github/**"]
+    paths: *paths
 
 # Four jobs at once, each with its build cache; scripts/ci-local.sh runs
 # the same steps, one after the other.
@@ -31,7 +31,11 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: lapin-images
-          path: lapin/target/*-full.bin
+          # The first image too: tests/first_flash.rs and tests/rescue.rs
+          # send it.
+          path: |
+            lapin/target/*-full.bin
+            lapin/target/lapin-first.bin
 
   lints:
     name: emulator lints
@@ -74,8 +78,7 @@ jobs:
           SUMS
       - name: Every test that follows the firmware under test, on r3
         run: |
-          read -ra fixed < <(sed -n 's/^lapin_fixed: //p' ../../.github/lapin-suites)
-          filter="not ($(printf 'binary(%s) | ' "${fixed[@]}" | sed 's/ | $//'))"
+          filter=$(../../scripts/lapin-suites.sh r3)
           cargo nextest run --release --no-fail-fast -E "$filter"
       - run: cargo test --release --doc
 
@@ -110,9 +113,8 @@ jobs:
           NABEMU_FIRMWARE: lapin
           SHARD: ${{ matrix.shard }}
         run: |
-          read -ra suites < <(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
-          read -ra fixed < <(sed -n 's/^lapin_fixed: //p' ../../.github/lapin-suites)
-          for t in "${fixed[@]}"; do suites+=(--test "$t"); done
+          args=$(../../scripts/lapin-suites.sh lapin)
+          read -ra suites <<<"$args"
           cargo nextest run --release --no-fail-fast --partition "count:$SHARD/3" "${suites[@]}"
 
   browser:
