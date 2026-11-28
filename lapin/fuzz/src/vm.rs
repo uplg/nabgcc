@@ -154,7 +154,8 @@ impl Host for Board {
     }
     fn net_send(&mut self, frame: &[u8], _: &[u8; 6], _: i32) -> i32 {
         assert!(frame.len() <= 1 << 22);
-        0
+        // Sent, or refused (the previous frame still on its way).
+        (self.random() & 1) as i32
     }
     fn net_mac(&mut self) -> [u8; 6] {
         [0x00, 0x19, 0xDB, 0x9C, 0x28, 0x15]

@@ -1,7 +1,8 @@
 //! The Rust machine against the C one (`lapin/cref`) on random
 //! programs the C machine runs within its memory: the same console,
 //! the same calls to the board, the same registers and memory, word
-//! for word.
+//! for word. The board's clock starts anywhere in a second and moves
+//! with every call, tags are in front of the reader, frames go.
 
 #![no_main]
 
@@ -26,11 +27,17 @@ fn same(c: &Outcome, r: &Outcome) {
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
     let mut input = Input::new(data);
+    let start_ms = input.u16() as u64 * 7;
     let bc = lapin_fuzz::program::program(&mut input);
     if std::env::var_os("LAPIN_FUZZ_DEBUG").is_some() {
         eprintln!("{} bytes of bytecode", bc.len());
     }
-    let c = run_c(World::new(Vec::new()), &bc, 1);
-    let r = run_rust(World::new(Vec::new()), &bc, 1);
+    let world = || {
+        let mut w = World::new(Vec::new());
+        w.now_ms = start_ms;
+        w
+    };
+    let c = run_c(world(), &bc, 1);
+    let r = run_rust(world(), &bc, 1);
     same(&c, &r);
 });

@@ -19,6 +19,9 @@ enum Kind {
     Str,
     /// A table of this many words.
     Tab(u8),
+    /// A function of two integers with this many of them fixed
+    /// (`FIXARG`): one or two.
+    Fun(u8),
     Any,
 }
 
@@ -172,7 +175,7 @@ impl Gen<'_, '_> {
     }
 
     fn statement(&mut self) {
-        let choice = self.input.u8() % 37;
+        let choice = self.input.u8() % 60;
         match choice {
             0 => {
                 self.push_any();
@@ -484,8 +487,303 @@ impl Gen<'_, '_> {
                 }
                 self.store(Kind::Any);
             }
+            // The other ways to call: through the stack (CALLRB, CALLR),
+            // with the arguments in a tuple (CALL), a nil function.
+            37 | 38 if self.fun + 1 < self.funs => {
+                let (Some(a), Some(b)) = (self.int_local(), self.int_local()) else {
+                    return;
+                };
+                let f = self.later_fun();
+                let how = self.input.u8() % 4;
+                if how == 3 && self.input.bool() {
+                    self.op(NIL_);
+                } else {
+                    self.int(f);
+                }
+                self.get(a);
+                self.get(b);
+                match how {
+                    0 => self.code.extend([CALLRB as u8, 2]),
+                    1 => {
+                        self.int(2);
+                        self.op(CALLR);
+                    }
+                    _ => {
+                        self.code.extend([DEFTABB as u8, 2]);
+                        self.op(CALL);
+                    }
+                }
+                // A nil function gives nil.
+                self.store(Kind::Any);
+            }
+            // A closure: a function with an argument fixed, or two.
+            39 if self.fun + 1 < self.funs => {
+                let Some(a) = self.int_local() else { return };
+                let fixed = match self.pick(|k| k == Kind::Fun(1)) {
+                    Some(c) if self.input.bool() => {
+                        self.get(c);
+                        2
+                    }
+                    _ => {
+                        let f = self.later_fun();
+                        self.int(f);
+                        1
+                    }
+                };
+                self.get(a);
+                self.op(FIXARG);
+                self.store(Kind::Fun(fixed));
+            }
+            40 => {
+                let Some(c) = self.pick(|k| matches!(k, Kind::Fun(_))) else {
+                    return;
+                };
+                let Kind::Fun(fixed) = self.locals[c] else {
+                    return;
+                };
+                let free = 2 - fixed;
+                self.get(c);
+                for _ in 0..free {
+                    match self.int_local() {
+                        Some(a) => self.get(a),
+                        None => self.int(3),
+                    }
+                }
+                match self.input.u8() % 3 {
+                    0 if free == 0 => self.op(EXEC),
+                    1 => {
+                        self.int(free as i32);
+                        self.op(CALLR);
+                    }
+                    _ => self.code.extend([CALLRB as u8, free]),
+                }
+                self.store(Kind::Int);
+            }
+            // The stack and the locals, by number.
+            41 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(_))) else {
+                    return;
+                };
+                self.get(t);
+                self.op(FIRST);
+                self.store(Kind::Any);
+                self.op(DROP);
+            }
+            42 => {
+                let Some(a) = self.pick(|_| true) else { return };
+                let kind = self.locals[a];
+                self.get(a);
+                self.op(DUP);
+                self.store(kind);
+                self.op(DROP);
+            }
+            43 => {
+                let a = self.input.u8() as usize % LOCALS;
+                let kind = self.locals[a];
+                self.int(a as i32);
+                self.op(GETLOCAL);
+                self.store(kind);
+            }
+            44 | 45 => {
+                let Some(v) = self.pick(|_| true) else { return };
+                let kind = self.locals[v];
+                let Some(d) = self.dest(kind) else { return };
+                if choice == 44 {
+                    self.get(v);
+                    self.int(d as i32);
+                    self.op(SETLOCAL);
+                } else {
+                    self.int(d as i32);
+                    self.get(v);
+                    self.op(SETLOCAL2);
+                    self.op(DROP);
+                }
+                self.locals[d] = kind;
+            }
+            // Globals by number: strings stay strings.
+            46 if self.globals > 0 => {
+                let g = self.input.u8() as usize % self.globals;
+                if self.input.bool() {
+                    self.int(g as i32);
+                    self.op(GETGLOBAL);
+                    self.store(Kind::Str);
+                } else {
+                    let Some(a) = self.str_local() else { return };
+                    self.int(g as i32);
+                    self.get(a);
+                    self.op(SETGLOBAL);
+                    self.op(DROP);
+                }
+            }
+            // Tables sized from the stack, and stores into them.
+            47 if self.depth == 0 => {
+                let n = self.input.u8() % 12;
+                self.int(n as i32);
+                self.op(MKTAB);
+                self.store(Kind::Tab(n));
+            }
+            48 => {
+                let n = 1 + self.input.u8() % 4;
+                for _ in 0..n {
+                    let v = self.pick(|_| true).unwrap_or(0);
+                    self.get(v);
+                }
+                self.int(n as i32);
+                self.op(DEFTAB);
+                self.store(Kind::Tab(n));
+            }
+            49 => {
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(n) if n > 0)) else {
+                    return;
+                };
+                let Kind::Tab(n) = self.locals[t] else {
+                    return;
+                };
+                let v = self.pick(|_| true).unwrap_or(0);
+                // In bounds: the C stores wherever the index points.
+                let i = self.input.u8() % n;
+                self.get(t);
+                self.get(v);
+                if self.input.bool() {
+                    self.code.extend([SETSTRUCTB as u8, i]);
+                } else {
+                    self.int(i as i32);
+                    self.op(SETSTRUCT);
+                }
+                self.op(DROP);
+            }
+            // Lists: of strings joined, of pairs looked up.
+            50 => {
+                let n = self.input.u8() % 4;
+                for _ in 0..n {
+                    match self.str_local() {
+                        Some(a) => self.get(a),
+                        None => self.op(NIL_),
+                    }
+                }
+                self.op(NIL_);
+                for _ in 0..n {
+                    self.code.extend([DEFTABB as u8, 2]);
+                }
+                self.op(STRCATLIST);
+                self.store(Kind::Str);
+            }
+            51 | 52 => {
+                let strings = choice == 52;
+                let n = self.input.u8() % 4;
+                for _ in 0..n {
+                    let key = if strings {
+                        self.str_local()
+                    } else {
+                        self.int_local()
+                    };
+                    match key {
+                        Some(k) => self.get(k),
+                        None => self.op(NIL_),
+                    }
+                    let v = self.int_local().unwrap_or(0);
+                    self.get(v);
+                    self.code.extend([DEFTABB as u8, 2]);
+                }
+                self.op(NIL_);
+                for _ in 0..n {
+                    self.code.extend([DEFTABB as u8, 2]);
+                }
+                let key = if strings {
+                    self.str_local()
+                } else {
+                    self.int_local()
+                };
+                match key {
+                    Some(k) if !self.input.u8().is_multiple_of(5) => self.get(k),
+                    _ => self.op(NIL_),
+                }
+                self.op(if strings { LISTSWITCHSTR } else { LISTSWITCH });
+                self.store(Kind::Any);
+            }
+            // The clocks.
+            53 => {
+                let o = if self.input.bool() { TIME } else { TIME_MS };
+                self.op(o);
+                self.store(Kind::Int);
+            }
+            // The environment kept across bytecodes.
+            54 => {
+                if self.input.bool() {
+                    self.op(ENVGET);
+                    self.store(Kind::Any);
+                } else {
+                    let Some(a) = self.str_local() else { return };
+                    self.get(a);
+                    self.op(ENVSET);
+                    self.op(DROP);
+                }
+            }
+            // Tags: the one in front, the list, a block read or written.
+            55 => {
+                let o = if self.input.bool() {
+                    RFIDGET
+                } else {
+                    RFIDGETLIST
+                };
+                self.op(o);
+                self.store(Kind::Any);
+            }
+            56 => {
+                // The C reads eight bytes of identifier and four of
+                // data, whatever the strings' lengths: strings that long.
+                self.int(8);
+                self.op(STRNEW);
+                self.push_small();
+                if self.input.bool() {
+                    self.op(RFIDREAD);
+                } else {
+                    self.int(4);
+                    self.op(STRNEW);
+                    self.op(RFIDWRITE);
+                }
+                self.store(Kind::Any);
+            }
+            // The network: a frame sent, a checksum, the link.
+            57 => {
+                let (Some(a), Some(m)) = (self.str_local(), self.str_local()) else {
+                    return;
+                };
+                self.get(a);
+                self.push_small();
+                self.push_small_or_nil();
+                self.get(m);
+                self.push_small();
+                self.push_small();
+                self.op(NETSEND);
+                self.store(Kind::Any);
+            }
+            58 => {
+                let Some(a) = self.str_local() else { return };
+                self.get(a);
+                // From an even index: at an odd one the C reads its
+                // half-words unaligned, which the rabbit's processor
+                // turns round (as lapin-metal does) and the host does
+                // not.
+                let i = self.small();
+                self.int(if i > 0 { i & !1 } else { i });
+                self.push_small_or_nil();
+                self.push_any();
+                self.op(NETCHK);
+                self.store(Kind::Int);
+            }
+            59 => {
+                let o = [NETSTATE, NETRSSI, NETMAC][self.input.u8() as usize % 3];
+                self.op(o);
+                self.store(if o == NETMAC { Kind::Str } else { Kind::Int });
+            }
             _ => {}
         }
+    }
+
+    /// A function after this one, to call.
+    fn later_fun(&mut self) -> i32 {
+        (self.fun + 1 + self.input.u8() as usize % (self.funs - self.fun - 1)) as i32
     }
 
     /// Start the locals from `from` on as something of their kind.
