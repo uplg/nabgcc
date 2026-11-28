@@ -25,7 +25,7 @@ static BOOT_PACKED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/boot.lz"))
 const BOOT_LEN: usize = 28279;
 
 #[unsafe(link_section = ".vmem")]
-static mut MEMORY: Memory = Memory::new();
+static mut MEMORY: Memory = Memory::ZEROED;
 #[unsafe(link_section = ".xram.station")]
 static mut STATION: MaybeUninit<Station> = MaybeUninit::uninit();
 #[unsafe(link_section = ".xram.stick")]

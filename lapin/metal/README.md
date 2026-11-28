@@ -16,7 +16,7 @@ and writes nothing.
 ## Using it
 
 ```rust
-static mut MEMORY: Memory = Memory::new();     // 804 KB: external RAM
+static mut MEMORY: Memory = Memory::ZEROED;     // 804 KB: external RAM
 let mut vm = Vm::new(board, &mut MEMORY);       // board: impl Host
 vm.boot(BOOT_BYTECODE);                         // as main() does
 loop {

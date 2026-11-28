@@ -114,19 +114,14 @@ pub struct Memory {
 }
 
 impl Memory {
-    pub const fn new() -> Self {
-        Memory {
-            heap: [0; VMEM_LENGTH],
-            fifo: [0; AUDIO_FIFOPLAY],
-            env: [0; ENV_MAX - AUDIO_FIFOPLAY],
-        }
-    }
-}
-
-impl Default for Memory {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// All zero, evaluated where it is used: in the firmware's static
+    /// (lapin.rs). A constant, not a function returning 832 KB by value,
+    /// so that it is never built on a stack.
+    pub const ZEROED: Self = Memory {
+        heap: [0; VMEM_LENGTH],
+        fifo: [0; AUDIO_FIFOPLAY],
+        env: [0; ENV_MAX - AUDIO_FIFOPLAY],
+    };
 }
 
 /// What `motorset` asks of an ear.
