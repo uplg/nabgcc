@@ -213,9 +213,27 @@ struct Offer {
     /// the WPA element, without RSN), as the network announced them:
     /// message 3 has to bring the same.
     digest: [u8; 32],
+    /// The same of the WPA element alone, which message 3 brings on a
+    /// WPA link.
+    wpa_digest: [u8; 32],
+    /// WPA's key managements (bit 2 PSK).
+    wpa_akm: u16,
+    /// An RSN element was there, whether this firmware could read it.
+    rsn_seen: bool,
 }
 
 impl Offer {
+    const NONE: Offer = Offer {
+        bssid: [0; 6],
+        rsn: None,
+        wpa: None,
+        h2e: false,
+        digest: [0; 32],
+        wpa_digest: [0; 32],
+        wpa_akm: 0,
+        rsn_seen: false,
+    };
+
     /// The offer in a list of elements: a beacon's, a probe response's,
     /// or message 3's key data.
     fn from_elements(bssid: Mac, ies: &[u8]) -> Offer {
@@ -257,7 +275,50 @@ impl Offer {
             (None, None) => {}
         }
         o.digest = h.finish();
+        o.rsn_seen = rsne.is_some();
+        if let Some(w) = wpa {
+            let mut h = sha256::Sha256::new();
+            h.update(&[221, w.len() as u8]);
+            h.update(w);
+            o.wpa_digest = h.finish();
+            o.wpa_akm = suites(&w[4..], [0x00, 0x50, 0xF2]).map_or(0, |(_, _, akm, _)| akm);
+        }
         o
+    }
+
+    /// The code the bytecode is told for this offer, as the C driver
+    /// worked it out (`ieee80211_input`), or None without RSN nor WPA
+    /// element: an RSN element offering CCMP or TKIP with PSK (or SAE)
+    /// is WPA2 with its ciphers; else a WPA element offering them with
+    /// PSK is WPA; else the network is one the rabbit cannot join.
+    fn scan_code(&self) -> Option<u8> {
+        if let Some((group, pairwise, akm, _)) = self.rsn {
+            // PSK or SAE: both are "WPA2" to the bytecode, which hands
+            // over the derived key and lets the firmware choose.
+            let g = match group {
+                2 => 0x04,
+                4 => 0x08,
+                _ => 0,
+            };
+            let p = (if pairwise & 1 << 2 != 0 { 1 } else { 0 })
+                | (if pairwise & 1 << 4 != 0 { 2 } else { 0 });
+            if g != 0 && p != 0 && akm & (1 << 2 | 1 << 8) != 0 {
+                return Some(CRYPT_WPA2 | g | p);
+            }
+        }
+        if let Some((group, pairwise)) = self.wpa {
+            // The C driver checked the group cipher's OUI alone: a WEP
+            // group key, which neither firmware's handshake installs,
+            // passed for WPA.
+            if matches!(group, 2 | 4)
+                && pairwise & (1 << 2 | 1 << 4) != 0
+                && self.wpa_akm & 1 << 2 != 0
+            {
+                return Some(CRYPT_WPA);
+            }
+            return Some(CRYPT_UNSUPPORTED);
+        }
+        self.rsn_seen.then_some(CRYPT_UNSUPPORTED)
     }
 }
 
@@ -626,20 +687,8 @@ impl Station {
                 timer: 0,
                 mac: [0; 6],
             }; MAX_STATIONS],
-            offers: [Offer {
-                bssid: [0; 6],
-                rsn: None,
-                wpa: None,
-                h2e: false,
-                digest: [0; 32],
-            }; OFFERS],
-            bss: Offer {
-                bssid: [0; 6],
-                rsn: None,
-                wpa: None,
-                h2e: false,
-                digest: [0; 32],
-            },
+            offers: [Offer::NONE; OFFERS],
+            bss: Offer::NONE,
             bss_known: false,
             learned: None,
             msg1_replay: [0; 8],
@@ -980,32 +1029,9 @@ impl Station {
         if r.rateset == 0 {
             r.rateset = 1;
         }
-        r.encryption = match (offer.rsn, offer.wpa) {
-            (Some((group, pairwise, akm, _)), _) => {
-                // PSK or SAE: both are "WPA2" to the bytecode, which hands
-                // over the derived key and lets the firmware choose.
-                let g = match group {
-                    2 => 0x04,
-                    4 => 0x08,
-                    _ => 0,
-                };
-                let p = (if pairwise & 1 << 2 != 0 { 1 } else { 0 })
-                    | (if pairwise & 1 << 4 != 0 { 2 } else { 0 });
-                if g == 0 || p == 0 || akm & (1 << 2 | 1 << 8) == 0 {
-                    CRYPT_UNSUPPORTED
-                } else {
-                    CRYPT_WPA2 | g | p
-                }
-            }
-            (None, Some((_, pairwise))) => {
-                if pairwise & (1 << 2 | 1 << 4) != 0 {
-                    CRYPT_WPA
-                } else {
-                    CRYPT_UNSUPPORTED
-                }
-            }
-            _ => r.encryption,
-        };
+        if let Some(code) = offer.scan_code() {
+            r.encryption = code;
+        }
         if offer.rsn.is_some() || offer.wpa.is_some() {
             let slot = self
                 .offers
@@ -2292,7 +2318,12 @@ impl Station {
         let offer = Offer::from_elements(self.bssid, plain);
         self.learned = Some(offer);
         if self.bss_known {
-            return offer.digest == self.bss.digest;
+            let announced = if self.is_wpa1() {
+                self.bss.wpa_digest
+            } else {
+                self.bss.digest
+            };
+            return offer.digest == announced;
         }
         let akm = offer.rsn.map_or(0, |(_, _, akm, _)| akm);
         let sae_offered = akm & 1 << 8 != 0;

@@ -302,6 +302,10 @@ pub struct AccessPoint {
     /// Messages 4 to lose, as if they never arrived: the access point
     /// sends message 3 again, in clear (it holds no key yet).
     pub lose_message_4: u32,
+    /// When set, beacons and probe responses carry these elements in
+    /// place of the security elements of `security`: an offer to be
+    /// scanned, not joined.
+    pub announced: Option<Vec<u8>>,
     psk: [u8; 32],
     comeback_key: [u8; 32],
     igtk_index: u8,
@@ -468,6 +472,7 @@ impl AccessPoint {
             channel,
             security,
             beacon_interval: 100,
+            announced: None,
             hidden: false,
             rssi: DEFAULT_RSSI,
             wpa3: Wpa3::Off,
@@ -614,8 +619,13 @@ impl AccessPoint {
         f.extend_from_slice(name);
         f.extend_from_slice(&Self::RATES);
         f.extend_from_slice(&[3, 1, self.channel]);
-        f.extend_from_slice(&self.own_element());
-        f.extend_from_slice(&self.own_extension());
+        match &self.announced {
+            Some(elements) => f.extend_from_slice(elements),
+            None => {
+                f.extend_from_slice(&self.own_element());
+                f.extend_from_slice(&self.own_extension());
+            }
+        }
         f
     }
 
