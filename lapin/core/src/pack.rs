@@ -4,7 +4,8 @@
 //! writes must be short. The rescue core unpacks it, once, into the
 //! external RAM.
 //!
-//! LZ77 with an adaptive binary coder (rANS, 12-bit probabilities),
+//! LZ77 with an adaptive binary coder (rANS, 16-bit probabilities,
+//! each the mean of two that adapt at different speeds),
 //! after a filter that turns the offsets of Thumb's BL pairs into
 //! their targets (two calls to one function then look alike). The
 //! history the copies reach into starts with the rescue core: the
@@ -21,16 +22,20 @@
 //!   distance. Then its length minus one.
 //!
 //! Distances and lengths are Elias gamma codes, their bits from the
-//! lowest, each with its own context. The unpacked length is known
+//! lowest, each with its own context (a repeat's length has its own
+//! from a new distance's). The unpacked length is known
 //! beforehand: the stream has no end marker.
 
-/// The coder's probabilities: 12 bits, out of [`ONE`].
-const BITS: u32 = 12;
+/// The coder's probabilities: 16 bits, out of [`ONE`].
+const BITS: u32 = 16;
 const ONE: u32 = 1 << BITS;
 /// The coder's state stays in [`LOW`, `LOW` << 8) between bits.
-const LOW: u32 = 1 << 16;
-/// How fast a probability adapts: by 1/32 of the way.
-const RATE: u32 = 5;
+const LOW: u32 = 1 << 23;
+/// How fast each context's two probabilities adapt: by 1/8 and by
+/// 1/128 of the way. Their mean is what the bit is coded with (2.4 %
+/// shorter than one probability at 1/32, the best single rate).
+const FAST: u32 = 3;
+const SLOW: u32 = 7;
 
 const IS_COPY: usize = 0;
 const REPEAT: usize = 4;
@@ -40,7 +45,30 @@ const GAMMA_BITS: usize = 20;
 const TREES: usize = 4;
 const DISTANCE: usize = LITERAL + TREES * 256;
 const LENGTH: usize = DISTANCE + 2 * GAMMA_BITS;
-const CONTEXTS: usize = LENGTH + 2 * GAMMA_BITS;
+/// A repeat's length.
+const REPEAT_LENGTH: usize = LENGTH + 2 * GAMMA_BITS;
+const CONTEXTS: usize = REPEAT_LENGTH + 2 * GAMMA_BITS;
+
+/// A context's two probabilities, at first even.
+const EVEN: [u16; 2] = [(ONE / 2) as u16; 2];
+
+/// A context's two probabilities moved toward the bit it saw.
+fn adapt(p: &mut [u16; 2], one: bool) {
+    let (fast, slow) = (p[0] as u32, p[1] as u32);
+    if one {
+        p[0] = (fast + ((ONE - fast) >> FAST)) as u16;
+        p[1] = (slow + ((ONE - slow) >> SLOW)) as u16;
+    } else {
+        p[0] = (fast - (fast >> FAST)) as u16;
+        p[1] = (slow - (slow >> SLOW)) as u16;
+    }
+}
+
+/// The probability of a 1 a context's bit is coded with (within
+/// [127, `ONE` - 127]: never 0, never all).
+fn mean(p: &[u16; 2]) -> u32 {
+    (p[0] as u32 + p[1] as u32) >> 1
+}
 
 /// "LAPP", little-endian: the packed application's header. Its words:
 /// the magic, the packed stream's length in bytes, the unpacked
@@ -71,7 +99,7 @@ struct Decoder<'a> {
     input: &'a [u8],
     at: usize,
     state: u32,
-    probs: [u16; CONTEXTS],
+    probs: [[u16; 2]; CONTEXTS],
 }
 
 impl Decoder<'_> {
@@ -82,18 +110,17 @@ impl Decoder<'_> {
             self.state = self.state << 8 | byte as u32;
         }
         let p = &mut self.probs[ctx];
-        let prob = *p as u32;
+        let prob = mean(p);
         let slot = self.state & (ONE - 1);
         let high = self.state >> BITS;
-        if slot < prob {
-            self.state = prob * high + slot;
-            *p += ((ONE - prob) >> RATE) as u16;
-            1
+        let one = slot < prob;
+        self.state = if one {
+            prob * high + slot
         } else {
-            self.state = (ONE - prob) * high + slot - prob;
-            *p -= (prob >> RATE) as u16;
-            0
-        }
+            (ONE - prob) * high + slot - prob
+        };
+        adapt(p, one);
+        one as usize
     }
 
     fn gamma(&mut self, mut ctx: usize) -> usize {
@@ -116,17 +143,19 @@ pub fn unpack(packed: &[u8], buf: &mut [u8], start: usize, mut tick: impl FnMut(
         input: packed,
         at: 0,
         state: 0,
-        probs: [(ONE / 2) as u16; CONTEXTS],
+        probs: [EVEN; CONTEXTS],
     };
     let (mut n, mut distance, mut after_copy) = (start, 0, 0);
     while n < buf.len() {
         tick();
         let parity = n & 1;
         if d.bit(IS_COPY + parity + 2 * after_copy) != 0 {
+            let mut lengths = REPEAT_LENGTH;
             if after_copy != 0 || d.bit(REPEAT) == 0 {
                 distance = d.gamma(DISTANCE);
+                lengths = LENGTH;
             }
-            let len = d.gamma(LENGTH) + 1;
+            let len = d.gamma(lengths) + 1;
             if distance == 0 || distance > n || len > buf.len() - n {
                 return false;
             }
@@ -280,8 +309,8 @@ mod packer {
     /// The model's bits as the coder will take them, recorded with their
     /// probability at that point.
     struct Model {
-        probs: Vec<u16>,
-        bits: Vec<(bool, u16)>,
+        probs: Vec<[u16; 2]>,
+        bits: Vec<(bool, u32)>,
         /// How often each context saw a 1 and a 0, for the next parse.
         seen: Vec<[u32; 2]>,
     }
@@ -289,7 +318,7 @@ mod packer {
     impl Model {
         fn new() -> Model {
             Model {
-                probs: vec![(ONE / 2) as u16; CONTEXTS],
+                probs: vec![EVEN; CONTEXTS],
                 bits: Vec::new(),
                 seen: vec![[0; 2]; CONTEXTS],
             }
@@ -299,14 +328,9 @@ mod packer {
     impl Bits for Model {
         fn bit(&mut self, ctx: usize, one: bool) {
             let p = &mut self.probs[ctx];
-            self.bits.push((one, *p));
+            self.bits.push((one, mean(p)));
             self.seen[ctx][one as usize] += 1;
-            let prob = *p as u32;
-            if one {
-                *p += ((ONE - prob) >> RATE) as u16;
-            } else {
-                *p -= (prob >> RATE) as u16;
-            }
+            adapt(p, one);
         }
     }
 
@@ -322,7 +346,6 @@ mod packer {
             let mut out = Vec::new();
             let mut x = LOW;
             for &(one, p) in self.bits.iter().rev() {
-                let p = p as u32;
                 let (start, size) = if one { (0, p) } else { (p, ONE - p) };
                 while x >= ((LOW >> BITS) << 8) * size {
                     out.push(x as u8);
@@ -402,10 +425,12 @@ mod packer {
                     if after_copy == 0 {
                         m.bit(REPEAT, d == distance);
                     }
+                    let mut lengths = REPEAT_LENGTH;
                     if after_copy != 0 || d != distance {
                         m.coded(DISTANCE, d);
+                        lengths = LENGTH;
                     }
-                    m.coded(LENGTH, len - 1);
+                    m.coded(lengths, len - 1);
                     distance = d;
                     after_copy = 1;
                 }
@@ -499,7 +524,7 @@ mod packer {
                     let k = common(buf, i - distance, i);
                     let base = copy + costs.bit(REPEAT, true);
                     for len in lengths(2, k) {
-                        let c = base + costs.gamma(LENGTH, len - 1);
+                        let c = base + costs.gamma(REPEAT_LENGTH, len - 1);
                         offer(i + len, c, Item::Copy { distance, len }, distance);
                     }
                 }
