@@ -157,6 +157,18 @@ fn a_transfer_past_the_reassembly_buffer_is_dropped_to_its_end() {
     hears_after_an_overrun(&mut m);
 }
 
+/// Lose the second USB packet of the next frame the stick hands over,
+/// right after a beacon went: the frames sent next, not a beacon, lose
+/// it (which one used to depend on where the beacons' round stood when
+/// the test got there).
+fn lose_a_packet_of_the_next_frame(m: &mut Machine) {
+    let beacon = |m: &Machine| m.radio.borrow().rx.iter().any(|f| f.data[0] == 0x80);
+    until(m, 1000, "a beacon", beacon);
+    until(m, 1000, "the beacon handed over", |m| m.radio.borrow().rx.is_empty());
+    wait(m, 5);
+    m.radio.borrow_mut().lose_rx_packet = Some(1);
+}
+
 /// A receive packet the USB controller gives up on: lapin glued what
 /// followed to the frame it lost a packet of (M11); now it drops the
 /// rest of that transfer, and hears the next frames as r3 does.
@@ -164,7 +176,7 @@ fn a_transfer_past_the_reassembly_buffer_is_dropped_to_its_end() {
 fn a_lost_usb_packet_merges_no_frames() {
     let mut m = with_an_address(wpa2());
     // The ARP request arrives in two packets: its second is lost.
-    m.radio.borrow_mut().lose_rx_packet = Some(1);
+    lose_a_packet_of_the_next_frame(&mut m);
     let eth = eth_arp();
     // The same again right behind it: the very next frame the stick
     // hands over. Glued to the packet before the lost one, it would be
@@ -180,7 +192,7 @@ fn a_lost_usb_packet_merges_no_frames() {
 #[test]
 fn a_packet_lost_mid_frame_drops_that_frame_to_its_end_only() {
     let mut m = with_an_address(wpa2());
-    m.radio.borrow_mut().lose_rx_packet = Some(1);
+    lose_a_packet_of_the_next_frame(&mut m);
     let mut padded = eth_arp();
     padded.resize(padded.len() + 120, 0);
     let replies = arp_replies_to(&mut m, &[&padded, &eth_arp()], 1000);
