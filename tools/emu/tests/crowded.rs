@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{SSID, ap_saw, until};
+use common::{SSID, ap_saw, handshakes, until, wait, wpa2};
 use nabemu::air::{AccessPoint, ApEvent, Security};
 use nabemu::config::{Config, Wifi};
 use nabemu::{DEFAULT_MAC, Machine};
@@ -77,4 +77,34 @@ fn setup_mode_lists_its_network_among_two_hundred_neighbours() {
         // that some neighbours are lost (175 listed of 201).
         assert!(listed.len() < 201, "{listed:?}");
     }
+}
+
+/// Twenty WPA2 neighbours on the other channels: more secured networks
+/// than lapin remembered the offers of. The join completes at the first
+/// try, as on r3 (lapin took the boot's 20 s retry: the home network's
+/// offer had been pushed out, and message 3 was judged a downgrade).
+#[test]
+fn joins_wpa2_at_once_among_twenty_secured_neighbours() {
+    let mut m = common::on_network(&nabemu::testing::image(), wpa2());
+    m.air[0].channel = 1;
+    for i in 0..20u8 {
+        let bssid = [2, 0, 0, 0, 1, i];
+        let security = Security::wpa2("autre-passe-123");
+        m.air.push(AccessPoint::new(
+            &format!("Voisin{i:02}"),
+            bssid,
+            2 + i % 12,
+            security,
+        ));
+    }
+    until(&mut m, 15_000, "the handshake", |m| handshakes(m) > 0);
+    wait(&mut m, 1000);
+    assert!(
+        !m.air[0].events.iter().any(|e| matches!(
+            e,
+            ApEvent::Deauthenticated { .. } | ApEvent::EapolRejected { .. }
+        )),
+        "{:?}",
+        m.air[0].events
+    );
 }

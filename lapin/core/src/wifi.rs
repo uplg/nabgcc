@@ -1110,6 +1110,10 @@ impl Station {
                 self.pmk[..n].copy_from_slice(&key[..n]);
                 self.keys = KeyState::Msg1;
                 self.replay_active = false;
+                // Kept whatever the network offers, for `same_offer`.
+                let n = password.len().min(64);
+                self.password[..n].copy_from_slice(&password[..n]);
+                self.password_len = n;
                 let rsn = offer.and_then(|o| o.rsn);
                 let sae_offered = rsn.is_some_and(|(_, _, akm, _)| akm & 1 << 8 != 0);
                 let psk_offered = rsn.is_none_or(|(_, _, akm, _)| akm & 1 << 2 != 0);
@@ -1117,9 +1121,6 @@ impl Station {
                     && sae_offered
                     && (!password.is_empty() || !psk_offered)
                 {
-                    let n = password.len().min(64);
-                    self.password[..n].copy_from_slice(&password[..n]);
-                    self.password_len = n;
                     Security::Sae {
                         h2e: offer.is_some_and(|o| o.h2e),
                     }
@@ -2282,15 +2283,23 @@ impl Station {
     /// extension element, byte for byte (or WPA's element). An attacker
     /// can change a beacon, not message 3: a network that offered WPA3
     /// and was made to look as if it did not shows here. When they
-    /// differ, or nothing was known of the network, what message 3 says
-    /// is kept for the next attempt (see `auth`).
+    /// differ, what message 3 says is kept for the next attempt (see
+    /// `auth`). When nothing was known of the network (its beacon
+    /// crowded out of the offers a scan remembers), message 3, whose
+    /// integrity is checked, is what it offers: the attempt goes on,
+    /// unless it shows WPA3 that this attempt would have used over PSK.
     fn same_offer(&mut self, plain: &[u8]) -> bool {
         let offer = Offer::from_elements(self.bssid, plain);
-        if self.bss_known && offer.digest == self.bss.digest {
-            return true;
-        }
         self.learned = Some(offer);
-        false
+        if self.bss_known {
+            return offer.digest == self.bss.digest;
+        }
+        let akm = offer.rsn.map_or(0, |(_, _, akm, _)| akm);
+        let sae_offered = akm & 1 << 8 != 0;
+        let psk_offered = offer.rsn.is_none() || akm & 1 << 2 != 0;
+        let would_be_sae =
+            !self.is_wpa1() && sae_offered && (self.password_len > 0 || !psk_offered);
+        self.is_wpa3() || !would_be_sae
     }
 
     #[inline(never)]
@@ -3282,6 +3291,48 @@ mod tests {
         let learned = s.learned.unwrap();
         assert_eq!(learned.bssid, AP);
         assert!(learned.rsn.is_some_and(|(_, _, akm, _)| akm & 1 << 8 != 0));
+    }
+
+    /// The network's beacon was crowded out of the offers the scan
+    /// remembered (more than 16 secured networks around): its message
+    /// 3 was judged a downgrade and the attempt ended, the access point
+    /// gave up waiting for message 4 and the boot tried again 20 s
+    /// later. Nothing known is no reason to stop...
+    #[test]
+    fn message_3_of_a_network_the_scan_forgot_is_answered() {
+        let (mut s, mut air) = in_handshake();
+        s.bss_known = false;
+        air.sent.clear();
+        let mut data = AP_RSN.to_vec();
+        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
+        data.extend_from_slice(&[0x47; 16]);
+        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
+        input(&mut s, &mut air, &f, false);
+        assert_eq!(air.sent.len(), 1, "message 4");
+        assert_eq!(s.state, State::Run);
+    }
+
+    /// ... unless message 3 shows WPA3, which this attempt would have
+    /// used with the passphrase it holds: the next attempt uses it.
+    #[test]
+    fn message_3_of_a_forgotten_network_offering_wpa3_ends_the_attempt() {
+        let (mut s, mut air) = in_handshake();
+        s.bss_known = false;
+        s.password_len = 8;
+        air.sent.clear();
+        let mut rsn = AP_RSN.to_vec();
+        rsn[1] = 24;
+        rsn[14] = 2;
+        rsn.splice(20..20, [0x00, 0x0F, 0xAC, 8]);
+        rsn[24] = 0x80;
+        let mut data = rsn.clone();
+        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
+        data.extend_from_slice(&[0x47; 16]);
+        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
+        input(&mut s, &mut air, &f, false);
+        assert!(air.sent.is_empty(), "answered");
+        assert_eq!(s.state, State::Idle);
+        assert!(s.learned.is_some_and(|o| o.rsn.is_some()));
     }
 
     /// The access point sends message 1 again (message 2 lost): the
