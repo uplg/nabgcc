@@ -67,21 +67,39 @@ fn start(address: u8) -> Result<(), Failed> {
 
 fn acknowledged() -> Result<(), Failed> {
     if STATUS.read() & ST_NO_ACK != 0 {
-        stop();
+        // As the C: the stop first, then the status.
+        CONTROL.clear(MASTER);
+        STATUS.write(0);
         return Err(Failed::Refused);
     }
     Ok(())
 }
 
+/// The end of a transfer that went through, in the C's order: the
+/// status cleared, then the stop.
 fn stop() {
-    CONTROL.clear(MASTER);
     STATUS.write(0);
+    CONTROL.clear(MASTER);
+}
+
+/// A transfer, its end whatever happened: a wait that timed out leaves
+/// the start condition up (the C's does, the bus then held until a
+/// restart), so a stop goes out then too.
+fn transfer(steps: impl FnOnce() -> Result<(), Failed>) -> Result<(), Failed> {
+    // The controller wants each step followed closely: no interruption.
+    irq::free(|| {
+        let result = steps();
+        if result == Err(Failed::Stuck) {
+            CONTROL.clear(MASTER | NO_ACK);
+            STATUS.write(0);
+        }
+        result
+    })
 }
 
 /// Write `data` to the device at `address` (the 8-bit form, low bit clear).
 pub fn write(address: u8, data: &[u8]) -> Result<(), Failed> {
-    // The controller wants each step followed closely: no interruption.
-    irq::free(|| {
+    transfer(|| {
         CONTROL.set(TRANSMIT);
         start(address)?;
         STATUS.write(0);
@@ -96,12 +114,14 @@ pub fn write(address: u8, data: &[u8]) -> Result<(), Failed> {
     })
 }
 
-/// Read `data.len()` bytes from the device at `address`.
+/// Read `data.len()` bytes from the device at `address`. Nothing to
+/// read, nothing done (the C clocks two bytes in, into a buffer of none;
+/// no caller asks for none).
 pub fn read(address: u8, data: &mut [u8]) -> Result<(), Failed> {
     let Some((last, first)) = data.split_last_mut() else {
         return Ok(());
     };
-    irq::free(|| {
+    transfer(|| {
         CONTROL.clear(TRANSMIT);
         start(address | 1)?;
         for byte in first {
