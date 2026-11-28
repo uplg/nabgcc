@@ -3,4 +3,6 @@ tests/roms/
 web/node_modules/
 web/dist/
 web/src/lib/emu/nabemu.wasm
+# Where the page before the Svelte one put it.
+web/nabemu.wasm
 web/public/firmware/
