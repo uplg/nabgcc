@@ -27,7 +27,8 @@ step "emulator: every test, on r3"
 cargo nextest run --release --no-fail-fast
 cargo test --release --doc
 step "the acceptance tests, on lapin"
-NABEMU_FIRMWARE=lapin cargo nextest run --release --no-fail-fast $(sed -n 's/^lapin_suites: //p' "$root/.github/lapin-suites")
+read -ra suites < <(sed -n 's/^lapin_suites: //p' "$root/.github/lapin-suites")
+NABEMU_FIRMWARE=lapin cargo nextest run --release --no-fail-fast "${suites[@]}"
 step "the browser build"
 cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
 web/build.sh

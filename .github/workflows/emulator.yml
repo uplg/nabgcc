@@ -92,7 +92,9 @@ jobs:
       - name: The same acceptance tests, on the Rust firmware
         env:
           NABEMU_FIRMWARE: lapin
-        run: cargo nextest run --release --no-fail-fast $(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
+        run: |
+          read -ra suites < <(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
+          cargo nextest run --release --no-fail-fast "${suites[@]}"
       - name: Build for the browser and test that build under Node
         run: |
           rustup target add wasm32-unknown-unknown
