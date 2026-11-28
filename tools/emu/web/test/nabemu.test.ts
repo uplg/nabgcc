@@ -9,6 +9,7 @@ const here = new URL("..", import.meta.url).pathname;
 const wasm = await WebAssembly.compile(await Bun.file(`${here}src/lib/emu/nabemu.wasm`).arrayBuffer());
 const r3 = await firmware("Nab-wpa23-gtk-r3.sim");
 const lapin = await firmware("lapin-full.bin").catch(() => null);
+const selftest = await firmware("selftest-full.bin").catch(() => null);
 
 async function firmware(name: string): Promise<Uint8Array> {
   return new Uint8Array(await Bun.file(`${here}public/firmware/${name}`).arrayBuffer());
@@ -138,7 +139,7 @@ describe("r3, the C firmware", () => {
   });
 });
 
-describe.skipIf(!lapin)("lapin, the Rust firmware", () => {
+describe.skipIf(!lapin || !selftest)("lapin, the Rust firmware", () => {
   test("joins a WPA3 network", async () => {
     const r = await atHome(lapin!, "WPA3");
     const text = until(r, 30_000, (_, text) => text.includes("4242"));
@@ -150,8 +151,10 @@ describe.skipIf(!lapin)("lapin, the Rust firmware", () => {
     const r = await atHome(lapin!);
     r.run(500);
     r.powerCycle();
-    r.serveUpdate(lapin!);
-    r.cutPowerAfter(12_000);
+    // Another application than the one in place: the same would leave
+    // every sector as it is, and the cut would never come.
+    r.serveUpdate(selftest!);
+    r.cutPowerAfter(1000);
     until(r, 60_000, (s) => s.lastReset === "power loss");
     until(r, 20_000, (_, text) => text.includes("secours: network up"));
     r.phoneJoin("Nabaztag-secours");

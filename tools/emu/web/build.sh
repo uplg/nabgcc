@@ -13,8 +13,11 @@ ls -l web/src/lib/emu/nabemu.wasm
 mkdir -p web/public/firmware
 cp ../../artifacts/Nab-wpa23-gtk-r3.sim web/public/firmware/
 lapin=../../lapin/target/lapin-full.bin
+# lapin's self-test: an application other than lapin's, for an update
+# that has something to write (unchanged sectors are left alone).
+selftest=../../lapin/target/selftest-full.bin
 garenne=${NABEMU_GARENNE:-../../../clapier/garenne/build/garenne.bin}
-for optional in "$lapin" "$garenne"; do
+for optional in "$lapin" "$selftest" "$garenne"; do
     if [ -f "$optional" ]; then
         cp "$optional" web/public/firmware/
     else

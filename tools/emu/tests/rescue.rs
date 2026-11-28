@@ -8,7 +8,7 @@ mod common;
 
 use common::{
     RESCUE, lapin, lapin_target, on_network, open, page, phone_on_the_rescue_network,
-    rescue_network_up, serve, serve_first, until, wait, without_application,
+    rescue_network_up, serve_first, until, wait, without_application,
 };
 use nabemu::soc::ResetCause;
 use nabemu::{Event, Machine, metal};

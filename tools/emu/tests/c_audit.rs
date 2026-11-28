@@ -369,6 +369,7 @@ const DROP: u8 = 5;
 const ADD: u8 = 9;
 const AND: u8 = 14;
 const SUB: u8 = 10;
+const NEG: u8 = 19;
 const GOTO: u8 = 28;
 const ELSE: u8 = 29;
 const GETGLOBALB: u8 = 36;
@@ -599,7 +600,11 @@ fn a_dead_codec_costs_half_a_second_once() {
         f.extend(metal::int(40));
         f.extend([SNDVOL, DROP]);
     }
-    f.extend([TIME_MS, SUB, IECHOLN, RET]);
+    // end - start, after a marker line: it can be 0, which has no sign
+    // to tell it from the boot's own output.
+    f.extend([TIME_MS, SUB, NEG]);
+    f.extend(metal::int(7770));
+    f.extend([IECHOLN, DROP, IECHOLN, RET]);
     let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&[], &f));
     m.soc.board.codec.dead = true;
     if !is_lapin() {
@@ -610,10 +615,14 @@ fn a_dead_codec_costs_half_a_second_once() {
         );
         return;
     }
-    until(&mut m, 60_000, "the timing", |m| {
-        common::time_printed(m).is_some()
-    });
-    let ms = common::time_printed(&m).unwrap();
+    let after_marker = |m: &Machine| -> Option<u64> {
+        let console = m.console();
+        let mut lines = console.lines().skip_while(|l| *l != "7770");
+        lines.next()?;
+        lines.next()?.parse().ok()
+    };
+    until(&mut m, 60_000, "the timing", |m| after_marker(m).is_some());
+    let ms = after_marker(&m).unwrap();
     assert!(ms < 20, "ten volume changes took {ms} ms");
 }
 
