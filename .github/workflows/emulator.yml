@@ -100,8 +100,9 @@ jobs:
         run: |
           read -ra suites < <(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
           cargo nextest run --release --no-fail-fast "${suites[@]}"
-      - name: Build for the browser and test that build under Node
+      - uses: oven-sh/setup-bun@v2
+      - name: Build for the browser and test that build under bun
         run: |
           rustup target add wasm32-unknown-unknown
           web/build.sh
-          node web/test.mjs
+          bun run --cwd web test

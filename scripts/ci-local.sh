@@ -35,5 +35,5 @@ NABEMU_FIRMWARE=lapin cargo nextest run --release --no-fail-fast "${suites[@]}"
 step "the browser build"
 cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
 web/build.sh
-node web/test.mjs
+bun run --cwd web test
 step "all green"
