@@ -1,3 +1,6 @@
 target/
 tests/roms/
-web/nabemu.wasm
+web/node_modules/
+web/dist/
+web/src/lib/emu/nabemu.wasm
+web/public/firmware/
