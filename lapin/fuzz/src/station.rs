@@ -387,6 +387,24 @@ fn element(out: &mut Vec<u8>, id: u8, body: &[u8]) {
     out.extend_from_slice(body);
 }
 
+/// The security elements of the network's beacon: RSN, RSN extension,
+/// WPA's.
+fn offered_elements(kind: Kind) -> Vec<u8> {
+    let b = beacon(kind);
+    let mut ies = &b[36..];
+    let mut out = Vec::new();
+    while let [id, len, rest @ ..] = ies {
+        let n = *len as usize;
+        let Some(body) = rest.get(..n) else { break };
+        let wpa = *id == 221 && body.starts_with(&[0x00, 0x50, 0xF2, 0x01]);
+        if *id == 48 || *id == 244 || wpa {
+            element(&mut out, *id, body);
+        }
+        ies = &rest[n..];
+    }
+    out
+}
+
 fn beacon(kind: Kind) -> Vec<u8> {
     let privacy = !matches!(kind, Kind::Open | Kind::Master);
     let mut f = header(0x80, 0, &[0xFF; 6], &AP, &AP);
@@ -641,7 +659,13 @@ impl Air {
         self.keys.replay += 1;
         let v = self.version();
         let wpa1 = matches!(self.kind, Kind::Psk { wpa2: false, .. });
-        let mut data = if wpa1 { Vec::new() } else { self.kdes() };
+        // The elements the beacon announced come back in message 3, as a
+        // real access point sends them (802.11-2020 12.7.6.4; WPA's own
+        // element for WPA): the station checks they are the same.
+        let mut data = offered_elements(self.kind);
+        if !wpa1 {
+            data.extend_from_slice(&self.kdes());
+        }
         data.extend_from_slice(extra);
         let k = KeyFrame {
             descriptor: self.descriptor(),
