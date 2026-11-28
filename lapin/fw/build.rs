@@ -64,6 +64,7 @@ fn main() {
     println!("cargo:rustc-link-search={dir}");
     println!("cargo:rerun-if-changed=link.x");
     println!("cargo:rerun-if-changed=rescue.x");
+    println!("cargo:rerun-if-changed=common.x");
     // The rescue core holds the first sectors; every other program is
     // an application after it (src/boot.rs).
     println!("cargo:rustc-link-arg-bin=rescue=-Trescue.x");
