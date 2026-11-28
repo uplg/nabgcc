@@ -1,21 +1,22 @@
 <script lang="ts">
   import type { Snapshot } from "../emu/protocol";
   import { boardTime, count } from "../format";
+  import Flag from "./Flag.svelte";
+  import Panel from "./Panel.svelte";
 
   let { s }: { s: Snapshot } = $props();
   const st = $derived(s.status);
   const network = $derived(st.joined === null ? null : s.accessPoints[st.joined]?.ssid);
 </script>
 
-<section class="card" aria-labelledby="state-title">
-  <header>
-    <h2 id="state-title">State</h2>
+<Panel name="state" title="State">
+  {#snippet badge()}
     {#if s.behind}
       <span class="pill warn">slower than real time</span>
     {:else}
-      <span class="pill" class:ok={s.running}>{s.running ? "running" : "paused"}</span>
+      <Flag on={s.running} yes="running" no="paused" />
     {/if}
-  </header>
+  {/snippet}
 
   <dl class="kv">
     <dt>Board time</dt>
@@ -51,7 +52,7 @@
     <dt>Server requests</dt>
     <dd>{st.server.requests}</dd>
   </dl>
-</section>
+</Panel>
 
 <style>
   .bad {

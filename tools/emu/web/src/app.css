@@ -1,22 +1,24 @@
+/* Each colour is light-dark(light, dark): the colour scheme picks,
+   the system's unless the theme toggle names one. */
 :root {
-  color-scheme: light;
-  --bg: #f5f3ef;
-  --surface: #ffffff;
-  --surface-2: #f0ede8;
-  --border: #e0dbd3;
-  --border-strong: #c9c2b7;
-  --text: #24222a;
-  --muted: #6d6873;
-  --accent: #6f45b5;
-  --accent-soft: #ece4f8;
-  --on-accent: #ffffff;
-  --ok: #2f8a4f;
-  --warn: #b26b00;
-  --danger: #c0392b;
-  --shell: #fbfaf7;
-  --shell-line: #cfc8bc;
-  --led-off: #dcd7cf;
-  --console-bg: #1d1c21;
+  color-scheme: light dark;
+  --bg: light-dark(#f5f3ef, #16151a);
+  --surface: light-dark(#ffffff, #1f1e24);
+  --surface-2: light-dark(#f0ede8, #29272f);
+  --border: light-dark(#e0dbd3, #34323b);
+  --border-strong: light-dark(#c9c2b7, #4a4752);
+  --text: light-dark(#24222a, #ebe8ef);
+  --muted: light-dark(#6d6873, #a09ba8);
+  --accent: light-dark(#6f45b5, #a37ee8);
+  --accent-soft: light-dark(#ece4f8, #2f2640);
+  --on-accent: light-dark(#ffffff, #16151a);
+  --ok: light-dark(#2f8a4f, #5cc27f);
+  --warn: light-dark(#b26b00, #e0a243);
+  --danger: light-dark(#c0392b, #ef6b5c);
+  --shell: light-dark(#fbfaf7, #ecebe6);
+  --shell-line: light-dark(#cfc8bc, #8f8a82);
+  --led-off: light-dark(#dcd7cf, #cdc8c0);
+  --console-bg: light-dark(#1d1c21, #121115);
   --console-text: #dedbe4;
   --focus: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
 
@@ -27,50 +29,12 @@
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
-:root[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #16151a;
-  --surface: #1f1e24;
-  --surface-2: #29272f;
-  --border: #34323b;
-  --border-strong: #4a4752;
-  --text: #ebe8ef;
-  --muted: #a09ba8;
-  --accent: #a37ee8;
-  --accent-soft: #2f2640;
-  --on-accent: #16151a;
-  --ok: #5cc27f;
-  --warn: #e0a243;
-  --danger: #ef6b5c;
-  --shell: #ecebe6;
-  --shell-line: #8f8a82;
-  --led-off: #cdc8c0;
-  --console-bg: #121115;
-  --console-text: #dedbe4;
+:root[data-theme="light"] {
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --bg: #16151a;
-    --surface: #1f1e24;
-    --surface-2: #29272f;
-    --border: #34323b;
-    --border-strong: #4a4752;
-    --text: #ebe8ef;
-    --muted: #a09ba8;
-    --accent: #a37ee8;
-    --accent-soft: #2f2640;
-    --on-accent: #16151a;
-    --ok: #5cc27f;
-    --warn: #e0a243;
-    --danger: #ef6b5c;
-    --shell: #ecebe6;
-    --shell-line: #8f8a82;
-    --led-off: #cdc8c0;
-    --console-bg: #121115;
-    --console-text: #dedbe4;
-  }
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 *,
@@ -293,9 +257,29 @@ input[type="checkbox"] {
 
 .check {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   cursor: pointer;
+}
+
+/* Lists laid out as tiles, at least --tile wide. */
+
+.tiles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(var(--tile, 240px), 1fr));
+  gap: 12px;
+}
+
+.tiles > li {
+  display: grid;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
 }
 
 .fields {

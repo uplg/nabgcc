@@ -58,7 +58,7 @@
   {#if holdUntil !== null}
     <p class="pill warn" role="status">Button held for {((holdUntil - ms) / 1000).toFixed(1)} s more</p>
   {/if}
-  <ul class="scenarios">
+  <ul class="tiles">
     {#each SCENARIOS as s (s.title)}
       <li>
         <h3>{s.title}</h3>
@@ -70,22 +70,9 @@
 </div>
 
 <style>
-  .scenarios {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 12px;
-  }
-
   li {
-    display: grid;
     grid-template-rows: auto 1fr auto;
     gap: 8px;
-    padding: 14px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
   }
 
   li .btn {

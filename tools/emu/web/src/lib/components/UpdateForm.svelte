@@ -1,6 +1,7 @@
 <script lang="ts">
   import { fetchOffer, readFile, type Offer } from "../catalogue";
   import { useRabbit } from "../context";
+  import Check from "./Check.svelte";
   import FilePick from "./FilePick.svelte";
 
   /** The firmwares built next to the page. */
@@ -21,12 +22,11 @@
     The rabbit restarts; its first <code>bc.jsp</code> then brings a bytecode that writes the new image over the running
     one, after which the server goes back to what it served.
   </p>
-  <label class="check">
-    <input type="checkbox" bind:checked={cut} />
+  <Check bind:checked={cut}>
     Cut the power after
     <input class="ops" type="number" min="1" bind:value={ops} disabled={!cut} aria-label="Flash operations before the cut" />
     flash operations (erases and words)
-  </label>
+  </Check>
   <div class="row">
     <span class="muted small">Send</span>
     {#each offers as o (o.name)}
@@ -37,10 +37,6 @@
 </section>
 
 <style>
-  .check {
-    flex-wrap: wrap;
-  }
-
   .ops {
     width: 96px;
   }

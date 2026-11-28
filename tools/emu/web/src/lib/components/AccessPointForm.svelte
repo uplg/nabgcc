@@ -2,6 +2,9 @@
   import { useRabbit } from "../context";
   import { SECURITIES, type AccessPointSpec } from "../emu/nabemu";
   import { keyProblem } from "../world";
+  import Check from "./Check.svelte";
+  import Choice from "./Choice.svelte";
+  import Field from "./Field.svelte";
 
   const rabbit = useRabbit();
 
@@ -24,34 +27,20 @@
 <form class="stack" onsubmit={add}>
   <h3>Add an access point</h3>
   <div class="fields">
-    <label class="field">
-      <span>Network name</span>
+    <Field label="Network name">
       <input type="text" bind:value={ap.ssid} maxlength="32" />
-    </label>
-    <label class="field">
-      <span>Security</span>
-      <select bind:value={ap.security}>
-        {#each SECURITIES as s (s)}
-          <option value={s}>{s}</option>
-        {/each}
-      </select>
-    </label>
-    <label class="field">
-      <span>{ap.security.startsWith("WEP") ? "WEP key" : "Passphrase"}</span>
+    </Field>
+    <Choice label="Security" options={SECURITIES} bind:value={ap.security} />
+    <Field label={ap.security.startsWith("WEP") ? "WEP key" : "Passphrase"}>
       <input type="text" bind:value={ap.key} disabled={ap.security === "open"} spellcheck="false" />
-    </label>
-    <label class="field">
-      <span>Channel</span>
+    </Field>
+    <Field label="Channel">
       <input type="number" min="1" max="13" bind:value={ap.channel} />
-    </label>
-    <label class="field">
-      <span>Signal (dBm)</span>
+    </Field>
+    <Field label="Signal (dBm)">
       <input type="number" min="-95" max="-20" bind:value={ap.dbm} />
-    </label>
-    <label class="check small">
-      <input type="checkbox" bind:checked={ap.hidden} />
-      Hidden name
-    </label>
+    </Field>
+    <Check small bind:checked={ap.hidden}>Hidden name</Check>
   </div>
   <div class="row">
     <button class="btn primary" disabled={problem !== null}>Add</button>

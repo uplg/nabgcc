@@ -1,5 +1,7 @@
 <script lang="ts">
   import { useRabbit } from "../context";
+  import Check from "./Check.svelte";
+  import Panel from "./Panel.svelte";
 
   const rabbit = useRabbit();
 
@@ -30,19 +32,18 @@
   }
 </script>
 
-<section class="card" aria-labelledby="console-title">
-  <header>
-    <h2 id="console-title">Serial console</h2>
+<Panel name="console" title="Serial console">
+  {#snippet badge()}
     <span class="small muted">{rabbit.lines.length} lines</span>
-  </header>
+  {/snippet}
   <div class="row">
     <input class="grow" type="search" placeholder="Filter" bind:value={filter} aria-label="Filter the console" />
-    <label class="check small"><input type="checkbox" bind:checked={dumps} /> Memory dumps</label>
+    <Check small bind:checked={dumps}>Memory dumps</Check>
     <button class="btn" aria-pressed={follow} onclick={() => (follow = !follow)}>Follow</button>
     <button class="btn quiet" onclick={() => rabbit.clearConsole()}>Clear</button>
   </div>
   <pre bind:this={box} onscroll={scrolled} aria-label="What the firmware printed" aria-live="off">{shown}</pre>
-</section>
+</Panel>
 
 <style>
   pre {

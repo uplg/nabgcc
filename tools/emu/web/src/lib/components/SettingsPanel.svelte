@@ -3,6 +3,8 @@
   import { useRabbit } from "../context";
   import { SETTINGS_SECURITIES, type AccessPoint, type Settings } from "../emu/nabemu";
   import { HOME, keyProblem, settingsFor } from "../world";
+  import Choice from "./Choice.svelte";
+  import Field from "./Field.svelte";
 
   let { settings, accessPoints }: { settings: Settings | null; accessPoints: AccessPoint[] } = $props();
   const rabbit = useRabbit();
@@ -53,31 +55,21 @@
       <button type="button" class="btn quiet" disabled={!settings} onclick={load}>Copy from the flash</button>
     </div>
     <div class="fields">
-      <label class="field">
-        <span>Network name</span>
+      <Field label="Network name">
         <input type="text" bind:value={form.ssid} maxlength="31" list="ssids" />
         <datalist id="ssids">
           {#each accessPoints as ap, i (i)}
             <option value={ap.ssid}></option>
           {/each}
         </datalist>
-      </label>
-      <label class="field">
-        <span>Security</span>
-        <select bind:value={form.security}>
-          {#each SETTINGS_SECURITIES as s (s)}
-            <option value={s}>{s}</option>
-          {/each}
-        </select>
-      </label>
-      <label class="field">
-        <span>Key</span>
+      </Field>
+      <Choice label="Security" options={SETTINGS_SECURITIES} bind:value={form.security} />
+      <Field label="Key">
         <input type="text" bind:value={form.key} disabled={form.security === "open"} spellcheck="false" />
-      </label>
-      <label class="field">
-        <span>Server</span>
+      </Field>
+      <Field label="Server">
         <input type="text" bind:value={form.server} spellcheck="false" />
-      </label>
+      </Field>
     </div>
     {#if accessPoints.length}
       <div class="row small">

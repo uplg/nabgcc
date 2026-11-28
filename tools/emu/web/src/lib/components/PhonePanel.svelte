@@ -2,6 +2,7 @@
   import { readFile } from "../catalogue";
   import { useRabbit } from "../context";
   import type { Phone } from "../emu/nabemu";
+  import Field from "./Field.svelte";
   import FilePick from "./FilePick.svelte";
   import PhoneScreen from "./PhoneScreen.svelte";
 
@@ -67,18 +68,16 @@
     </dl>
 
     <form class="row" onsubmit={(e) => (e.preventDefault(), fetch(path))}>
-      <label class="grow field">
-        <span>Address on the rabbit</span>
+      <Field label="Address on the rabbit" grow>
         <input type="text" class="mono" bind:value={path} spellcheck="false" />
-      </label>
+      </Field>
       <button class="btn primary go" disabled={!ready}>Load</button>
     </form>
 
     <div class="row">
-      <label class="field">
-        <span>Upload to</span>
+      <Field label="Upload to">
         <input type="text" class="mono upload" bind:value={upload} spellcheck="false" />
-      </label>
+      </Field>
       <div class="go">
         <FilePick label="Send an image…" accept=".sim,.bin" disabled={!ready} onpick={async (f) => fetch(upload, await readFile(f))} />
       </div>

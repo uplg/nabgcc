@@ -11,7 +11,7 @@
     The access points in the rabbit's range, with a wired network and the server behind them.
   </p>
   {#if accessPoints.length}
-    <ul class="aps">
+    <ul class="tiles" style:--tile="260px">
       {#each accessPoints as ap, n (`${n}-${ap.ssid}`)}
         <AccessPointItem {ap} {n} />
       {/each}
@@ -22,14 +22,3 @@
   <hr />
   <AccessPointForm />
 </div>
-
-<style>
-  .aps {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-    gap: 12px;
-  }
-</style>

@@ -1,6 +1,9 @@
 <script lang="ts">
   import { useRabbit } from "../context";
   import type { Snapshot } from "../emu/protocol";
+  import Field from "./Field.svelte";
+  import Flag from "./Flag.svelte";
+  import Panel from "./Panel.svelte";
   import RabbitFigure from "./RabbitFigure.svelte";
 
   let { s }: { s: Snapshot } = $props();
@@ -11,11 +14,10 @@
   const motion = (direction: number) => (direction > 0 ? "turning" : direction < 0 ? "turning back" : "still");
 </script>
 
-<section class="card" aria-labelledby="rabbit-title">
-  <header>
-    <h2 id="rabbit-title">Rabbit</h2>
-    <span class="pill" class:ok={status.button}>{status.button ? "button down" : "button up"}</span>
-  </header>
+<Panel name="rabbit" title="Rabbit">
+  {#snippet badge()}
+    <Flag on={status.button} yes="button down" no="button up" />
+  {/snippet}
 
   <RabbitFigure leds={status.leds} ears={status.ears} pressed={status.button} onpress={(down) => rabbit.send("button", down)} />
   <p class="muted small center">Press and hold the head for its button (or focus it and hold Space).</p>
@@ -25,8 +27,7 @@
     <button class="btn" onclick={() => rabbit.send("hold", 3000, false)}>Hold 3 s</button>
   </div>
 
-  <label class="field">
-    <span>Volume wheel <output class="mono">{status.volume}</output></span>
+  <Field label="Volume wheel" reading={status.volume}>
     <input
       type="range"
       min="0"
@@ -34,7 +35,7 @@
       value={status.volume}
       oninput={(e) => rabbit.send("volume", e.currentTarget.valueAsNumber)}
     />
-  </label>
+  </Field>
 
   <div class="ears">
     {#each status.ears as ear, i (i)}
@@ -49,7 +50,7 @@
       </div>
     {/each}
   </div>
-</section>
+</Panel>
 
 <style>
   .center {
@@ -80,10 +81,5 @@
     padding: 10px;
     border-radius: var(--radius-sm);
     background: var(--surface-2);
-  }
-
-  output {
-    color: var(--text);
-    margin-left: 4px;
   }
 </style>

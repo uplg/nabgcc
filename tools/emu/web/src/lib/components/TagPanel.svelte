@@ -1,5 +1,8 @@
 <script lang="ts">
   import { useRabbit } from "../context";
+  import Field from "./Field.svelte";
+  import Flag from "./Flag.svelte";
+  import Panel from "./Panel.svelte";
 
   let { tag }: { tag: string | null } = $props();
   const rabbit = useRabbit();
@@ -14,18 +17,16 @@
   }
 </script>
 
-<section class="card" aria-labelledby="tag-title">
-  <header>
-    <h2 id="tag-title">Tag at the nose</h2>
-    <span class="pill" class:ok={tag}>{tag ? "held" : "none"}</span>
-  </header>
-  <label class="field">
-    <span>Identifier (8 bytes, hexadecimal)</span>
+<Panel name="tag" title="Tag at the nose">
+  {#snippet badge()}
+    <Flag on={tag !== null} yes="held" no="none" />
+  {/snippet}
+  <Field label="Identifier (8 bytes, hexadecimal)">
     <div class="row">
       <input class="grow mono" type="text" bind:value={uid} spellcheck="false" maxlength="16" aria-invalid={!valid} />
       <button class="btn quiet" onclick={random}>Random</button>
     </div>
-  </label>
+  </Field>
   <div class="row">
     <button class="btn primary" disabled={!valid} onclick={() => rabbit.send("tag", uid.toLowerCase())}>
       {tag ? "Hold this one instead" : "Hold it at the nose"}
@@ -35,4 +36,4 @@
   {#if tag}
     <p class="small muted">Held: <code>{tag}</code></p>
   {/if}
-</section>
+</Panel>

@@ -2,22 +2,23 @@
   import { useRabbit } from "../context";
   import type { AccessPoint } from "../emu/nabemu";
   import { macs } from "../format";
+  import Field from "./Field.svelte";
+  import Flag from "./Flag.svelte";
 
   let { ap, n }: { ap: AccessPoint; n: number } = $props();
   const rabbit = useRabbit();
 </script>
 
-<li class="ap">
+<li>
   <div class="top">
     <div class="name">
       <h3>{ap.ssid || "(no name)"}</h3>
       <span class="small muted">{ap.security} · channel {ap.channel}{ap.hidden ? " · hidden" : ""}</span>
     </div>
-    <span class="pill" class:ok={ap.joined}>{ap.joined ? "rabbit joined" : "rabbit not joined"}</span>
+    <Flag on={ap.joined} yes="rabbit joined" no="rabbit not joined" />
   </div>
 
-  <label class="field">
-    <span>Signal <output class="mono">{ap.dbm} dBm</output></span>
+  <Field label="Signal" reading="{ap.dbm} dBm">
     <input
       type="range"
       min="-95"
@@ -25,7 +26,7 @@
       value={ap.dbm}
       onchange={(e) => rabbit.send("signal", n, e.currentTarget.valueAsNumber)}
     />
-  </label>
+  </Field>
 
   <div class="row">
     <button class="btn" onclick={() => rabbit.send("restartAccessPoint", n)} title="It loses power and comes back, having forgotten every station">
@@ -47,13 +48,8 @@
 </li>
 
 <style>
-  .ap {
-    display: grid;
+  li {
     gap: 12px;
-    padding: 14px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--surface);
   }
 
   .top {
@@ -70,11 +66,6 @@
 
   h3 {
     overflow-wrap: anywhere;
-  }
-
-  output {
-    color: var(--text);
-    margin-left: 4px;
   }
 
   summary {

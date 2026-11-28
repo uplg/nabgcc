@@ -4,6 +4,8 @@
   import { loudness, Speaker } from "../audio/speaker";
   import { useRabbit } from "../context";
   import type { Status } from "../emu/nabemu";
+  import Flag from "./Flag.svelte";
+  import Panel from "./Panel.svelte";
 
   let { status }: { status: Status } = $props();
   const rabbit = useRabbit();
@@ -59,11 +61,10 @@
   });
 </script>
 
-<section class="card" aria-labelledby="sound-title">
-  <header>
-    <h2 id="sound-title">Sound</h2>
-    <span class="pill" class:ok={status.amplifier}>{status.amplifier ? "amplifier on" : "amplifier off"}</span>
-  </header>
+<Panel name="sound" title="Sound">
+  {#snippet badge()}
+    <Flag on={status.amplifier} yes="amplifier on" no="amplifier off" />
+  {/snippet}
   <div class="pair">
     <button class="btn" aria-pressed={speaker !== null} onclick={toggleSpeaker} title="Play what the codec outputs on this device">
       Loudspeaker
@@ -81,7 +82,7 @@
     <dt>Played so far</dt>
     <dd>{(status.audioBytes / 1024).toFixed(1)} KB</dd>
   </dl>
-</section>
+</Panel>
 
 <style>
   .pair {
