@@ -4,8 +4,16 @@
 //! Every descriptor and buffer the controller touches lives in its RAM
 //! at fixed places: one control endpoint, one bulk endpoint each way.
 //! The interrupt handler takes finished transfers off the done queue:
-//! received packets go to the Wi-Fi driver at once and their transfer
-//! descriptors straight back in the queue.
+//! what was received goes to the Wi-Fi driver at once and its transfer
+//! descriptor straight back in the queue.
+//!
+//! The controller retires a descriptor in the frame it finishes, and
+//! hands the done ones over at the end of that frame (its done queue,
+//! written to the HCCA): each receive descriptor brings one transfer of
+//! the stick's, or a part of one, per millisecond at most. Eight in flight, of two
+//! packets each (a short frame, or a beacon, whole), take up to eight
+//! frames a millisecond off the stick; one packet per millisecond was
+//! the C's (`rt2501_submit_rx`).
 
 use crate::sync::Shared;
 use crate::{irq, reg, timer, watchdog};
@@ -85,17 +93,25 @@ const ED_IN: usize = RAM + 0x120;
 const TD_CONTROL: usize = RAM + 0x130;
 const TD_OUT: usize = RAM + 0x170;
 const TD_IN: usize = RAM + 0x190;
-const SETUP: usize = RAM + 0x1E0;
-const CONTROL_DATA: usize = RAM + 0x200;
-const RX_BUFFERS: usize = RAM + 0x300;
-const TX_BUFFER: usize = RAM + 0x440;
+/// Receive descriptors: one more than there are buffers, the endpoint's
+/// placeholder, which has none.
+const RX_TDS: usize = RX_BUFFERS_IN_FLIGHT + 1;
+const SETUP: usize = TD_IN + RX_TDS * 16;
+const CONTROL_DATA: usize = SETUP + 8;
+const RX_BUFFERS: usize = CONTROL_DATA + CONTROL_MAX;
+const TX_BUFFER: usize = RX_BUFFERS + RX_BUFFERS_IN_FLIGHT * RX_CHUNK;
 
-/// Largest data stage of a control transfer.
-pub const CONTROL_MAX: usize = 256;
-/// Largest bulk transfer out: what is left of the RAM.
+/// Largest data stage of a control transfer: the stick's configuration
+/// (64 bytes asked at most), its calibration data (38).
+pub const CONTROL_MAX: usize = 64;
+/// Largest bulk transfer out: what is left of the RAM, 2456 bytes. The
+/// longest frame the station builds (2400 bytes) and its descriptor fit.
 pub const TX_MAX: usize = RAM + 0x1000 - TX_BUFFER;
 pub const PACKET: usize = 64;
-const RX_TDS: usize = 5;
+const RX_BUFFERS_IN_FLIGHT: usize = 8;
+/// What a receive descriptor takes: two packets.
+const RX_CHUNK: usize = 2 * PACKET;
+const _: () = assert!(TX_MAX >= 24 + 2400 + 4 && TX_BUFFER.is_multiple_of(4));
 
 // Endpoint descriptor fields.
 const ED_SKIP: u32 = 1 << 14;
@@ -141,9 +157,11 @@ static TX_AT: Shared<u32> = Shared::new(0);
 /// through (0: none is). One word: the interrupt clears it.
 static STUCK_SINCE: Shared<u32> = Shared::new(0);
 static BROKEN: Shared<bool> = Shared::new(false);
-/// What takes the packets received on the bulk endpoint: `None` for a
-/// packet the controller gave up on, lost.
-type PacketHandler = fn(Option<&[u8]>);
+/// What takes what is received on the bulk endpoint, a descriptor's
+/// worth at a time: whole packets, the last of which may be short, and
+/// whether they end the stick's transfer (a short packet did); `None`
+/// for a packet the controller gave up on, lost.
+type PacketHandler = fn(Option<&[u8]>, bool);
 static RX_HANDLER: Shared<Option<PacketHandler>> = Shared::new(None);
 /// Transfers the controller gave up on, both directions.
 static BULK_ERRORS: Shared<u32> = Shared::new(0);
@@ -365,27 +383,36 @@ fn root_hub(port: u32) {
 fn retire(td: usize) {
     let condition = word(td).read() >> 28;
     if (TD_IN..TD_IN + RX_TDS * 16).contains(&td) {
-        let buffer = rx_buffer(td);
-        let len = moved(td, buffer, PACKET);
+        // The buffer it was given, from its last byte, which the
+        // controller leaves as it is: one of ours, or the descriptor is
+        // not one this driver queued.
+        let buffer = (word(td + 12).read() as usize + 1).wrapping_sub(RX_CHUNK);
+        if !(RX_BUFFERS..TX_BUFFER).contains(&buffer) || (buffer - RX_BUFFERS) % RX_CHUNK != 0 {
+            return;
+        }
+        let len = moved(td, buffer, RX_CHUNK).min(RX_CHUNK);
         // The buffer is read plainly between the descriptor's register
         // reads and writes: keep it there.
         crate::sync::barrier();
-        if condition == 0 {
-            if let Some(handler) = RX_HANDLER.get() {
-                // SAFETY: the controller is done with this buffer until
-                // the descriptor is queued again, below.
-                handler(Some(unsafe {
-                    core::slice::from_raw_parts(buffer as *const u8, len)
-                }));
-            }
-        } else {
-            bulk_failed(ED_IN);
-            if let Some(handler) = RX_HANDLER.get() {
-                handler(None);
+        if let Some(handler) = RX_HANDLER.get() {
+            // SAFETY: the controller is done with this buffer until it
+            // is queued again, below. A failed descriptor leaves its
+            // pointer after the packets that went through.
+            let got = unsafe { core::slice::from_raw_parts(buffer as *const u8, len) };
+            if condition == 0 {
+                handler(Some(got), len < RX_CHUNK);
+            } else {
+                if len > 0 {
+                    handler(Some(got), false);
+                }
+                handler(None, false);
             }
         }
+        if condition != 0 {
+            bulk_failed(ED_IN);
+        }
         crate::sync::barrier();
-        queue_rx(td);
+        queue_rx(td, buffer);
     } else if (TD_OUT..TD_OUT + 32).contains(&td) {
         if condition != 0 {
             bulk_failed(ED_OUT);
@@ -408,24 +435,12 @@ fn retire(td: usize) {
 
 static DATA_MOVED: Shared<u32> = Shared::new(0);
 
-/// The packet buffer of a receive descriptor, one each.
-fn rx_buffer(td: usize) -> usize {
-    RX_BUFFERS + (td - TD_IN) / 16 * PACKET
-}
-
-/// Put a receive descriptor (back) at the end of the bulk-in queue:
-/// the current placeholder becomes a real request, and `spare` the
-/// new placeholder.
-fn queue_rx(spare: usize) {
+/// Put a receive buffer (back) at the end of the bulk-in queue: the
+/// current placeholder becomes a request for it, and `spare`, a
+/// descriptor just retired, the new placeholder.
+fn queue_rx(spare: usize, buffer: usize) {
     let td = word(ED_IN + 4).read() as usize;
-    queue_bulk(
-        ED_IN,
-        td,
-        TD_ROUNDING | TD_IN_PID,
-        rx_buffer(td),
-        PACKET,
-        spare,
-    );
+    queue_bulk(ED_IN, td, TD_ROUNDING | TD_IN_PID, buffer, RX_CHUNK, spare);
 }
 
 /// Whether the controller reported an unrecoverable error.
@@ -640,9 +655,9 @@ pub fn enumerate() -> Result<Device, Error> {
 
     irq::free(|| {
         set_bulk_eds(ADDRESS, 0);
-        // Four receive requests in flight, the fifth descriptor waits.
+        // Every receive buffer in flight, the last descriptor waits.
         for slot in 1..RX_TDS {
-            queue_rx(TD_IN + slot * 16);
+            queue_rx(TD_IN + slot * 16, RX_BUFFERS + (slot - 1) * RX_CHUNK);
         }
     });
     Ok(device)

@@ -48,6 +48,9 @@ pub struct Board {
 /// broken for the bytecode (a stalled endpoint fails every millisecond).
 const RX_FAILURES: u32 = 16;
 
+/// How long one pump goes on taking frames from the stick.
+const PUMP_MS: u32 = 20;
+
 pub const SCAN_NONE: ScanResult = ScanResult {
     ssid: [0; 33],
     mac: [0; 6],
@@ -116,7 +119,14 @@ impl Board {
         if work {
             self.station.poll(&mut radio);
         }
-        while let Some(rx) = radio.receive(frame) {
+        // For a while at most: in a band so crowded that frames come
+        // faster than they are handled, the queue never empties, and
+        // the main loop must still come round (the watchdog, the
+        // sound); what does not fit in the queue meanwhile is dropped.
+        let start = timer::millis();
+        while timer::since(start) < PUMP_MS
+            && let Some(rx) = radio.receive(frame)
+        {
             if let Some(d) = self.station.input(&mut radio, frame, rx) {
                 self.inbox.push(&frame[d.start..d.start + d.len], &d.source);
             }

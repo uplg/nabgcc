@@ -213,7 +213,10 @@ pub struct Stick {
 /// longest frame it passes (4095 bytes, MAC_CSR6), in whole packets.
 const ASSEMBLY_SIZE: usize = (24 + 4095usize).div_ceil(PACKET) * PACKET;
 
-/// Where the interrupt handler puts a frame together from its packets.
+/// Where the interrupt handler puts a frame together from its packets,
+/// on a word as the controller's buffers and the queue's frames are:
+/// copied a word at a time.
+#[repr(align(4))]
 struct Assembly(UnsafeCell<[u8; ASSEMBLY_SIZE]>);
 // SAFETY: only the USB interrupt handler touches it.
 unsafe impl Sync for Assembly {}
@@ -226,14 +229,15 @@ static DISCARDING: Shared<bool> = Shared::new(false);
 /// descriptor at its start (0: not known yet).
 static EXPECTED: Shared<usize> = Shared::new(0);
 
-/// Called from the USB interrupt with each packet from the stick (`None`:
-/// one was lost). A frame ends on a packet shorter than the maximum.
+/// Called from the USB interrupt with what came from the stick, whole
+/// packets at a time (`None`: one was lost); `last` when they end its
+/// transfer, on a packet shorter than the maximum.
 ///
 /// What follows a lost packet, or a transfer longer than any the stick
 /// sends, is dropped up to the end of that transfer: read as the start
 /// of a frame, its bytes would be a descriptor the sender of the frame
 /// chose ("decrypted, no error"), the way to slip frames past the keys.
-fn on_packet(packet: Option<&[u8]>) {
+fn on_packet(packet: Option<&[u8]>, last: bool) {
     // SAFETY: see `Assembly`.
     let buffer = unsafe { &mut *ASSEMBLY.0.get() };
     let Some(packet) = packet else {
@@ -251,7 +255,6 @@ fn on_packet(packet: Option<&[u8]>) {
         DISCARDING.set(!over);
         return;
     };
-    let last = packet.len() < PACKET;
     if DISCARDING.get() {
         DISCARDING.set(!last);
         return;

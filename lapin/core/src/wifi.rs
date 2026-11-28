@@ -274,7 +274,9 @@ impl Offer {
                 }
             }
             (None, Some(w)) => add(221, w),
-            (None, None) => {}
+            // Nothing to hash (an open network's beacon: a third of a
+            // millisecond each, many times over in a crowded band).
+            (None, None) => return o,
         }
         o.digest = h.finish();
         o.rsn_seen = rsne.is_some();
