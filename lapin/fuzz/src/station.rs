@@ -15,7 +15,7 @@ use lapin_core::ccmp;
 use lapin_core::md5::{hmac_md5, rc4};
 use lapin_core::sae::{self, Commit, Session};
 use lapin_core::sha1::hmac_sha1;
-use lapin_core::wifi::{self, HwCipher, LLC_EAPOL, Link, Mac, Rx, Station, Tx};
+use lapin_core::wifi::{self, HwCipher, LLC_EAPOL, Link, Mac, Rx, Station, Tx, be16, le16};
 
 use crate::input::Input;
 
@@ -354,14 +354,6 @@ impl Link for Air {
             *b = (self.next() >> 24) as u8;
         }
     }
-}
-
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
 }
 
 // ---- frames the access point builds -------------------------------------
@@ -1123,6 +1115,41 @@ pub fn world(kind: usize, steps: usize) -> World {
 
 // ---- the fuzzed part ----------------------------------------------------
 
+/// What the bytecode asks `auth` for, its key and password cut to
+/// what it can hand over.
+struct Join<'a> {
+    ssid: &'a [u8],
+    mac: Mac,
+    bssid: Mac,
+    channel: u8,
+    rateset: u16,
+    shared: bool,
+    encryption: u8,
+    key: &'a [u8],
+    password: &'a [u8],
+}
+
+impl Join<'_> {
+    /// The station told to join, and the exchange that follows: the
+    /// oracle off, the bytecode may ask for anything.
+    fn run(self, w: &mut World, oracle: &mut Oracle) {
+        oracle.on = false;
+        w.sta.auth(
+            &mut w.air,
+            self.ssid,
+            &self.mac,
+            &self.bssid,
+            self.channel,
+            self.rateset,
+            self.shared,
+            self.encryption,
+            &self.key[..self.key.len().min(32)],
+            &self.password[..self.password.len().min(64)],
+        );
+        w.pump(oracle);
+    }
+}
+
 fn mac(input: &mut Input) -> Mac {
     match input.u8() % 6 {
         0 => STA,
@@ -1371,20 +1398,18 @@ fn op(w: &mut World, input: &mut Input, oracle: &mut Oracle) {
                 if let Some(r) = w.found.get(i % w.found.len().max(1)).copied() {
                     let key = input.chunk(false).to_vec();
                     let password = input.chunk(false).to_vec();
-                    oracle.on = false;
-                    w.sta.auth(
-                        &mut w.air,
-                        &r.ssid[..r.ssid_len],
-                        &r.mac,
-                        &r.bssid,
-                        r.channel,
-                        r.rateset,
-                        input.bool(),
-                        r.encryption,
-                        &key[..key.len().min(32)],
-                        &password[..password.len().min(64)],
-                    );
-                    w.pump(oracle);
+                    let join = Join {
+                        ssid: &r.ssid[..r.ssid_len],
+                        mac: r.mac,
+                        bssid: r.bssid,
+                        channel: r.channel,
+                        rateset: r.rateset,
+                        shared: input.bool(),
+                        encryption: r.encryption,
+                        key: &key,
+                        password: &password,
+                    };
+                    join.run(w, oracle);
                 }
             }
         }
@@ -1399,20 +1424,18 @@ fn op(w: &mut World, input: &mut Input, oracle: &mut Oracle) {
             let ssid = input.chunk(false).to_vec();
             let key = input.chunk(false).to_vec();
             let password = input.chunk(false).to_vec();
-            oracle.on = false;
-            w.sta.auth(
-                &mut w.air,
-                &ssid,
-                &mac_,
-                &bssid,
+            let join = Join {
+                ssid: &ssid,
+                mac: mac_,
+                bssid,
                 channel,
                 rateset,
                 shared,
                 encryption,
-                &key[..key.len().min(32)],
-                &password[..password.len().min(64)],
-            );
-            w.pump(oracle);
+                key: &key,
+                password: &password,
+            };
+            join.run(w, oracle);
         }
         15 => {
             let master = input.bool();

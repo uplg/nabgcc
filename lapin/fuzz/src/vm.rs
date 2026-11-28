@@ -118,14 +118,11 @@ impl Host for Board {
         true
     }
     fn settings_read(&mut self, offset: u32, data: &mut [u8]) {
-        // The board clips; the machine may ask for anything.
-        let at = (offset as usize).min(4096);
-        let n = data.len().min(4096 - at);
+        let (at, n) = clip(offset, data.len());
         data[..n].copy_from_slice(&self.settings[at..at + n]);
     }
     fn settings_write(&mut self, offset: u32, data: &[u8]) {
-        let at = (offset as usize).min(4096);
-        let n = data.len().min(4096 - at);
+        let (at, n) = clip(offset, data.len());
         self.settings[at..at + n].copy_from_slice(&data[..n]);
     }
     fn flash_firmware(&mut self, _: &[u8]) -> ! {
@@ -199,6 +196,14 @@ impl Host for Board {
     fn usb_events(&mut self) {
         self.now = self.now.wrapping_add(10);
     }
+}
+
+/// Where `len` bytes at `offset` of the settings sector start, and how
+/// many of them are inside it: the board clips, the machine may ask for
+/// anything.
+fn clip(offset: u32, len: usize) -> (usize, usize) {
+    let at = (offset as usize).min(4096);
+    (at, len.min(4096 - at))
 }
 
 /// An 804 KB memory, zeroed, straight on the heap.

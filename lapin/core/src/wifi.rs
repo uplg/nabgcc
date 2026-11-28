@@ -517,11 +517,13 @@ impl Default for Station {
     }
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
+/// The little-endian 16-bit word at `at`.
+pub fn le16(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
 
-fn be16(b: &[u8], at: usize) -> u16 {
+/// The big-endian (network order) 16-bit word at `at`.
+pub fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }
 
@@ -804,7 +806,6 @@ impl Station {
     /// Fill in the duration and send `tx[..len]` as a management frame
     /// at the lowest rate, protected in software if `protect`.
     fn send_management(&mut self, link: &mut impl Link, len: usize, protect: bool) -> bool {
-        let (units, rate) = mask_rate(self.lowest_txrate);
         let mut len = len;
         if protect {
             let Some(soft) = &self.soft else { return false };
@@ -812,14 +813,27 @@ impl Station {
             len = ccmp::protect(&tk, 0, self.tx_pn, &mut self.tx, len);
             self.tx_pn += 1;
         }
+        self.transmit_management(link, len, HwCipher::None, 0)
+    }
+
+    /// The same, `tx[..len]` as it is, the stick encrypting it with key
+    /// 0 (`cipher`, `iv`) if asked.
+    fn transmit_management(
+        &mut self,
+        link: &mut impl Link,
+        len: usize,
+        cipher: HwCipher,
+        iv: u32,
+    ) -> bool {
+        let (units, rate) = mask_rate(self.lowest_txrate);
         let d = txtime(len, units) + 10;
         self.tx[2..4].copy_from_slice(&d.to_le_bytes());
         let tx = Tx {
             rate,
             ack: true,
-            cipher: HwCipher::None,
+            cipher,
             key: 0,
-            iv: 0,
+            iv,
             eiv: 0,
             timestamp: false,
         };
@@ -1854,25 +1868,15 @@ impl Station {
                 let Security::Wep { long, .. } = self.security else {
                     return;
                 };
-                let (units, rate) = mask_rate(self.lowest_txrate);
-                let d = txtime(n, units) + 10;
-                self.tx[2..4].copy_from_slice(&d.to_le_bytes());
                 let mut iv = [0u8; 3];
                 link.random(&mut iv);
-                let tx = Tx {
-                    rate,
-                    ack: true,
-                    cipher: if long {
-                        HwCipher::Wep104
-                    } else {
-                        HwCipher::Wep40
-                    },
-                    key: 0,
-                    iv: u32::from_le_bytes([iv[0], iv[1], iv[2], 0]),
-                    eiv: 0,
-                    timestamp: false,
+                let cipher = if long {
+                    HwCipher::Wep104
+                } else {
+                    HwCipher::Wep40
                 };
-                if !link.transmit(&self.tx[..n], &tx) {
+                let iv = u32::from_le_bytes([iv[0], iv[1], iv[2], 0]);
+                if !self.transmit_management(link, n, cipher, iv) {
                     self.state = State::Idle;
                 }
             }

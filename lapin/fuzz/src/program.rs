@@ -154,6 +154,20 @@ impl Gen<'_, '_> {
         self.pick(|k| k == Kind::Str)
     }
 
+    /// An integer local's value, or `v` if there is none.
+    fn int_or(&mut self, v: i32) {
+        match self.int_local() {
+            Some(a) => self.get(a),
+            None => self.int(v),
+        }
+    }
+
+    /// Any local's value (local 0's if none has one).
+    fn get_any_local(&mut self) {
+        let v = self.pick(|_| true).unwrap_or(0);
+        self.get(v);
+    }
+
     /// `body`, skipped by an `ELSE` unless local `c` holds true.
     fn unless_zero(&mut self, c: usize, body: impl FnOnce(&mut Self)) {
         self.get(c);
@@ -345,8 +359,7 @@ impl Gen<'_, '_> {
                 if self.input.bool() {
                     self.code.extend([MKTABB as u8, n]);
                 } else {
-                    let v = self.pick(|_| true).unwrap_or(0);
-                    self.get(v);
+                    self.get_any_local();
                     self.int(n as i32);
                     self.op(TABNEW);
                 }
@@ -463,10 +476,7 @@ impl Gen<'_, '_> {
             35 => {
                 let n = 1 + self.input.u8() % 4;
                 for _ in 0..n {
-                    match self.int_local() {
-                        Some(a) => self.get(a),
-                        None => self.int(0),
-                    }
+                    self.int_or(0);
                 }
                 self.code.extend([DEFTABB as u8, n]);
                 self.store(Kind::Tab(n));
@@ -544,10 +554,7 @@ impl Gen<'_, '_> {
                 let free = 2 - fixed;
                 self.get(c);
                 for _ in 0..free {
-                    match self.int_local() {
-                        Some(a) => self.get(a),
-                        None => self.int(3),
-                    }
+                    self.int_or(3);
                 }
                 match self.input.u8() % 3 {
                     0 if free == 0 => self.op(EXEC),
@@ -627,8 +634,7 @@ impl Gen<'_, '_> {
             48 => {
                 let n = 1 + self.input.u8() % 4;
                 for _ in 0..n {
-                    let v = self.pick(|_| true).unwrap_or(0);
-                    self.get(v);
+                    self.get_any_local();
                 }
                 self.int(n as i32);
                 self.op(DEFTAB);
