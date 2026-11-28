@@ -141,11 +141,13 @@ fn a_lost_usb_packet_merges_no_frames() {
     m.radio.borrow_mut().lose_rx_packet = Some(1);
     m.air[0].uplink.clear();
     let eth = eth_arp();
+    // The same again right behind it: the very next frame the stick
+    // hands over. Glued to the packet before the lost one, it would be
+    // the tail of a broken frame, and lost too.
+    m.air[0].send(&mut m.radio.borrow_mut(), &eth);
     m.air[0].send(&mut m.radio.borrow_mut(), &eth);
     wait(&mut m, 1000);
-    assert_eq!(arp_replies(&m), 0);
-    let replies = answers_arp(&mut m) + answers_arp(&mut m);
-    assert!(replies >= 1, "deaf after a lost packet");
+    assert_eq!(arp_replies(&m), 1, "the next frame merged");
 }
 
 // ---- the stick on its port ---------------------------------------------
