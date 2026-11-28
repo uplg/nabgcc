@@ -40,6 +40,12 @@ macro_rules! bit_ops {
             pub fn clear(self, bits: $t) {
                 self.write(self.read() & !bits);
             }
+
+            /// Set `bits` when `on`, clear them otherwise.
+            #[inline(always)]
+            pub fn put(self, bits: $t, on: bool) {
+                if on { self.set(bits) } else { self.clear(bits) }
+            }
         }
     };
 }
@@ -47,14 +53,15 @@ bit_ops!(u8);
 bit_ops!(u16);
 bit_ops!(u32);
 
-/// Declare registers: `reg!(NAME: u32 = 0xB700_0000);`
+/// Declare registers: `reg!(NAME: u32 = 0xB700_0000);`, with a
+/// visibility in front of one that other drivers use too.
 #[macro_export]
 macro_rules! reg {
-    ($($name:ident : $t:ty = $addr:expr;)*) => {
+    ($($vis:vis $name:ident : $t:ty = $addr:expr;)*) => {
         $(
             #[allow(dead_code)]
             // SAFETY: addresses from the processor's register map.
-            const $name: $crate::reg::Reg<$t> = {
+            $vis const $name: $crate::reg::Reg<$t> = {
                 let address: usize = $addr;
                 unsafe { $crate::reg::Reg::at(address) }
             };

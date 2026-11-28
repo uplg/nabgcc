@@ -1,15 +1,13 @@
 //! Clock tree: 32 MHz from the 8 MHz crystal.
 
 use crate::reg;
+use crate::timer::{TMEN, TMOVF, TMRLR};
 
 reg! {
     PECLKCNT: u32 = 0xB700_0000;
     PLL1: u32 = 0xB700_0008;
     PLL2: u32 = 0xB700_000C;
     CLKCNT: u32 = 0xB700_0010;
-    TMEN: u8 = 0xB800_1004;
-    TMRLR: u16 = 0xB800_1008;
-    TMOVF: u8 = 0xB800_1010;
 }
 
 /// Processor and peripheral clock once [`init`] has run.

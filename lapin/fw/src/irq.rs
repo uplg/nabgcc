@@ -11,7 +11,7 @@ reg! {
     ILC0: u32 = 0x7800_0020;
     ILC1: u32 = 0x7800_0024;
     EXILCA: u32 = 0x7BF0_0018;
-    EXILCB: u32 = 0x7BF0_0028;
+    pub(crate) EXILCB: u32 = 0x7BF0_0028;
     EXILCC: u32 = 0x7BF0_0038;
 }
 

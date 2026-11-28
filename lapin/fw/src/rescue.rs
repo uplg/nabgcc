@@ -127,7 +127,7 @@ impl Rescue {
             .iter()
             .enumerate()
         {
-            ssid[17 + i] = b"0123456789abcdef"[*nibble as usize];
+            ssid[17 + i] = uart::DIGITS[*nibble as usize];
         }
         Rescue {
             mac,
@@ -201,9 +201,7 @@ impl Rescue {
         let mut options = TxOptions::PLAIN;
         options.ack = ack;
         let start = timer::millis();
-        while !stick.transmit(&self.frame[..len], &options)
-            && timer::since(start) < 50
-        {
+        while !stick.transmit(&self.frame[..len], &options) && timer::since(start) < 50 {
             watchdog::feed();
         }
     }
@@ -248,10 +246,7 @@ impl Rescue {
             // Ten minutes without a request (a phone that joined and
             // left, or rejoins on its own, does not count): give the
             // application another try.
-            if app_present
-                && self.tcp == Tcp::Listen
-                && timer::since(self.last_visit) > IDLE_MS
-            {
+            if app_present && self.tcp == Tcp::Listen && timer::since(self.last_visit) > IDLE_MS {
                 uart::write(b"secours: back to the application\n");
                 Slots::fresh();
                 watchdog::reset_now();
@@ -512,9 +507,7 @@ impl Rescue {
             // A second connection while one is under way (a browser's
             // spare one, a favicon) is not taken: it would drop the
             // upload. One silent for ten seconds is given up.
-            let busy = self.tcp != Tcp::Listen
-                && !ours
-                && timer::since(self.heard_at) < 10_000;
+            let busy = self.tcp != Tcp::Listen && !ours && timer::since(self.heard_at) < 10_000;
             if busy {
                 return;
             }

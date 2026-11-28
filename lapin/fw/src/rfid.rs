@@ -24,12 +24,12 @@ pub enum Error {
     NoSuchTag,
 }
 
-/// Again while the reader refuses, not when the bus is stuck: a bus held
-/// low would take a thousand waits each time (and the C's driver hangs
-/// on it).
-fn write(data: &[u8]) -> Result<(), Error> {
+/// A transfer with the reader, again while it refuses, not when the bus
+/// is stuck: a bus held low would take a thousand waits each time (and
+/// the C's driver hangs on it).
+fn again(mut transfer: impl FnMut() -> Result<(), i2c::Failed>) -> Result<(), Error> {
     for _ in 0..TRIES {
-        match i2c::write(READER, data) {
+        match transfer() {
             Ok(()) => return Ok(()),
             Err(i2c::Failed::Stuck) => return Err(Error::Reader),
             Err(i2c::Failed::Refused) => {}
@@ -38,15 +38,12 @@ fn write(data: &[u8]) -> Result<(), Error> {
     Err(Error::Reader)
 }
 
+fn write(data: &[u8]) -> Result<(), Error> {
+    again(|| i2c::write(READER, data))
+}
+
 fn read(data: &mut [u8]) -> Result<(), Error> {
-    for _ in 0..TRIES {
-        match i2c::read(READER, data) {
-            Ok(()) => return Ok(()),
-            Err(i2c::Failed::Stuck) => return Err(Error::Reader),
-            Err(i2c::Failed::Refused) => {}
-        }
-    }
-    Err(Error::Reader)
+    again(|| i2c::read(READER, data))
 }
 
 /// Send a frame to the tags.
@@ -151,10 +148,7 @@ pub fn scan(found: &mut [Tag]) -> Result<usize, Error> {
 }
 
 fn with_tag<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-    let mut found = [Tag {
-        uid: [0; 8],
-        chip_id: 0,
-    }; 16];
+    let mut found = [Tag::default(); 16];
     let result = scan_keeping_field(&mut found).and_then(|count| {
         let tag = found[..count]
             .iter()

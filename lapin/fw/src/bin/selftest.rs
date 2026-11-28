@@ -17,9 +17,7 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 fn hex(bytes: &[u8]) {
     for byte in bytes {
-        for nibble in [byte >> 4, byte & 15] {
-            uart::write(&[b"0123456789abcdef"[nibble as usize]]);
-        }
+        uart::hex8(*byte);
     }
 }
 

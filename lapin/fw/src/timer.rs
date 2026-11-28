@@ -5,9 +5,9 @@ use crate::sync::Shared;
 use crate::{irq, reg, watchdog};
 
 reg! {
-    TMEN: u8 = 0xB800_1004;
-    TMRLR: u16 = 0xB800_1008;
-    TMOVF: u8 = 0xB800_1010;
+    pub(crate) TMEN: u8 = 0xB800_1004;
+    pub(crate) TMRLR: u16 = 0xB800_1008;
+    pub(crate) TMOVF: u8 = 0xB800_1010;
 }
 
 static MILLIS: Shared<u32> = Shared::new(0);

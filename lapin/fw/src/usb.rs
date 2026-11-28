@@ -41,7 +41,6 @@ reg! {
     RAM_ADR: u32 = CHIP + 0x20C;
     INT_ENBL: u16 = CHIP + 0x314;
     EXIRQB: u16 = 0x7BF0_0020;
-    EXILCB: u32 = 0x7BF0_0028;
 }
 
 const OPERATING: u32 = 1 << 1;
@@ -212,7 +211,7 @@ pub fn init() -> Result<(), Error> {
 
     // The controller's interrupt pin, at the highest level.
     EXIRQB.set(0x10);
-    EXILCB.set(0x700);
+    irq::EXILCB.set(0x700);
     HOST_CTL.write(0);
     // Power the port: a device already there shows up as a change.
     HC_RH_STATUS.write(1 << 16);

@@ -1,10 +1,6 @@
 //! The two SPI buses: 0 goes to the audio codec, 1 to the led driver.
 
-use crate::reg;
-
-reg! {
-    PORTSEL2: u32 = 0xB700_0028;
-}
+use crate::board::PORTSEL2;
 
 const CONTROL: usize = 0x00;
 const BAUD: usize = 0x04;
@@ -60,9 +56,7 @@ impl Spi {
         while self.reg(STATUS).read() & DONE == 0 {}
         read.read()
     }
-}
 
-impl Spi {
     /// Bus clock: the peripheral clock divided by `2 * (divider + 1)`.
     pub fn set_divider(self, divider: u32) {
         let control = self.reg(CONTROL);

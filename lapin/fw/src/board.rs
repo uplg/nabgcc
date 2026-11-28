@@ -3,8 +3,8 @@
 use crate::reg;
 
 reg! {
-    PORTSEL1: u32 = 0xB700_0024;
-    PORTSEL2: u32 = 0xB700_0028;
+    pub(crate) PORTSEL1: u32 = 0xB700_0024;
+    pub(crate) PORTSEL2: u32 = 0xB700_0028;
     PORTSEL3: u32 = 0xB700_002C;
     PORTSEL4: u32 = 0xB700_0030;
     PORTSEL5: u32 = 0xB700_0034;
@@ -12,10 +12,10 @@ reg! {
     RAMAC: u32 = 0x7810_0008;
     IO0AC: u32 = 0x7810_000C;
     PI1: u8 = 0xB7A0_1004;
-    PO2: u8 = 0xB7A0_2000;
+    pub(crate) PO2: u8 = 0xB7A0_2000;
     PM2: u8 = 0xB7A0_2008;
     PI3: u8 = 0xB7A0_3004;
-    PO4: u8 = 0xB7A0_4000;
+    pub(crate) PO4: u8 = 0xB7A0_4000;
     PM4: u8 = 0xB7A0_4008;
     PO5: u8 = 0xB7A0_5000;
     PM5: u8 = 0xB7A0_5008;
@@ -41,49 +41,22 @@ const MOTOR_PINS: u8 = 0b0011_1100;
 const AUDIO_DATA_SELECT: u8 = 1 << 0;
 const AUDIO_RESET: u8 = 1 << 7;
 
-pub(crate) fn port2_set(bits: u8) {
-    PO2.set(bits);
-}
-
-pub(crate) fn port2_clear(bits: u8) {
-    PO2.clear(bits);
-}
-
 /// The codec's "send me more" line.
 pub(crate) fn codec_wants_data() -> bool {
     PI1.read() & (1 << 2) != 0
 }
 
 pub(crate) fn amplifier(on: bool) {
-    if on {
-        PO4.set(AUDIO_AMPLIFIER)
-    } else {
-        PO4.clear(AUDIO_AMPLIFIER)
-    }
+    PO4.put(AUDIO_AMPLIFIER, on);
 }
 
+/// The codec's reset and data select lines are active low.
 pub(crate) fn codec_reset(held: bool) {
-    if held {
-        PO11.clear(AUDIO_RESET)
-    } else {
-        PO11.set(AUDIO_RESET)
-    }
+    PO11.put(AUDIO_RESET, !held);
 }
 
 pub(crate) fn codec_data_select(on: bool) {
-    if on {
-        PO11.clear(AUDIO_DATA_SELECT)
-    } else {
-        PO11.set(AUDIO_DATA_SELECT)
-    }
-}
-
-pub(crate) fn port4_set(bits: u8) {
-    PO4.set(bits);
-}
-
-pub(crate) fn port4_clear(bits: u8) {
-    PO4.clear(bits);
+    PO11.put(AUDIO_DATA_SELECT, !on);
 }
 
 /// Give every pin its function, direction and resting level.
@@ -143,14 +116,11 @@ pub fn button() -> bool {
 /// (it varies with the interrupts that come and the flash's waits), and
 /// the readings themselves, all ten bits (the last ones wander).
 pub fn noise() -> u32 {
-    const START: u16 = 0x10;
     let tick = crate::timer::millis();
     let mut x = 0u32;
     let mut n = 0u32;
     while crate::timer::millis() == tick && n < 100_000 {
-        ADCON1.set(START | 2);
-        while ADCON1.read() & START != 0 {}
-        x = x.rotate_left(3) ^ ADR2.read() as u32;
+        x = x.rotate_left(3) ^ convert() as u32;
         n += 1;
     }
     crate::watchdog::feed();
@@ -159,9 +129,14 @@ pub fn noise() -> u32 {
 
 /// The volume wheel, 0 to 255.
 pub fn volume() -> u8 {
+    // The wheel is wired so that the reading goes down as it goes up.
+    255 - (convert() >> 2) as u8
+}
+
+/// One conversion of the volume wheel's input, ten bits.
+fn convert() -> u16 {
     const START: u16 = 0x10;
     ADCON1.set(START | 2);
     while ADCON1.read() & START != 0 {}
-    // The wheel is wired so that the reading goes down as it goes up.
-    255 - (ADR2.read() >> 2) as u8
+    ADR2.read()
 }

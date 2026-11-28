@@ -37,20 +37,26 @@ struct Settings(Cell<[[u8; 3]; 5]>);
 unsafe impl Sync for Settings {}
 static SETTINGS: Settings = Settings(Cell::new([[0; 3]; 5]));
 
+/// Get the driver to take bits: its sixteen output switches, or (with
+/// `currents`) the current settings.
+fn begin(currents: bool) {
+    board::PO2.put(board::LED_MODE, currents);
+    board::PO4.clear(board::LED_LATCH);
+}
+
+/// Have the driver use the bits it took.
 fn latch() {
-    board::port4_set(board::LED_LATCH);
-    board::port4_clear(board::LED_LATCH);
+    board::PO4.set(board::LED_LATCH);
+    board::PO4.clear(board::LED_LATCH);
 }
 
 /// Switch every output on and every current to zero.
 pub fn init() {
-    board::port2_clear(board::LED_MODE);
-    board::port4_clear(board::LED_LATCH);
+    begin(false);
     spi::LEDS.transfer(0xFF);
     spi::LEDS.transfer(0xFF);
     latch();
-    board::port2_set(board::LED_MODE);
-    board::port4_clear(board::LED_LATCH);
+    begin(true);
     for _ in 0..14 {
         spi::LEDS.transfer(0);
     }
@@ -65,8 +71,7 @@ pub fn set(led: usize, colour: u32) {
         let mut all = SETTINGS.0.get();
         all[led % 5] = rgb;
         SETTINGS.0.set(all);
-        board::port2_set(board::LED_MODE);
-        board::port4_clear(board::LED_LATCH);
+        begin(true);
         // Fifteen 7-bit fields in fourteen bytes, in the chain's order,
         // the last seven bits zero.
         let mut bits = 0u32;

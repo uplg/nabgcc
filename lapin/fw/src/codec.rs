@@ -32,27 +32,27 @@ fn wait_ready() {
     }
 }
 
+/// A command on a control register: the operation and the register,
+/// then the two bytes of `value` out while the register's come back.
+fn command(operation: u8, register: u8, value: u16) -> u16 {
+    wait_ready();
+    board::PO2.clear(board::AUDIO_CONTROL_SELECT);
+    spi::CODEC.transfer(operation);
+    spi::CODEC.transfer(register);
+    let high = spi::CODEC.transfer((value >> 8) as u8);
+    let low = spi::CODEC.transfer(value as u8);
+    board::PO2.set(board::AUDIO_CONTROL_SELECT);
+    (high as u16) << 8 | low as u16
+}
+
 /// Read one of the chip's control registers.
 pub fn read(register: u8) -> u16 {
-    wait_ready();
-    board::port2_clear(board::AUDIO_CONTROL_SELECT);
-    spi::CODEC.transfer(READ);
-    spi::CODEC.transfer(register);
-    let high = spi::CODEC.transfer(0);
-    let low = spi::CODEC.transfer(0);
-    board::port2_set(board::AUDIO_CONTROL_SELECT);
-    (high as u16) << 8 | low as u16
+    command(READ, register, 0)
 }
 
 /// Write one of the chip's control registers.
 pub fn write(register: u8, value: u16) {
-    wait_ready();
-    board::port2_clear(board::AUDIO_CONTROL_SELECT);
-    spi::CODEC.transfer(WRITE);
-    spi::CODEC.transfer(register);
-    spi::CODEC.transfer((value >> 8) as u8);
-    spi::CODEC.transfer(value as u8);
-    board::port2_set(board::AUDIO_CONTROL_SELECT);
+    command(WRITE, register, value);
 }
 
 /// A patch the chip needs to play WMA streams properly, as register
