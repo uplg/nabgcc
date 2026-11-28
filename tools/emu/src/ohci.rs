@@ -103,6 +103,13 @@ pub struct Ohci {
     /// do (Linux's `ohci_irq` copes with those). Off, it is raised once
     /// per change. On by default with `NABEMU_RHSC_LEVEL` set.
     pub rhsc_level: bool,
+    /// The chip's own interrupt status (StatusTransferCount's OHCI bit),
+    /// set while the core interrupts and cleared by writing it, which
+    /// both drivers do last in their handler. With `latched`, the pin
+    /// follows it rather than the core: it falls at that write, just
+    /// before the handler's end (and its CILCL write).
+    stt_ohci: bool,
+    pub latched: bool,
 }
 
 struct Ram<'a>(&'a mut [u8]);
@@ -142,6 +149,8 @@ impl Ohci {
             errors: 0,
             frames: 0,
             rhsc_level: std::env::var_os("NABEMU_RHSC_LEVEL").is_some(),
+            stt_ohci: false,
+            latched: false,
         }
     }
 
@@ -182,9 +191,10 @@ impl Ohci {
     /// Chip reset. The device stays plugged in.
     pub fn reset(&mut self) {
         let device = self.device.take();
-        let level = self.rhsc_level;
+        let (level, latched) = (self.rhsc_level, self.latched);
         *self = Ohci::new();
         self.rhsc_level = level;
+        self.latched = latched;
         self.device = device;
         if let Some(d) = &mut self.device {
             d.bus_reset();
@@ -207,9 +217,21 @@ impl Ohci {
         self.int_enable & INTR_MIE != 0 && self.int_status & self.int_enable & !INTR_MIE != 0
     }
 
+    /// The chip's interrupt status: the core's, or the latch of it.
+    fn status(&mut self) -> bool {
+        if self.ohci_irq() {
+            self.stt_ohci = true;
+        }
+        if self.latched {
+            self.stt_ohci
+        } else {
+            self.ohci_irq()
+        }
+    }
+
     /// Level of the chip's interrupt pin towards the CPU (EXINT2).
-    pub fn irq(&self) -> bool {
-        self.ohci_irq() && self.r(HOST_CTL) & 2 == 0
+    pub fn irq(&mut self) -> bool {
+        self.status() && self.r(HOST_CTL) & 2 == 0
     }
 
     pub fn read(&mut self, off: u32) -> u32 {
@@ -220,7 +242,7 @@ impl Ohci {
             HC_RH_DESCRIPTOR_A => 1,
             HC_RH_STATUS => 0,
             HC_RH_PORT_STATUS => self.port,
-            STT_TRNS_CNT => (self.ohci_irq() as u32) << 1,
+            STT_TRNS_CNT => (self.status() as u32) << 1,
             _ => self.r(off),
         }
     }
@@ -259,7 +281,11 @@ impl Ohci {
                     self.port &= !PS_PES;
                 }
             }
-            STT_TRNS_CNT => {}
+            STT_TRNS_CNT => {
+                if v & 2 != 0 {
+                    self.stt_ohci = false;
+                }
+            }
             // RstClkCtl's chip reset (B_CRST): the whole controller, its
             // port too, starts over (the device sees a bus reset).
             RST_CLK_CTL if v & CHIP_RESET != 0 => self.reset(),

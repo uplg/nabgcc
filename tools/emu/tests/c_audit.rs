@@ -664,13 +664,15 @@ fn the_rescue_networks_beacons_stop_with_the_application() {
 /// The processor seeing the interrupt line late (I1): an interrupt whose
 /// source went away is taken, and the controller names source 0, the
 /// system timer. lapin counted a millisecond for each: its clock ran
-/// ahead of the board's. Now its clock never runs ahead.
+/// ahead of the board's. Now its clock never runs ahead. (r3 counts
+/// them too, but its handler returns late enough for the line to be
+/// down: the model gives it none.)
 #[test]
 fn an_illegal_interrupt_is_no_millisecond() {
-    // Wait in the bytecode until its clock says 30 s, say so, then
-    // until it says 40 s, and say so.
+    // Wait in the bytecode until its clock says 10 s, say so, then
+    // until it says 13 s, and say so.
     let mut f = metal::FUNCTION_HEADER.to_vec();
-    for (until_ms, say) in [(30_000, 731_731), (40_000, 937_937)] {
+    for (until_ms, say) in [(10_000, 731_731), (13_000, 937_937)] {
         let top = (f.len() - 3) as u16;
         f.push(TIME_MS);
         f.extend(metal::int(until_ms));
@@ -686,15 +688,33 @@ fn an_illegal_interrupt_is_no_millisecond() {
     f.extend([NIL, RET]);
     let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&[], &f));
     m.soc.irq_lag = true;
-    let first = common::until_every(&mut m, 1, 60_000, "30 s", |m| {
+    let first = common::until_every(&mut m, 1, 60_000, "10 s", |m| {
         m.console().contains("\n731731")
     });
-    let second = common::until_every(&mut m, 1, 30_000, "40 s", |m| {
-        m.console().contains("\n937937")
-    });
+    let before = m.soc.illegal_irqs;
+    // Meanwhile, a frame for the rabbit every 5 ms: USB interrupts.
+    let mut eth = DEFAULT_MAC.to_vec();
+    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
+    eth.extend_from_slice(&[0x5A; 100]);
+    let mut ms = 0;
+    while !m.console().contains("\n937937") {
+        assert!(ms < 6000, "13 s on the rabbit's clock not by {ms} ms on");
+        if ms % 5 == 0 {
+            m.air[0].send(&mut m.radio.borrow_mut(), &eth);
+        }
+        wait(&mut m, 1);
+        ms += 1;
+    }
+    let second = m.soc.millis();
+    // The bytecode ran before its clock said 10 s: it waited.
+    assert!(first < 11_000, "the bytecode came at {first} ms");
     let board = second - first;
-    assert!(
-        board + 2 >= 10_000,
-        "10 s on the rabbit's clock in {board} ms"
-    );
+    let illegal = m.soc.illegal_irqs - before;
+    eprintln!("{illegal} illegal interrupts, 3 s in {board} ms");
+    if is_lapin() {
+        // The handler clears the controller's status last, and the
+        // CILCL write follows: the line, still up, is taken again.
+        assert!(illegal > 10, "{illegal} illegal interrupts");
+    }
+    assert!(board + 2 >= 3000, "3 s on the rabbit's clock in {board} ms");
 }

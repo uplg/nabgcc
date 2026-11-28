@@ -496,11 +496,17 @@ pub struct Soc {
     /// The USB controller's interrupt line (EXINT2) takes a while to
     /// fall once its cause is cleared: the processor can still take it
     /// then, and the controller has nothing to name (IRN 0, an illegal
-    /// interrupt, manual 6.5.6 and 6.6.2). On with `NABEMU_IRQ_LAG`.
+    /// interrupt, manual 6.5.6 and 6.6.2). The line follows the chip's
+    /// own status bit then, which the drivers clear last in their
+    /// handler: the CILCL write right after it lets the processor take
+    /// the line again before it is down (the manual's third case). On
+    /// with `NABEMU_IRQ_LAG`.
     pub irq_lag: bool,
     /// Lines still seen high, and until when.
     falling_lines: u64,
     falling_until: u64,
+    /// Reads of IRN that found nothing to name: illegal interrupts.
+    pub illegal_irqs: u64,
     /// Counts every access that may change the board's state (a store
     /// that changes memory, any peripheral access but feeding the
     /// watchdog): two turns of a loop with the same count in between
@@ -569,6 +575,7 @@ impl Soc {
             irq_lag: std::env::var_os("NABEMU_IRQ_LAG").is_some(),
             falling_lines: 0,
             falling_until: 0,
+            illegal_irqs: 0,
             touched: 0,
             feeds: 0,
         }
@@ -695,6 +702,7 @@ impl Soc {
                 self.uart_advance();
             }
             self.ohci.frame(&mut self.usb_ram);
+            self.ohci.latched = self.irq_lag;
             let irq = self.ohci.irq();
             self.set_line(INT_EXINT2_USB, irq);
         }
@@ -1010,7 +1018,10 @@ impl Soc {
                 // Nothing pending (it went away since the processor took
                 // the interrupt): 0, as the manual says (6.5.6), the
                 // system timer's number, an "illegal interrupt".
-                None => 0,
+                None => {
+                    self.illegal_irqs += 1;
+                    0
+                }
             },
             CIL => self.cil,
             EXIRQA => ((self.irq_lines >> 16) & 0xFFFF) as u32,
@@ -1299,6 +1310,7 @@ impl Soc {
             }
             a if a >= USB_BASE => {
                 self.ohci.write(a - USB_BASE, val, mask);
+                self.ohci.latched = self.irq_lag;
                 let irq = self.ohci.irq();
                 self.set_line(INT_EXINT2_USB, irq);
             }
