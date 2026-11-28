@@ -53,30 +53,51 @@ fixed or documented, with tests (`tools/emu/tests/c_audit.rs`,
 `observable.rs`, `crowded.rs`, `scan.rs`, `scan_connected.rs`,
 `first_flash.rs`, `wpa3_sound.rs`, ...). lapin is NOT ready for Garen.
 Léonard rules out a first flash by JTAG: the C to lapin migration must
-be safe over the air by construction. In this order:
+be safe over the air by construction.
 
-1. **A packed first image: done.** The server sends an r3 rabbit
-   `lapin-first.bin`, once (see "The first flash" below and
-   `docs/first-flash.md`): 1931 ms unfed at the manual's slowest flash,
-   166 ms to spare, where `lapin-full.bin` is bitten. A power cut in
-   the first ~0.35 s, while r3 writes the rescue core itself, stays
-   fatal (pinned as a Known defect): nothing on the lapin side can
-   change that.
-2. **The final nose pass** over the whole repository, the Svelte page
-   included.
-3. **Review `docs/first-flash.md`** (no JTAG in it). Its largest open
-   risk: nobody has read Garen's radio type; an unknown one leaves the
-   rescue core without a network too.
-4. **Measure the CI cold** (local and GitHub): the audits added about a
-   hundred tests; nothing slow should be left that need not be.
-5. Leftovers: the flash command timing made explicit (manual 20.5.5)
-   and checked by the model; (INTST.RSTSTATUS read before `arm()`:
-   done, see the rescue core below); tests that could not fail before (M11, A14 in the emulator, I1, the
-   data toggle after a take-back, the I2C STOP after a timeout, the
-   receive overflow path); a quirk seen in `scan_connected.rs`: the last
-   global of a test bytecode read empty in a loop callback, on r3 and
-   lapin alike (the test builder, or the machine?).
-6. **cargo-mutants** only on Léonard's go; then nose once more.
+Done since:
+
+- **A packed first image.** The server sends an r3 rabbit
+  `lapin-first.bin`, once (see "The first flash" below and
+  `docs/first-flash.md`): 1931 ms unfed at the manual's slowest flash,
+  166 ms to spare, where `lapin-full.bin` is bitten. A power cut in the
+  first ~0.35 s, while r3 writes the rescue core itself, stays fatal
+  (pinned as a Known defect): nothing on the lapin side can change
+  that.
+- **INTST.RSTSTATUS** tells a power-on from a watchdog restart.
+- **The flash rules of the manual's 20.5.5** written out in the RAM
+  routines and checked by the emulator; no erase of an erased sector
+  (the flash is guaranteed for 100 rewrites).
+- **Every audit test can fail**: M11, A14, I1, the data toggle after a
+  take-back, the I2C STOP after a timeout, the receive overflow path
+  (each seen failing on the code before its fix). A lost receive packet
+  now drops what is left of its own frame only, from the descriptor's
+  length.
+- **nose**: no family left anywhere (lapin, tools/emu, scripts,
+  .github), even on its full surface; `nose.ignore.json` gives the
+  reason for each one that must stay; `scripts/nose.sh` gates it in
+  ci-local.sh and in the CI.
+- **The CI** splits the tests on lapin over three runners (about 4 min
+  end to end on GitHub); the suites that pick their own images run
+  once.
+
+Open, in this order:
+
+1. **The last global of a served bytecode** lies above the stack
+   (`7737b92`): `OPbytecode` leaves the interpreter with the new
+   bytecode's stack, and the caller's `VPULL` pops from it. r3 and
+   lapin alike; the next push overwrites that global, and the collector
+   no longer marks it (an object held only there can be collected while
+   still referenced). lapin keeps the C's behaviour for now: whether to
+   fix it (a C bug, so lapin should not reproduce it) is Léonard's
+   call, since it changes what the bytecode sees and the differential
+   tests against the C.
+2. **Receive throughput in a crowded band**: lapin takes about two
+   frames a millisecond off the stick; with 200 neighbours beaconing
+   every 20 ms (`crowded.rs`) it lists 100 to 200 of them depending on
+   their phase, where r3 lists 175 (the home network always). Worth a
+   look at the receive transfers in flight.
+3. **cargo-mutants** only on Léonard's go; nose gates the code it adds.
 
 ## Things worth knowing before continuing
 
