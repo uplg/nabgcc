@@ -14,9 +14,11 @@ reg! {
 pub const HZ: u32 = 32_000_000;
 
 pub fn init() {
-    // Already done (by the rescue core, before handing over): leave
-    // the running clock alone.
-    if CLKCNT.read() == 0x0009_0009 {
+    // Already done (by the rescue core, before handing over): the
+    // processor on the system clock side (SRCSEL 00) through PLL A
+    // (PLLSEL 01), PLL A running. Leave the running clock alone.
+    let now = CLKCNT.read();
+    if now & 0x303 == 0x001 && now & 0x1_0000 != 0 {
         return;
     }
     // Still on the ring oscillator, as out of reset: give the crystal
@@ -28,7 +30,12 @@ pub fn init() {
         // The ring oscillator's 16 MHz, divided by 16: 10 000 counts.
         TMRLR.write((0x1_0000 - 10 * 16 * 1000 / 16) as u16);
         TMEN.write(1);
-        while TMOVF.read() & 1 == 0 {}
+        // Bounded: a timer that never overflows must not hold the board
+        // here (the ring oscillator runs 10 ms in well under 2^22 polls).
+        let mut polls = 0u32;
+        while TMOVF.read() & 1 == 0 && polls < 1 << 22 {
+            polls += 1;
+        }
         CLKCNT.write(CLKCNT.read() & 0xFFFF_FCFF);
         TMEN.write(0);
         TMOVF.write(1);

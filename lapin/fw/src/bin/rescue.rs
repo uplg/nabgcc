@@ -13,7 +13,7 @@ use core::arch::{asm, global_asm};
 use lapin_fw::boot::{self, MAX_FAILED_BOOTS, Slots};
 use lapin_fw::rescue::Rescue;
 use lapin_fw::wifi::rt2573::Stick;
-use lapin_fw::{clock, led, timer, uart, watchdog};
+use lapin_fw::{board, clock, led, timer, uart, watchdog};
 
 global_asm!(
     r#"
@@ -60,14 +60,19 @@ const RED: u32 = 0xFF0000;
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     lapin_fw::start::link();
+    // The watchdog first of all (on the ring oscillator its period is
+    // only longer): whatever hangs from here, the clock's switch or the
+    // check of the application, ends in a restart, which counts; and an
+    // application that hangs before its own start of it comes back here.
+    watchdog::start();
     let failed = Slots::count_boot();
     // The application finds the clock running and leaves it so.
     clock::init();
+    // The pins at rest (amplifier off, codec in reset, ears still) as
+    // the C sets them early, before the time the check below takes.
+    board::init();
     let app = boot::installed_app();
     if let Some(entry) = app.filter(|_| failed < MAX_FAILED_BOOTS) {
-        // Running before the jump: an application that hangs before
-        // its own start of it still comes back here, and counts.
-        watchdog::start();
         // SAFETY: the application's reset code, at the address its whole
         // and checked header gives; it takes over the processor from
         // scratch, as from a reset.

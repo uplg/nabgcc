@@ -124,7 +124,11 @@ pub fn crc32(data: &[u8]) -> u32 {
         0xBDBD_F21C,
     ];
     let mut c = !0u32;
-    for &b in data {
+    for (i, &b) in data.iter().enumerate() {
+        // A whole application takes tens of milliseconds.
+        if i % 4096 == 0 {
+            crate::watchdog::feed();
+        }
         c ^= b as u32;
         c = (c >> 4) ^ T[(c & 15) as usize];
         c = (c >> 4) ^ T[(c & 15) as usize];
