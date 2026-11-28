@@ -244,6 +244,100 @@ What the access point and the air see:
   them and the console says so once (`tests/observable.rs`). r3 never
   checked.
 
+**Drivers and sound.** An
+audit of the drivers and the sound against r3 (`tools/emu/tests/c_audit.rs`,
+`first_flash.rs`, `lapin/metal/tests/audio.rs`). lapin does what the C
+does where the outside world can see it, except here, where the C is
+wrong:
+
+- Wi-Fi receive: the C goes deaf for good after a receive transfer longer
+  than its buffer (Known defect). lapin holds the longest transfer the
+  stick hands over (4095 bytes) and drops what follows an overrun or a
+  lost USB packet up to the end of its transfer (it used to read it as
+  a new frame, whose descriptor the sender chose: frames in clear
+  passed as decrypted).
+- The stick unplugged and plugged back: the C gets back through a
+  watchdog restart (Known defect); lapin brings it up again in place,
+  the station back to idle. A bring-up that fails on the way gets two
+  more tries with the USB controller reset. The request that starts
+  the stick's firmware may fail, as in the C (whose result it ignores);
+  control transfers get the C's second.
+- Tuning: a failed request leaves the receiver on, as the C (which
+  ignores every error); a failed key write leaves the key slot invalid
+  and a failed beacon write sends no beacon (the C marks a half-written
+  key valid and beacons a half-written frame). BBP R94 is put back on
+  the next channel (the C leaves it raised). Beacons and their slots
+  are cleared at start, as Linux's rt73usb does (the C never cleared
+  them: the rescue network kept beaconing after a restart). Radio types
+  other than RT2528 and RT2527 are refused by name; the C, finding no
+  synthesiser table, never tunes them, receiver on and deaf. The IVs
+  the replay check reads (descriptor words 2 and 3, as rt73usb reads
+  them; the C never did) go to the serial port for the first frames.
+- USB wire: the root hub is served in the interrupt, as the C; the
+  rest of the C's sequence too (three tries of the first descriptor,
+  the descriptor again at the new address, the configuration in two
+  reads, reset at once then 40 ms). Left different: control
+  descriptors all interrupt (the C's no-interrupt ones are not needed),
+  HcControl is written once, the done list is walked at most 16 deep.
+- Sound: a byte taken from the ring while DREQ fell is held for the
+  codec (lapin dropped it; the C writes it anyway, which the VS1003
+  takes). At the end of a stream lapin sends the 2048 zeros the data
+  sheet asks for after a file and switches the amplifier off (the C
+  sends nothing and leaves it on, Known defect B40); SM_OUTOFWAV is for
+  stopping in the middle (data sheet 9.3) and is not needed at an end.
+  The refill asks the bytecode once (the C asks twice and drops the
+  second answer, B41). recVol from a negative start is 0 (the C reads
+  before the string, B38); an ADPCM step index past the table is its
+  last entry (the C reads past it); a negative length to wav2alaw or
+  alaw2wav converts nothing (the C restarts, Known defect B36).
+- Codec: given up after half a second without DREQ, and then not
+  waited for until it raises DREQ again (the C waits for ever: a dead
+  codec keeps it from starting, Known defect). The reset pulse is the
+  C's DelayMs(1), which can be close to nothing: not a defect, the data
+  sheet asks two of the chip's clock cycles, and DREQ is waited for.
+  A command takes 8 us against the C's 5 (lapin reads every SPI byte
+  back); harmless.
+- Tag reader: the C's sequence and pauses, within 10 % of its time
+  (rfidGet 5 ms, rfidRead 12 ms). Left different: the field is closed
+  once after a scan that found nothing (the C twice); a tag write waits
+  the tags' 5 ms of programming before the field goes off (the C turns
+  it off at once and may cut the write short); the C retries a refused
+  write for ever, lapin a thousand times; a bus that does not come
+  free is tried again for 300 ms with interrupts let through (the C
+  polls a million times with them off) and a timed-out transfer sends
+  its stop (the C leaves the bus held). A field that reads back wrong
+  is told on the serial port, the scan goes on, as the C. I2C: status
+  cleared before the stop, as the C; a read of nothing reads nothing
+  (the C clocks two bytes into no buffer; nobody asks for none).
+- Flash: after an update the watchdog bites in 256 us, as the C (lapin
+  waited 2.1 s). A sector that already holds what it would be given is
+  not rewritten (the manual guarantees a hundred rewrites). The rest of
+  the image's last sector is erased (the C keeps the old bytes there;
+  the header's length and CRC make them meaningless).
+- Board: the volume wheel at 1 MHz as the C (lapin had 2). The rescue
+  core starts the watchdog first and sets the pins before checking the
+  application (they were set 76 ms later than the C's). An interrupt
+  that names the system timer when its source went away (manual 6.5.6)
+  is no millisecond. The UART's receiver is not wired: the C takes
+  its bytes in an interrupt for an XMODEM loader its main never calls.
+- Self-test: what it writes (the settings' first bytes, a tag block) it
+  puts back.
+
+**The first flash, measured.** `tests/first_flash.rs`: r3 writing
+`lapin-full.bin` over the air, unfed by its own routine, takes 1907 ms
+of the watchdog's 2097 with the flash's typical timings; with the
+manual's slowest (50 ms an erase) the watchdog bites after 21581 of
+28113 operations, the rescue core whole, which raises its network. A
+power cut anywhere after the rescue core's 20 KB leaves the rescue
+network; one during those (the first sixth of the write) leaves a dead
+rabbit. `docs/first-flash.md` is the checklist.
+
+**Harsher hardware.** The emulator can make the root hub's interrupt
+a level (`NABEMU_RHSC_LEVEL`), the USB interrupt line slow to fall
+(`NABEMU_IRQ_LAG`), the stick refuse or delay requests, lose a packet,
+be unplugged; the flash slowest. Every suite passes with the first two
+on, both firmwares.
+
 **Unverified assumptions.** In the emulator: flash erase and program
 times (from a comment in the C code, within the manual's maxima), ear
 speed, the stick's power-on beacon interval, what the stick reports
