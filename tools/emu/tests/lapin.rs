@@ -459,13 +459,16 @@ fn the_interpreter_outruns_the_c_one() {
         let mut lan = Lan::new();
         lan.handler = Box::new(move |_| Response::ok(served.clone()));
         m.lan = Some(lan);
-        m.run_until_ms(40_000);
-        let console = m.console();
-        console
-            .lines()
-            .filter_map(|l| l.strip_prefix('-')?.parse::<u64>().ok())
-            .next_back()
-            .unwrap_or_else(|| panic!("no time printed:\n{console}"))
+        let printed = |m: &Machine| {
+            m.console()
+                .lines()
+                .filter_map(|l| l.strip_prefix('-')?.parse::<u64>().ok())
+                .next_back()
+        };
+        while printed(&m).is_none() && m.soc.millis() < 60_000 {
+            m.run_until_ms(m.soc.millis() + 50);
+        }
+        printed(&m).unwrap_or_else(|| panic!("no time printed:\n{}", m.console()))
     };
     for (name, bytecode) in [("loop", &lp), ("fib 20", &fb)] {
         let (c, rust) = (time(&r3, bytecode), time(&lapin, bytecode));

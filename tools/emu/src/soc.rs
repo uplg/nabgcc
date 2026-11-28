@@ -367,6 +367,13 @@ pub struct Soc {
     pub trace: Option<Trace>,
     /// The I2C bus held low by a broken device: the master never gets it.
     pub i2c_jammed: bool,
+    /// Counts every access that may change the board's state (a store
+    /// that changes memory, any peripheral access but feeding the
+    /// watchdog): two turns of a loop with the same count in between
+    /// changed nothing. See [`crate::Machine`]'s idle skipping.
+    pub(crate) touched: u64,
+    /// Watchdog feeds, apart: a loop that feeds it is still idle.
+    pub(crate) feeds: u64,
 }
 
 /// Register writes to record: the addresses watched, and what was
@@ -421,6 +428,8 @@ impl Soc {
             unmodelled: BTreeSet::new(),
             trace: None,
             i2c_jammed: false,
+            touched: 0,
+            feeds: 0,
         }
     }
 
@@ -474,6 +483,44 @@ impl Soc {
     /// Advance time by the cycles one instruction took and update what
     /// depends on it.
     #[inline]
+    /// The board cycle of the next thing that happens on its own: a
+    /// timer overflow, a millisecond frame (USB, the board's inputs), the
+    /// watchdog, a character leaving the serial port, the flash done.
+    pub(crate) fn next_event(&self) -> u64 {
+        let mut next = self.next_frame;
+        if self.timer.enabled {
+            next = next.min(self.timer.next);
+        }
+        if let Some(at) = self.wdt.overflow_at() {
+            next = next.min(at);
+        }
+        if let Some(at) = self.uart.shifting_until {
+            next = next.min(at);
+        }
+        if self.flash_ctl.busy_until > self.cycles {
+            next = next.min(self.flash_ctl.busy_until);
+        }
+        next
+    }
+
+    /// Whether time runs at the board's own pace (cycles skipped are
+    /// the CPU's).
+    pub(crate) fn at_board_pace(&self) -> bool {
+        self.cpu_hz == CLOCK_HZ && self.ext_wait == 0
+    }
+
+    /// Let `cycles` pass with nothing happening, as the turns of a loop
+    /// that changes nothing would; `fed`: the loop feeds the watchdog,
+    /// fed again at the end as it would have been.
+    pub(crate) fn skip(&mut self, cycles: u64, fed: bool) {
+        self.cycles += cycles;
+        if fed && self.wdt.running {
+            let now = self.cycles;
+            self.watchdog_fed_at = now;
+            self.wdt.set_count(now, 0);
+        }
+    }
+
     pub fn tick(&mut self, cycles: u32) {
         // Instructions and bus waits are in CPU clocks; the board counts
         // time in cycles of 32 MHz.
@@ -792,6 +839,8 @@ impl Soc {
     // ---- memory-mapped registers --------------------------------------
 
     fn mmio_read(&mut self, addr: u32) -> u32 {
+        // Reads too: many clear what they report, or advance a FIFO.
+        self.touched += 1;
         match addr {
             IRQ => (self.irq_lines & 0xFFFF) as u32,
             IRN => match self.best_irq() {
@@ -925,6 +974,11 @@ impl Soc {
 
     /// `mask` tells which bits of the word the access really wrote.
     fn mmio_write(&mut self, addr: u32, val: u32, mask: u32) {
+        if addr == WDTCON && self.wdt.running {
+            self.feeds += 1;
+        } else {
+            self.touched += 1;
+        }
         let merged = (self.reg(addr) & !mask) | (val & mask);
         if let Some((watched, log)) = &mut self.trace
             && watched.contains(&addr)
@@ -1290,10 +1344,14 @@ impl Bus for Soc {
             return;
         }
         if addr >> 28 == 0 {
+            self.touched += 1;
             return self.flash_store(addr, val);
         }
         if let Some(m) = self.mem(addr, 1) {
-            m[0] = val;
+            if m[0] != val {
+                m[0] = val;
+                self.touched += 1;
+            }
         } else if Self::is_mmio(addr) {
             let sh = (addr & 3) * 8;
             self.mmio_write(addr & !3, (val as u32) << sh, 0xFF << sh);
@@ -1311,7 +1369,10 @@ impl Bus for Soc {
             return;
         }
         if let Some(m) = self.mem(addr, 2) {
-            m.copy_from_slice(&val.to_le_bytes());
+            if *m != val.to_le_bytes() {
+                m.copy_from_slice(&val.to_le_bytes());
+                self.touched += 1;
+            }
         } else if Self::is_mmio(addr) {
             let sh = (addr & 2) * 8;
             self.mmio_write(addr & !3, (val as u32) << sh, 0xFFFF << sh);
@@ -1329,7 +1390,10 @@ impl Bus for Soc {
             return;
         }
         if let Some(m) = self.mem(addr, 4) {
-            m.copy_from_slice(&val.to_le_bytes());
+            if *m != val.to_le_bytes() {
+                m.copy_from_slice(&val.to_le_bytes());
+                self.touched += 1;
+            }
         } else if Self::is_mmio(addr) {
             self.mmio_write(addr, val, 0xFFFF_FFFF);
         } else {

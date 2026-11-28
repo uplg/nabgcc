@@ -66,6 +66,24 @@ pub struct Machine {
     /// an interrupt with interrupts held back.
     pub masked_longest: u64,
     masked_since: Option<u64>,
+    /// Skip the turns of a loop that changes nothing, to the next thing
+    /// that happens (on unless `NABEMU_NO_SKIP` is set): the program
+    /// sees the same, much sooner.
+    pub skip_idle: bool,
+    idle: Option<Idle>,
+    /// Board cycles skipped so.
+    pub skipped: u64,
+}
+
+/// The state at the head of a loop, to tell an idle turn.
+#[derive(Clone, Copy, PartialEq)]
+struct Idle {
+    pc: u32,
+    r: [u32; 16],
+    cpsr: u32,
+    touched: u64,
+    feeds: u64,
+    cycles: u64,
 }
 
 impl Machine {
@@ -90,6 +108,9 @@ impl Machine {
             stack_low_words: Vec::new(),
             masked_longest: 0,
             masked_since: None,
+            skip_idle: std::env::var_os("NABEMU_NO_SKIP").is_none(),
+            idle: None,
+            skipped: 0,
         }
     }
 
@@ -141,7 +162,11 @@ impl Machine {
     #[inline]
     pub fn step(&mut self) {
         self.cpu.irq_line = self.soc.irq_asserted();
+        let before = self.cpu.pc();
         let cycles = self.cpu.step(&mut self.soc);
+        if self.skip_idle && self.cpu.pc() < before {
+            self.at_loop_head();
+        }
         // Before the firmware sets a stack, the register holds anything.
         let sp = self.cpu.r[13];
         if (soc::IRAM_BASE..soc::IRAM_BASE + soc::IRAM_SIZE as u32).contains(&sp) {
@@ -205,6 +230,44 @@ impl Machine {
             }
             self.cpu.reset();
         }
+    }
+
+    /// Just jumped back: the head of a loop. Two turns that end here
+    /// with the same registers and nothing touched in between (no store
+    /// that changed memory, no peripheral access but watchdog feeds) are
+    /// the same turn: every following one is too, until something
+    /// happens on its own. Skip those turns, whole, to just before it.
+    fn at_loop_head(&mut self) {
+        let now = Idle {
+            pc: self.cpu.pc(),
+            r: self.cpu.r,
+            cpsr: self.cpu.cpsr,
+            touched: self.soc.touched,
+            feeds: self.soc.feeds,
+            cycles: self.soc.cycles,
+        };
+        let same = |a: &Idle, b: &Idle| {
+            a.pc == b.pc && a.r == b.r && a.cpsr == b.cpsr && a.touched == b.touched
+        };
+        if let Some(last) = self.idle
+            && same(&last, &now)
+            && self.soc.at_board_pace()
+            && !(self.cpu.irq_line && self.cpu.cpsr & 0x80 == 0)
+        {
+            let turn = now.cycles - last.cycles;
+            let next = self.soc.next_event().min(self.next_air);
+            let turns = next.saturating_sub(now.cycles + 1) / turn.max(1);
+            if turn > 0 && turns > 0 {
+                let fed = now.feeds != last.feeds;
+                self.soc.skip(turns * turn, fed);
+                self.skipped += turns * turn;
+            }
+        }
+        self.idle = Some(Idle {
+            cycles: self.soc.cycles,
+            feeds: self.soc.feeds,
+            ..now
+        });
     }
 
     /// Unplug the rabbit and plug it back in.

@@ -28,7 +28,9 @@ fn run(image: &[u8], bytecode: &[u8]) -> Vec<u8> {
     let mut lan = Lan::new();
     lan.handler = Box::new(move |_| Response::ok(served.clone()));
     m.lan = Some(lan);
-    m.run_until_ms(40_000);
+    while find(&m.soc.uart_tx, b"8880").is_none() && m.soc.millis() < 60_000 {
+        m.run_until_ms(m.soc.millis() + 50);
+    }
     let out = &m.soc.uart_tx;
     let start = find(out, b"7770").unwrap_or_else(|| panic!("no output:\n{}", m.console()));
     let end = find(&out[start..], b"8880").expect("no end") + start;

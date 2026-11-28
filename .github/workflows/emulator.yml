@@ -2,18 +2,62 @@ name: emulator
 
 on:
   push:
-    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", ".github/workflows/emulator.yml"]
+    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", "scripts/ci-local.sh", ".github/**"]
   pull_request:
-    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", ".github/workflows/emulator.yml"]
+    paths: ["tools/emu/**", "lapin/**", "artifacts/*.sim", "scripts/ci-local.sh", ".github/**"]
 
+# Four jobs at once, each with its build cache; scripts/ci-local.sh runs
+# the same steps, one after the other.
 jobs:
-  test:
+  lapin:
+    name: lapin's crates and image
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lapin
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lapin
+      - run: sudo apt-get update && sudo apt-get install -y binutils-arm-none-eabi
+      - run: cargo test --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref
+      - run: ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lapin-images
+          path: lapin/target/*-full.bin
+
+  lints:
+    name: emulator lints
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: tools/emu
     steps:
       - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/emu
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
+
+  r3:
+    name: every test, on r3
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/emu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/emu
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Fetch the ARM7TDMI instruction test ROMs
         run: |
           mkdir -p tests/roms
@@ -23,27 +67,34 @@ jobs:
           77ee88662552bdc885c1080c0172ff119d54db791bd73b21808cf1ff1fe5b40e  tests/roms/arm.gba
           b5cb2291df4ab314b31c598acd9bff2ccfa0b38efff29daadfe97422ce369b67  tests/roms/thumb.gba
           SUMS
-      - name: Build the Rust firmware and test its portable crates
-        working-directory: lapin
-        run: |
-          sudo apt-get update && sudo apt-get install -y binutils-arm-none-eabi
-          (cd p256 && cargo test)
-          (cd core && cargo test)
-          (cd metal && cargo test)
-          (cd cref && cargo test --release)
-          ./build.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --release --all-targets -- -D warnings
-      - run: cargo test --release
+      - run: cargo nextest run --release --no-fail-fast
+      - run: cargo test --release --doc
+
+  on-lapin:
+    name: the acceptance tests, on lapin, and the browser build
+    needs: lapin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/emu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/emu
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - uses: actions/download-artifact@v8
+        with:
+          name: lapin-images
+          path: lapin/target
       - name: The same acceptance tests, on the Rust firmware
         env:
           NABEMU_FIRMWARE: lapin
-        run: >
-          cargo test --release --test boot --test board --test join --test link
-          --test network --test setup --test rfid --test factory --test flash --test garenne --test limits --test rescue --test hardening --test odd_audio --test wifi_review
+        run: cargo nextest run --release --no-fail-fast $(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
       - name: Build for the browser and test that build under Node
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
           web/build.sh
           node web/test.mjs

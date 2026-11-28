@@ -8,10 +8,7 @@ step() { printf '\n== %s\n' "$*"; }
 
 cd "$root/lapin"
 step "lapin: portable crates and the firmware"
-(cd p256 && cargo test)
-(cd core && cargo test)
-(cd metal && cargo test)
-(cd cref && cargo test --release)
+cargo test --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref
 ./build.sh
 
 cd "$root/tools/emu"
@@ -26,10 +23,11 @@ cargo clippy --release --all-targets -- -D warnings
 rustup target add aarch64-unknown-linux-gnu >/dev/null
 cargo clippy --release --all-targets --target aarch64-unknown-linux-gnu -- -D warnings
 step "emulator: every test, on r3"
-cargo test --release
+# nextest runs every test of every binary at once, on every core.
+cargo nextest run --release --no-fail-fast
+cargo test --release --doc
 step "the acceptance tests, on lapin"
-NABEMU_FIRMWARE=lapin cargo test --release --test boot --test board --test join --test link \
-    --test network --test setup --test rfid --test factory --test flash --test garenne --test limits --test rescue --test hardening --test odd_audio --test wifi_review
+NABEMU_FIRMWARE=lapin cargo nextest run --release --no-fail-fast $(sed -n 's/^lapin_suites: //p' "$root/.github/lapin-suites")
 step "the browser build"
 cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings
 web/build.sh

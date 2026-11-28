@@ -26,3 +26,13 @@ opt-level = 2
 # times as long, for 160 bytes saved.
 [profile.release.package.lapin-metal]
 opt-level = 2
+
+# The portable crates' tests on the host: optimised (the curve and the
+# machine are slow unoptimised) but without the firmware's LTO and
+# single codegen unit, which only cost build time there.
+[profile.host]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = false
+incremental = true
