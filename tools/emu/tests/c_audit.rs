@@ -131,6 +131,31 @@ fn a_frame_longer_than_2_kb_slips_nothing_in_and_deafens_nobody() {
     }
 }
 
+/// A stick that hands over a transfer longer than any frame it should
+/// pass (4500 bytes, past MAC_CSR6's 4095): lapin's reassembly buffer,
+/// which holds the longest transfer, overflows; what follows is dropped
+/// up to the transfer's end, so a descriptor forged past the buffer
+/// slips nothing in, and the next frame is heard (r3: deaf, as above).
+#[test]
+fn a_transfer_past_the_reassembly_buffer_is_dropped_to_its_end() {
+    let mut m = with_an_address(wpa2());
+    m.radio.borrow_mut().rx_any_length = true;
+    // lapin's buffer ends at 4160, a whole packet: the forged
+    // descriptor starts the packet after the one that overflows.
+    m.radio
+        .borrow_mut()
+        .rx
+        .push_back(RxFrame::new(oversized(4500, 4224)));
+    wait(&mut m, 2000);
+    assert_eq!(arp_replies(&m), 0, "the forged frame went in");
+    let replies = answers_arp(&mut m);
+    if is_lapin() {
+        assert_eq!(replies, 1, "lapin still hears");
+    } else {
+        assert_eq!(replies, 0, "Known defect: r3 deaf after an overrun");
+    }
+}
+
 /// A receive packet the USB controller gives up on: lapin glued what
 /// followed to the frame it lost a packet of (M11); now it drops the
 /// rest of that transfer, and hears the next frames as r3 does.

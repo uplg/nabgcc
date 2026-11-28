@@ -33,6 +33,8 @@ const PHY_CSR3: usize = 0x308C;
 const PHY_CSR4: usize = 0x3090;
 
 const TXRX_CSR9: usize = 0x3064;
+/// The longest frame the receiver passes (bits 0-11).
+const MAC_CSR6: usize = 0x3018;
 const HW_BEACON_BASE0: usize = 0x2400;
 /// Power-on value of TXRX_CSR9: a beacon interval of 100 time units.
 /// The firmware never writes the interval and its beacons announce
@@ -138,6 +140,10 @@ pub struct Radio {
     /// This packet (counting from 0) of the next frame handed over the
     /// bulk endpoint in fails (a stall) and its bytes are lost.
     pub lose_rx_packet: Option<usize>,
+    /// Frames longer than MAC_CSR6 allows are handed over all the same,
+    /// as a broken (or lying) stick might: the firmware's reassembly
+    /// then sees a transfer longer than any it should.
+    pub rx_any_length: bool,
     /// Every baseband register write, in order: (register, value).
     pub bbp_writes: Vec<(u8, u8)>,
 }
@@ -479,7 +485,9 @@ impl Rt2573 {
                 let to = f.data.get(4..10).unwrap_or(&[]);
                 let group = to.first().is_some_and(|b| b & 1 != 0);
                 let mine = to == radio.mac;
-                if !radio.rx_enabled || f.data.len() < 10 || !(group || mine) {
+                let max = (self.word(MAC_CSR6) & 0xFFF) as usize;
+                let too_long = max != 0 && f.data.len() > max && !radio.rx_any_length;
+                if !radio.rx_enabled || f.data.len() < 10 || !(group || mine) || too_long {
                     radio.rx_dropped += 1;
                     continue;
                 }
