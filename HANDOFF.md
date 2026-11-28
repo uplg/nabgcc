@@ -86,21 +86,41 @@ Done since:
   takes the new bytecode's last global off the stack. Harmless to
   every bytecode served today, by the accident of where their last
   string sits; see "Deliberate differences from r3".
+- **Receive throughput in a crowded band.** The OHCI controller hands
+  its done descriptors over once a frame (1 ms), so the transfers in
+  flight bound what comes off the stick: lapin had four of one packet
+  (two frames a millisecond), r3 has one (half a frame). It now keeps
+  eight of two packets in flight (eight frames a millisecond, 1 KB of
+  the controller's RAM, taken from a control buffer and a transmit
+  buffer larger than any frame); a failed descriptor hands over the
+  packets that went through, then the loss. The scan could not read
+  eight frames a millisecond: an open network's beacon is no longer
+  hashed, and once the queue is half full a second announcement of a
+  network already queued during the scan is dropped in the interrupt.
+  A pump of the queue stops after 20 ms (frames coming faster than they
+  are handled starved the watchdog). With 200 neighbours beaconing
+  every 20 ms (`crowded.rs`, every phase of their round, a millisecond
+  at a time) lapin lists all 201 networks, where it listed 120 to 201
+  and r3 lists 168 to 177; the scan is unchanged (1.92 s from the
+  first probe to channel 14's end, r3 5.24 s). The emulator now gives
+  a full-speed frame its bus time (19 bulk packets of 64 bytes at
+  most, USB 2.0 table 5-10) and leaves a failed descriptor's buffer
+  pointer after the packets that went through, as the controller does.
+  Its air carries more than a real channel could (ten beacons a
+  millisecond, at 1 Mb/s one takes 0.7 ms): `crowded.rs` is a stress
+  test, not a building.
 
-Open, in this order:
+Open:
 
-1. **Receive throughput in a crowded band**: lapin takes about two
-   frames a millisecond off the stick; with 200 neighbours beaconing
-   every 20 ms (`crowded.rs`) it lists 100 to 200 of them depending on
-   their phase, where r3 lists 175 (the home network always). Worth a
-   look at the receive transfers in flight.
-2. **cargo-mutants** only on Léonard's go; nose gates the code it adds.
+1. **cargo-mutants** only on Léonard's go; nose gates the code it adds.
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 111.2
-KB (113 840 bytes), the boot bytecode's 27.6 KB included, packed to 16
-KB, and the rescue core's 20 KB (19 380 bytes used of its 20 472, the first image's unpacker in them): 12.8 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 113.0
+KB (115 692 bytes), the boot bytecode's 27.6 KB included, packed to 16
+KB, and the rescue core's 20 KB (19 884 bytes used of its 20 472, the
+first image's unpacker in them): 11.0 KB left. `lapin-first.bin` is
+81 499 bytes, 20 sectors and 421 bytes short of a 21st. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
