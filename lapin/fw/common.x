@@ -53,6 +53,13 @@ SECTIONS
     *(.vmem .vmem.*)
   } > XRAM
 
+  /* Scratch space above the bytecode's memory: the 64 KB below it are
+     nearly full. */
+  .xram_high (NOLOAD) : ALIGN(4)
+  {
+    *(.xram_high .xram_high.*)
+  } > XRAM
+
   ASSERT(__bss_end <= __stack_top - __irq_stack_size - 12K - 2K,
          "the internal RAM's data leaves too little room for the stacks")
 

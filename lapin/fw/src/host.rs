@@ -11,9 +11,13 @@ use crate::wifi::link::Radio;
 use crate::wifi::rt2573::{self, Stick};
 use crate::{board, codec, flash, i2c, led, rfid, timer, uart, watchdog};
 
-/// How many scan results are kept for the bytecode; the C driver put
-/// them all on the machine's stack, every beacon of every network.
-pub const SCAN_RESULTS: usize = 96;
+/// How many networks a scan keeps for the bytecode. The C driver put
+/// every frame it heard on the machine's stack, as many as the heap
+/// held; here frames of the same network (BSSID and name) are merged,
+/// the strongest kept, so this counts networks: a dense block of flats
+/// is heard as one or two hundred on 2.4 GHz. 256 of 52 bytes, 13 KB of
+/// the external RAM's 156 KB above the machine's memory.
+pub const SCAN_RESULTS: usize = 256;
 
 pub struct Board {
     pub stick: Option<&'static mut Stick>,
@@ -104,6 +108,24 @@ fn link<'a>(stick: &'a mut Option<&'static mut Stick>, pool: &'a mut Pool) -> Op
         stick: stick.as_deref_mut()?,
         pool,
     })
+}
+
+/// Where a frame heard during a scan goes among the `kept` networks:
+/// over the same network (BSSID and name) if it is heard stronger, at
+/// the end if it is new and there is room, else over the weakest if it
+/// is stronger than that; `None` to drop it.
+fn merge(kept: &[ScanResult], heard: &ScanResult) -> Option<usize> {
+    if let Some(i) = kept
+        .iter()
+        .position(|k| k.bssid == heard.bssid && k.ssid == heard.ssid)
+    {
+        return (heard.rssi > kept[i].rssi).then_some(i);
+    }
+    if kept.len() < SCAN_RESULTS {
+        return Some(kept.len());
+    }
+    let (weakest, k) = kept.iter().enumerate().min_by_key(|(_, k)| k.rssi)?;
+    (heard.rssi > k.rssi).then_some(weakest)
 }
 
 /// The bytes before the first zero.
@@ -286,19 +308,22 @@ impl Host for Board {
         };
         self.station
             .scan(&mut radio, ssid.map(cstr), frame, &mut |r| {
-                if n < SCAN_RESULTS {
-                    let mut ssid = [0u8; 33];
-                    ssid[..r.ssid_len].copy_from_slice(&r.ssid[..r.ssid_len]);
-                    scan[n] = ScanResult {
-                        ssid,
-                        mac: r.mac,
-                        bssid: r.bssid,
-                        rssi: r.rssi,
-                        channel: r.channel,
-                        rateset: r.rateset,
-                        encryption: r.encryption,
-                    };
-                    n += 1;
+                let mut ssid = [0u8; 33];
+                ssid[..r.ssid_len].copy_from_slice(&r.ssid[..r.ssid_len]);
+                let heard = ScanResult {
+                    ssid,
+                    mac: r.mac,
+                    bssid: r.bssid,
+                    rssi: r.rssi,
+                    channel: r.channel,
+                    rateset: r.rateset,
+                    encryption: r.encryption,
+                };
+                if let Some(slot) = merge(&scan[..n], &heard) {
+                    if slot == n {
+                        n += 1;
+                    }
+                    scan[slot] = heard;
                 }
             });
         self.held = None;

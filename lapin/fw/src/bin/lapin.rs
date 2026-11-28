@@ -33,7 +33,7 @@ static mut STATION: MaybeUninit<Station> = MaybeUninit::uninit();
 static mut STICK: MaybeUninit<Stick> = MaybeUninit::uninit();
 #[unsafe(link_section = ".xram.frame")]
 static mut FRAME: [u8; 2400] = [0; 2400];
-#[unsafe(link_section = ".xram.scan")]
+#[unsafe(link_section = ".xram_high.scan")]
 static mut SCAN: MaybeUninit<[ScanResult; SCAN_RESULTS]> = MaybeUninit::uninit();
 
 // `&mut *&raw mut` is how a static is borrowed once, by hand.
