@@ -24,10 +24,15 @@ pub enum Error {
     NoSuchTag,
 }
 
+/// Again while the reader refuses, not when the bus is stuck: a bus held
+/// low would take a thousand waits each time (and the C's driver hangs
+/// on it).
 fn write(data: &[u8]) -> Result<(), Error> {
     for _ in 0..TRIES {
-        if i2c::write(READER, data).is_ok() {
-            return Ok(());
+        match i2c::write(READER, data) {
+            Ok(()) => return Ok(()),
+            Err(i2c::Failed::Stuck) => return Err(Error::Reader),
+            Err(i2c::Failed::Refused) => {}
         }
     }
     Err(Error::Reader)
@@ -35,8 +40,10 @@ fn write(data: &[u8]) -> Result<(), Error> {
 
 fn read(data: &mut [u8]) -> Result<(), Error> {
     for _ in 0..TRIES {
-        if i2c::read(READER, data).is_ok() {
-            return Ok(());
+        match i2c::read(READER, data) {
+            Ok(()) => return Ok(()),
+            Err(i2c::Failed::Stuck) => return Err(Error::Reader),
+            Err(i2c::Failed::Refused) => {}
         }
     }
     Err(Error::Reader)

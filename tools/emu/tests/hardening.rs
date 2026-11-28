@@ -177,6 +177,37 @@ mod rescue_network {
         m
     }
 
+    /// The rescue network's beacons as phones expect them: the rates of
+    /// 802.11b, the channel, and a TIM (the standard requires one in a
+    /// beacon; it had none).
+    #[test]
+    fn the_rescue_beacon_carries_rates_and_a_tim() {
+        let Some(image) = image() else { return };
+        let mut m = Machine::from_file(&image).0;
+        m.soc.flash[RESCUE..RESCUE + 4096].fill(0xFF);
+        until(&mut m, 20_000, "the rescue network", |m| {
+            m.console().contains("secours: network up")
+        });
+        m.run_until_ms(m.soc.millis() + 500);
+        let radio = m.radio.borrow();
+        let beacon = radio
+            .tx
+            .iter()
+            .map(|t| t.data.clone())
+            .find(|f| f.first() == Some(&0x80))
+            .expect("a beacon");
+        let mut ies = std::collections::BTreeMap::new();
+        let mut at = 36;
+        while at + 2 <= beacon.len() {
+            let (id, len) = (beacon[at], beacon[at + 1] as usize);
+            ies.insert(id, beacon[at + 2..at + 2 + len].to_vec());
+            at += 2 + len;
+        }
+        assert_eq!(ies[&1], [0x82, 0x04, 0x0B, 0x16], "rates");
+        assert_eq!(ies[&3], [1], "channel");
+        assert_eq!(ies[&5], [0, 1, 0, 0], "TIM");
+    }
+
     /// A length that wraps past the end of the request: refused, where
     /// it used to panic the rescue core into a restart.
     #[test]
@@ -300,4 +331,90 @@ mod rescue_network {
             c[c.rfind("secours: back").unwrap()..].contains("lapin 0.1")
         });
     }
+}
+
+/// A stick that stops taking frames to send: for a few seconds, the
+/// frames caught in it are dropped and the rabbit sends again once it
+/// takes them; for good, the rabbit starts again from scratch, which
+/// brings the stick up anew. Before, one transfer that never went left
+/// the rabbit mute for good.
+#[test]
+fn a_stick_that_stops_sending_is_got_going_again() {
+    let Some(image) = image() else { return };
+    let mut m = on_open_network(&image);
+    until(&mut m, 30_000, "the stick up", |m| {
+        m.console().contains("wifi ")
+    });
+    m.run_until_ms(m.soc.millis() + 5000);
+
+    // A while.
+    m.radio.borrow_mut().tx_stuck = true;
+    m.run_until_ms(m.soc.millis() + 3000);
+    m.radio.borrow_mut().tx_stuck = false;
+    let sent = m.radio.borrow().tx.len();
+    until(&mut m, 20_000, "a frame sent again", |m| {
+        m.radio.borrow().tx.len() > sent
+    });
+    assert_eq!(m.events, [], "a short stall needs no restart");
+
+    // For good.
+    m.radio.borrow_mut().tx_stuck = true;
+    until(&mut m, 40_000, "the restart", |m| !m.events.is_empty());
+    assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
+}
+
+/// The routines that write the flash sit in the internal RAM from the
+/// start: overwritten there since (a stray write), an update still
+/// goes through, as they are copied afresh from the flash first.
+#[test]
+fn flash_routines_overwritten_in_ram_still_write_the_update() {
+    let Some(image) = image() else { return };
+    let mut m = on_open_network(&image);
+    let mut lan = Lan::new();
+    let flasher = metal::boot_response(&metal::flash_firmware(&image));
+    lan.handler = Box::new(move |_| Response::ok(flasher.clone()));
+    m.lan = Some(lan);
+    until(&mut m, 30_000, "the stick up", |m| {
+        m.console().contains("wifi ")
+    });
+    // Both routines, from the first word of the RAM after the slots.
+    m.soc.iram[0x10..0x150].fill(0xA5);
+    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    assert_eq!(m.events[0], Event::Reset(ResetCause::Watchdog));
+    assert!(m.soc.flash_erases > 0, "nothing written");
+    assert!(
+        m.soc.flash[..image.len()] == image[..],
+        "the image in place"
+    );
+}
+
+/// A tag reader that holds the I2C bus, under a bytecode asking for
+/// tags all the time: each wait on it gives up within milliseconds and
+/// is not tried again, so interrupts are never held back long and the
+/// rabbit keeps running (the C hangs on it; lapin used to restart over
+/// and over, the watchdog starved by a thousand tries of each).
+#[test]
+fn a_jammed_i2c_bus_never_holds_interrupts_back_long() {
+    let Some(image) = image() else { return };
+    let mut m = on_open_network(&image);
+    // A bytecode that asks the reader for a tag, again and again.
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.extend([metal::OP_RFID_GET, metal::OP_DROP, 28, 0, 0]);
+    let poll = metal::boot_response(&metal::bytecode(&[], &f));
+    let mut lan = Lan::new();
+    lan.handler = Box::new(move |_| Response::ok(poll.clone()));
+    m.lan = Some(lan);
+    until(&mut m, 60_000, "the polling bytecode", |m| {
+        !m.lan.as_ref().unwrap().requests.is_empty()
+    });
+    m.run_until_ms(m.soc.millis() + 2000);
+    m.masked_longest = 0;
+    let exchanges = m.soc.board.rfid.exchanges;
+    m.soc.i2c_jammed = true;
+    m.run_until_ms(m.soc.millis() + 20_000);
+    assert!(exchanges > 0, "the reader was never asked");
+    assert_eq!(m.events, []);
+    let ms = m.masked_longest * 1000 / nabemu::soc::CLOCK_HZ;
+    eprintln!("interrupts held back {ms} ms at most");
+    assert!(ms < 20, "interrupts held back {ms} ms");
 }

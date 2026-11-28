@@ -33,11 +33,17 @@ SECTIONS
   .data : ALIGN(4)
   {
     __data_start = .;
+    /* First: the flash routines, copied again before every use. */
+    __ramcode_start = .;
+    *(.data.ramcode .data.ramcode.*)
+    . = ALIGN(4);
+    __ramcode_end = .;
     *(.data .data.*)
     . = ALIGN(4);
     __data_end = .;
   } > RAM AT > FLASH
   __data_load = LOADADDR(.data);
+  __ramcode_load = LOADADDR(.data);
 
   .bss (NOLOAD) : ALIGN(4)
   {

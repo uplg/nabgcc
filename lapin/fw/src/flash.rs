@@ -146,6 +146,32 @@ unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize, to: usi
     }
 }
 
+unsafe extern "C" {
+    static mut __ramcode_start: u32;
+    static mut __ramcode_end: u32;
+    static __ramcode_load: u32;
+}
+
+/// Copy the routines that run from RAM afresh from the flash, right
+/// before they run: whatever wrote over the RAM since the start (a stray
+/// write, an overflowing stack) never runs with the flash busy.
+fn refresh_ramcode() {
+    // SAFETY: the linker's bounds of the RAM routines and of their
+    // copy in the flash, word aligned; nothing runs them meanwhile (the
+    // callers hold interrupts back, and only they call them).
+    unsafe {
+        let mut to = &raw mut __ramcode_start;
+        let end = &raw mut __ramcode_end;
+        let mut from = &raw const __ramcode_load;
+        while to < end {
+            to.write_volatile(from.read_volatile());
+            to = to.add(1);
+            from = from.add(1);
+        }
+    }
+    crate::sync::barrier();
+}
+
 /// Replace the firmware with `image` and restart on it: the end of
 /// this firmware. `image` must be word aligned and lie outside the
 /// flash. An image that brings the rescue core in place rewrites the
@@ -158,6 +184,7 @@ pub fn write_firmware(image: &[u8]) -> ! {
     let len = part.len().min(SETTINGS - to);
     irq::irq_disable();
     watchdog::feed();
+    refresh_ramcode();
     // SAFETY: interrupts are off for good, the routine runs from RAM
     // and never returns into the flash it rewrites; `to` is a sector
     // boundary and the length stops below the settings.
@@ -173,6 +200,7 @@ pub fn write_app(app: &[u8]) -> ! {
     };
     irq::irq_disable();
     watchdog::feed();
+    refresh_ramcode();
     // SAFETY: as in `write_firmware`; the application's place starts on
     // a sector boundary and ends below the settings (checked).
     unsafe { flash_image_from_ram(app.as_ptr().cast(), len, crate::boot::APP_BASE) }
@@ -205,6 +233,7 @@ pub fn write_settings_at(offset: usize, data: &[u8]) {
     let len = data.len().min(SECTOR - offset);
     irq::free(|| {
         watchdog::feed();
+        refresh_ramcode();
         // SAFETY: interrupts are off, so nobody else is in the scratch
         // buffer; it is in RAM and word aligned, the address is the
         // settings sector, and the routine itself runs from RAM.

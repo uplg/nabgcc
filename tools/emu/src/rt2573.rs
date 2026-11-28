@@ -102,6 +102,9 @@ pub struct Radio {
     /// tunes only on its own synthesiser words; the other two (1 an
     /// RT5226, 3 an RT5225) are named to the firmware but not modelled.
     pub rf_chip: u8,
+    /// The bulk endpoint out answers NAK to every packet while set: a
+    /// stick that has stopped taking frames to send.
+    pub tx_stuck: bool,
 }
 
 pub type SharedRadio = Rc<RefCell<Radio>>;
@@ -563,6 +566,7 @@ impl UsbDevice for Rt2573 {
     fn data_out(&mut self, ep: u8, data: &[u8]) -> Xfer {
         match ep {
             0 => self.ctrl.data_out(data),
+            1 if self.radio.borrow().tx_stuck => Xfer::Nak,
             1 => {
                 self.out.extend_from_slice(data);
                 if data.len() < PACKET {

@@ -199,24 +199,36 @@ fn a_power_cut_anywhere_in_an_update_leaves_a_rabbit_that_comes_back() {
     let Some(image) = image() else { return };
     // One erase per sector, one program per word: about 25 000 steps.
     let steps = (image.len() - RESCUE).div_ceil(4096) + (image.len() - RESCUE) / 4;
-    for i in 0..=16 {
-        let at = (steps * i / 16).max(1) as u64;
-        let mut m = rabbit(&image, metal::flash_firmware(&image));
-        m.soc.cut_power_after_flash_ops = Some(at);
-        until(&mut m, 60_000, "the power cut", |m| !m.events.is_empty());
-        let said = m.console().len();
-        until(&mut m, 20_000, "the rabbit coming back", |m| {
-            let after = &m.console()[said..];
-            after.contains("secours: network up") || after.contains("lapin 0.1")
-        });
-        let after = m.console()[said..].to_string();
-        eprintln!(
-            "cut after {at} of {steps} steps: {}",
-            if after.contains("secours") {
-                "rescue network"
-            } else {
-                "application"
-            }
-        );
+    // Each cut on its own machine, all at once: one test, every core.
+    let outcomes: Vec<(u64, &str)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..=16)
+            .map(|i| {
+                let image = &image;
+                scope.spawn(move || {
+                    let at = (steps * i / 16).max(1) as u64;
+                    let mut m = rabbit(image, metal::flash_firmware(image));
+                    m.soc.cut_power_after_flash_ops = Some(at);
+                    until(&mut m, 60_000, "the power cut", |m| !m.events.is_empty());
+                    let said = m.console().len();
+                    until(&mut m, 20_000, "the rabbit coming back", |m| {
+                        let after = &m.console()[said..];
+                        after.contains("secours: network up") || after.contains("lapin 0.1")
+                    });
+                    let rescued = m.console()[said..].contains("secours");
+                    (
+                        at,
+                        if rescued {
+                            "rescue network"
+                        } else {
+                            "application"
+                        },
+                    )
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (at, how) in outcomes {
+        eprintln!("cut after {at} of {steps} steps: {how}");
     }
 }

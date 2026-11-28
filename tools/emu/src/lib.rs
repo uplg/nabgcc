@@ -62,6 +62,10 @@ pub struct Machine {
     /// The program stack's words at its deepest, from the top of the
     /// stack pointer up: the return addresses in it say how it got there.
     pub stack_low_words: Vec<u32>,
+    /// The longest stretch, in board cycles, the program spent outside
+    /// an interrupt with interrupts held back.
+    pub masked_longest: u64,
+    masked_since: Option<u64>,
 }
 
 impl Machine {
@@ -84,6 +88,8 @@ impl Machine {
             stack_low: [u32::MAX; 32],
             stack_low_pc: [0; 32],
             stack_low_words: Vec::new(),
+            masked_longest: 0,
+            masked_since: None,
         }
     }
 
@@ -153,6 +159,13 @@ impl Machine {
                         .collect();
                 }
             }
+        }
+        let mode = self.cpu.mode() & 0x1F;
+        if self.cpu.cpsr & 0x80 != 0 && matches!(mode, 0x10 | 0x13 | 0x1F) {
+            let since = *self.masked_since.get_or_insert(self.soc.cycles);
+            self.masked_longest = self.masked_longest.max(self.soc.cycles - since);
+        } else {
+            self.masked_since = None;
         }
         if let Trap::Undefined { addr, opcode } = self.cpu.last_trap {
             self.events.push(Event::Undefined { addr, opcode });

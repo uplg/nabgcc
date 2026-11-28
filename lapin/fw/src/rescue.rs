@@ -70,6 +70,10 @@ unsafe impl Sync for Upload {}
 #[unsafe(link_section = ".xram.upload")]
 static UPLOAD: Upload = Upload(core::cell::UnsafeCell::new([0; 128 * 1024]));
 
+/// Supported rates: 802.11b's four, 1 Mbit/s the basic one (all the
+/// rescue core sends at), which phones expect to find.
+const RATES: [u8; 6] = [1, 4, 0x82, 0x04, 0x0B, 0x16];
+
 pub struct Rescue {
     mac: [u8; 6],
     ssid: [u8; 21],
@@ -179,8 +183,18 @@ impl Rescue {
         f[at + 1] = ssid.len() as u8;
         f[at + 2..at + 2 + ssid.len()].copy_from_slice(&ssid);
         at += 2 + ssid.len();
-        f[at..at + 6].copy_from_slice(&[1, 1, 0x82, 3, 1, CHANNEL]);
-        at + 6
+        f[at..at + 6].copy_from_slice(&RATES);
+        at += 6;
+        f[at..at + 3].copy_from_slice(&[3, 1, CHANNEL]);
+        at += 3;
+        if fc0 == 0x80 {
+            // A beacon carries a TIM (802.11-2020 9.3.3.2): every beacon a
+            // DTIM, nothing buffered (frames are never held back for a
+            // station that dozes).
+            f[at..at + 6].copy_from_slice(&[5, 4, 0, 1, 0, 0]);
+            at += 6;
+        }
+        at
     }
 
     fn send(&self, stick: &mut Stick, len: usize, ack: bool) {
@@ -280,8 +294,8 @@ impl Rescue {
             (0x00, 0) if for_us => {
                 let n = self.header(0x10, 0, &a2);
                 self.frame[n..n + 6].copy_from_slice(&[0x01, 0, 0, 0, 0x01, 0xC0]);
-                self.frame[n + 6..n + 9].copy_from_slice(&[1, 1, 0x82]);
-                self.send(stick, n + 9, true);
+                self.frame[n + 6..n + 12].copy_from_slice(&RATES);
+                self.send(stick, n + 12, true);
                 self.peer = Some(a2);
             }
             (0xA0 | 0xC0, 0) if for_us && self.peer == Some(a2) => {

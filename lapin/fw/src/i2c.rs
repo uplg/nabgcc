@@ -20,11 +20,21 @@ const ST_ARBITRATION_LOST: u16 = 1 << 4;
 const ST_BUSY: u16 = 1 << 5;
 const ST_DONE: u16 = 1 << 7;
 
-/// Polls before giving up on the bus.
-const PATIENCE: u32 = 1_000_000;
+/// Polls before giving up on the bus: a few milliseconds, where a byte
+/// takes a tenth of one. The C waits a million polls, about half a
+/// second, but with interrupts on; these waits hold them back, so a
+/// jammed bus must not hold them long.
+const PATIENCE: u32 = 20_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Failed;
+pub enum Failed {
+    /// The device did not answer, or another master took the bus: try
+    /// again (the tag reader does not answer while it talks to a tag).
+    Refused,
+    /// The bus never came free, or a transfer never ended: something
+    /// holds it, trying again only waits longer.
+    Stuck,
+}
 
 pub fn init() {
     CONTROL.set(ENABLE);
@@ -39,7 +49,7 @@ fn wait(mask: u16, wanted: u16) -> Result<(), Failed> {
             return Ok(());
         }
     }
-    Err(Failed)
+    Err(Failed::Stuck)
 }
 
 /// Send a start and the address, and check the device answers.
@@ -49,7 +59,7 @@ fn start(address: u8) -> Result<(), Failed> {
     CONTROL.set(MASTER);
     if STATUS.read() & ST_ARBITRATION_LOST != 0 {
         STATUS.write(0);
-        return Err(Failed);
+        return Err(Failed::Refused);
     }
     wait(ST_DONE, ST_DONE)?;
     acknowledged()
@@ -58,7 +68,7 @@ fn start(address: u8) -> Result<(), Failed> {
 fn acknowledged() -> Result<(), Failed> {
     if STATUS.read() & ST_NO_ACK != 0 {
         stop();
-        return Err(Failed);
+        return Err(Failed::Refused);
     }
     Ok(())
 }

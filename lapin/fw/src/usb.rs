@@ -128,6 +128,9 @@ static PORT_CHANGED: Shared<bool> = Shared::new(false);
 static TX_BUSY: Shared<bool> = Shared::new(false);
 /// When the transfer out on its way was queued.
 static TX_AT: Shared<u32> = Shared::new(0);
+/// Since when transfers out have been taken back without one going
+/// through (0: none is). One word: the interrupt clears it.
+static STUCK_SINCE: Shared<u32> = Shared::new(0);
 static BROKEN: Shared<bool> = Shared::new(false);
 /// What takes the packets received on the bulk endpoint.
 type PacketHandler = fn(&[u8]);
@@ -287,6 +290,7 @@ fn retire(td: usize) {
             clear_halt(ED_OUT);
         }
         TX_BUSY.set(false);
+        STUCK_SINCE.set(0);
     } else if condition != 0 {
         // A failed stage ends the control transfer: drop the others.
         let tail = word(ED_CONTROL + 4).read();
@@ -529,14 +533,26 @@ pub fn tx_busy() -> bool {
 /// false, without calling `fill`, while the previous transfer is still
 /// on its way.
 pub fn transmit(len: usize, fill: impl FnOnce(&mut [u8])) -> bool {
-    if tx_busy() && timer::millis().wrapping_sub(TX_AT.get()) > 1000 {
-        // A second on its way: the stick will not take it. Take it back
-        // from the controller, as a control transfer that timed out, or
-        // nothing would ever be sent again.
+    let now = timer::millis();
+    if tx_busy() && now.wrapping_sub(TX_AT.get()) > 1000 {
+        // A second on its way: the stick will not take it. Ten seconds of
+        // that and it is not coming back: start again from scratch, which
+        // brings the stick up anew.
+        let since = match STUCK_SINCE.get() {
+            0 => now.max(1),
+            t => t,
+        };
+        if now.wrapping_sub(since) > 10_000 {
+            watchdog::reset_now();
+        }
+        STUCK_SINCE.set(since);
+        // Take the frame back from the controller (it is lost, as on the
+        // air), keeping the data toggle the stick expects next.
         irq::free(|| {
             word(ED_OUT).write(word(ED_OUT).read() | ED_SKIP);
             timer::delay_ms(2);
-            word(ED_OUT + 8).write(word(ED_OUT + 4).read());
+            let toggle = word(ED_OUT + 8).read() & 2;
+            word(ED_OUT + 8).write(word(ED_OUT + 4).read() | toggle);
             word(ED_OUT).write(word(ED_OUT).read() & !ED_SKIP);
             TX_BUSY.set(false);
         });

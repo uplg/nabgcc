@@ -362,7 +362,16 @@ pub struct Soc {
     /// register, or registers read before any write whose value after a
     /// reset is undefined (see [`crate::regmap`]).
     pub unmodelled: BTreeSet<u32>,
+    /// When set, every register write to one of these addresses is
+    /// recorded: (board cycle, address, value after the write).
+    pub trace: Option<Trace>,
+    /// The I2C bus held low by a broken device: the master never gets it.
+    pub i2c_jammed: bool,
 }
+
+/// Register writes to record: the addresses watched, and what was
+/// written to them (board cycle, address, value after the write).
+pub type Trace = (Vec<u32>, Vec<(u64, u32, u32)>);
 
 impl Default for Soc {
     fn default() -> Self {
@@ -410,6 +419,8 @@ impl Soc {
             pending_reset: None,
             bus_faults: BTreeSet::new(),
             unmodelled: BTreeSet::new(),
+            trace: None,
+            i2c_jammed: false,
         }
     }
 
@@ -890,6 +901,7 @@ impl Soc {
             FTM0GR => self.board.ear_count(0) as u32,
             FTM1GR => self.board.ear_count(1) as u32,
             // I2C: transfer complete, bus free; bit 0 is "no acknowledge".
+            I2CSR if self.i2c_jammed => 0x20,
             I2CSR => 0x80 | self.i2c.nak as u32,
             I2CDR => {
                 if self.i2c.active && self.i2c.reading {
@@ -914,6 +926,11 @@ impl Soc {
     /// `mask` tells which bits of the word the access really wrote.
     fn mmio_write(&mut self, addr: u32, val: u32, mask: u32) {
         let merged = (self.reg(addr) & !mask) | (val & mask);
+        if let Some((watched, log)) = &mut self.trace
+            && watched.contains(&addr)
+        {
+            log.push((self.cycles, addr, merged));
+        }
         match addr {
             CIL => self.cil &= !(val & mask),
             CILCL => {
