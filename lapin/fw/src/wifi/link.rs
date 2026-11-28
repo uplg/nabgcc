@@ -22,6 +22,9 @@ pub struct Radio<'a> {
     pub pool: &'a mut Pool,
 }
 
+/// Protected frames whose IVs went to the serial port.
+static IVS_LOGGED: Shared<u8> = Shared::new(0);
+
 /// Frames that could not be handed to the stick in time.
 pub static TX_LOST: Shared<u32> = Shared::new(0);
 
@@ -86,6 +89,17 @@ impl Link for Radio<'_> {
 
     fn receive(&mut self, buffer: &mut [u8]) -> Option<Rx> {
         let got = self.stick.receive(buffer)?;
+        // The replay check rests on the receive descriptor's words 2 and
+        // 3 (read as rt73usb reads them; the C never did): the first few
+        // on the serial port, for the first rabbit to confirm them.
+        if got.decrypted && IVS_LOGGED.get() < 4 {
+            IVS_LOGGED.set(IVS_LOGGED.get() + 1);
+            crate::uart::write(b"wifi rx iv ");
+            for byte in got.iv.to_be_bytes().iter().chain(&got.eiv.to_be_bytes()) {
+                crate::uart::hex8(*byte);
+            }
+            crate::uart::write(b"\n");
+        }
         // Arrival time, strength and the first bytes: what an onlooker
         // cannot know exactly.
         let mut x = timer::millis() ^ (got.rssi as u32) << 24 ^ (got.len as u32) << 12;

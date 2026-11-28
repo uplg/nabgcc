@@ -47,6 +47,7 @@ const OPERATING: u32 = 1 << 1;
 const CHIP_RESET: u8 = 1 << 6;
 const PULL_DOWN_BOTH: u32 = 0x60;
 const OHCI_IRQ: u32 = 1 << 1;
+const DMA_IRQ: u32 = 1 << 0;
 
 const CONTROL_LIST: u32 = 1 << 4;
 const BULK_LIST: u32 = 1 << 5;
@@ -66,7 +67,14 @@ const PORT_ENABLED: u32 = 1 << 1;
 const PORT_RESET: u32 = 1 << 4;
 const PORT_CONNECT_CHANGE: u32 = 1 << 16;
 const PORT_ENABLE_CHANGE: u32 = 1 << 17;
+const PORT_SUSPEND_CHANGE: u32 = 1 << 18;
+const PORT_OVERCURRENT_CHANGE: u32 = 1 << 19;
 const PORT_RESET_CHANGE: u32 = 1 << 20;
+const PORT_CHANGES: u32 = PORT_CONNECT_CHANGE
+    | PORT_ENABLE_CHANGE
+    | PORT_SUSPEND_CHANGE
+    | PORT_OVERCURRENT_CHANGE
+    | PORT_RESET_CHANGE;
 
 // Layout of the controller's RAM.
 const HCCA: usize = RAM;
@@ -98,7 +106,6 @@ const TD_ROUNDING: u32 = 1 << 18;
 const TD_SETUP: u32 = 0 << 19;
 const TD_OUT_PID: u32 = 1 << 19;
 const TD_IN_PID: u32 = 2 << 19;
-const TD_NO_INTERRUPT: u32 = 7 << 21;
 const TD_DATA0: u32 = 2 << 24;
 const TD_DATA1: u32 = 3 << 24;
 const TD_NOT_ACCESSED: u32 = 0xF << 28;
@@ -123,7 +130,10 @@ fn word(address: usize) -> crate::reg::Reg<u32> {
 
 /// What the interrupt handler tells the main program.
 static CONTROL_RESULT: Shared<u32> = Shared::new(PENDING);
-static PORT_CHANGED: Shared<bool> = Shared::new(false);
+/// A device came up on the port (its reset over, the port enabled), and
+/// it went away: set by the interrupt, taken by the main program.
+static CONNECTED: Shared<bool> = Shared::new(false);
+static DISCONNECTED: Shared<bool> = Shared::new(false);
 static TX_BUSY: Shared<bool> = Shared::new(false);
 /// When the transfer out on its way was queued.
 static TX_AT: Shared<u32> = Shared::new(0);
@@ -131,8 +141,9 @@ static TX_AT: Shared<u32> = Shared::new(0);
 /// through (0: none is). One word: the interrupt clears it.
 static STUCK_SINCE: Shared<u32> = Shared::new(0);
 static BROKEN: Shared<bool> = Shared::new(false);
-/// What takes the packets received on the bulk endpoint.
-type PacketHandler = fn(&[u8]);
+/// What takes the packets received on the bulk endpoint: `None` for a
+/// packet the controller gave up on, lost.
+type PacketHandler = fn(Option<&[u8]>);
 static RX_HANDLER: Shared<Option<PacketHandler>> = Shared::new(None);
 /// Transfers the controller gave up on, both directions.
 static BULK_ERRORS: Shared<u32> = Shared::new(0);
@@ -197,7 +208,15 @@ fn queue_bulk(ed: usize, td: usize, control: u32, buffer: usize, len: usize, spa
 fn take_back(ed: usize, keep: u32) {
     word(ed).set(ED_SKIP);
     timer::delay_ms(2);
-    let kept = word(ed + 8).read() & keep;
+    let head = word(ed + 8).read();
+    let mut kept = head & keep;
+    // A descriptor that had moved packets already carries the toggle in
+    // its own field (its top bit set): that is the one the device
+    // expects next, not the endpoint's, last written before it.
+    let control = word((head & !0xF) as usize).read();
+    if keep & 2 != 0 && head & !0xF != word(ed + 4).read() && control & (1 << 25) != 0 {
+        kept = (control >> 23) & 2;
+    }
     word(ed + 8).write(word(ed + 4).read() | kept);
 }
 
@@ -270,7 +289,12 @@ pub fn init() -> Result<(), Error> {
 /// Called by the interrupt dispatcher for the controller's pin.
 pub(crate) fn on_interrupt() {
     EXIRQB.set(0x10);
-    if STT_TRNS_CNT.read() & OHCI_IRQ == 0 {
+    let source = STT_TRNS_CNT.read();
+    if source & DMA_IRQ != 0 {
+        // No DMA here; the C clears it the same way (hcd.c).
+        STT_TRNS_CNT.write(DMA_IRQ);
+    }
+    if source & OHCI_IRQ == 0 {
         return;
     }
     let status = HC_INTERRUPT_STATUS.read();
@@ -284,9 +308,12 @@ pub(crate) fn on_interrupt() {
         let mut td = (word(HCCA_DONE_HEAD).read() & !0xF) as usize;
         word(HCCA_DONE_HEAD).write(0);
         HC_INTERRUPT_STATUS.write(INT_DONE);
-        // The list comes newest first: turn it round.
+        // The list comes newest first: turn it round. There are sixteen
+        // descriptors at most: a longer list is a broken one.
         let mut oldest_first = 0usize;
-        while td != 0 {
+        let mut hops = 0;
+        while td != 0 && hops < 16 {
+            hops += 1;
             let next = (word(td + 8).read() & !0xF) as usize;
             word(td + 8).write(oldest_first as u32);
             oldest_first = td;
@@ -300,13 +327,38 @@ pub(crate) fn on_interrupt() {
         }
     }
     if status & INT_ROOT_HUB != 0 {
+        // As the C does (hcd.c): the port's change bits cleared here, in
+        // the interrupt, before the interrupt's own status. A controller
+        // that holds its root hub interrupt up while a change bit is set
+        // would otherwise interrupt for ever.
+        let port = HC_RH_PORT.read();
+        HC_RH_PORT.write(port & PORT_CHANGES);
         HC_INTERRUPT_STATUS.write(INT_ROOT_HUB);
-        PORT_CHANGED.set(true);
+        root_hub(port);
     }
     if status & INT_OVERRUN != 0 {
         HC_INTERRUPT_STATUS.write(INT_OVERRUN);
     }
     STT_TRNS_CNT.write(OHCI_IRQ);
+}
+
+/// What a change of the port means: a device plugged in is reset at
+/// once, and is ready once its reset is over; a port that loses its
+/// device, or is disabled, has lost the stick.
+fn root_hub(port: u32) {
+    let connected = port & PORT_CONNECTED != 0;
+    let enabled = port & PORT_ENABLED != 0;
+    if connected && port & PORT_CONNECT_CHANGE != 0 {
+        HC_RH_PORT.write(PORT_RESET);
+    }
+    if connected && enabled && port & PORT_RESET_CHANGE != 0 {
+        CONNECTED.set(true);
+    }
+    let lost = !connected || (port & PORT_ENABLE_CHANGE != 0 && !enabled);
+    if lost && port & (PORT_CONNECT_CHANGE | PORT_ENABLE_CHANGE) != 0 {
+        CONNECTED.set(false);
+        DISCONNECTED.set(true);
+    }
 }
 
 /// A transfer descriptor came back from the controller.
@@ -322,10 +374,15 @@ fn retire(td: usize) {
             if let Some(handler) = RX_HANDLER.get() {
                 // SAFETY: the controller is done with this buffer until
                 // the descriptor is queued again, below.
-                handler(unsafe { core::slice::from_raw_parts(buffer as *const u8, len) });
+                handler(Some(unsafe {
+                    core::slice::from_raw_parts(buffer as *const u8, len)
+                }));
             }
         } else {
             bulk_failed(ED_IN);
+            if let Some(handler) = RX_HANDLER.get() {
+                handler(None);
+            }
         }
         crate::sync::barrier();
         queue_rx(td);
@@ -380,35 +437,50 @@ pub fn bulk_errors() -> u32 {
     BULK_ERRORS.get()
 }
 
-/// Wait for a device on the port and reset it. Returns once it is
-/// ready to be talked to at address 0.
+/// Wait for a device on the port, which the interrupt resets as soon
+/// as it shows up. Returns once it is ready to be talked to at address
+/// 0: its reset over, then 40 ms, as the C (hcd.c).
 pub fn attach(timeout_ms: u32) -> Result<(), Error> {
     let start = timer::millis();
-    let mut resetting = false;
-    loop {
+    while !take_connected() {
         watchdog::feed();
         if timer::since(start) > timeout_ms {
             return Err(Error::Timeout);
         }
-        if !PORT_CHANGED.get() {
-            continue;
-        }
-        PORT_CHANGED.set(false);
-        let port = HC_RH_PORT.read();
-        HC_RH_PORT.write(port & (PORT_CONNECT_CHANGE | PORT_ENABLE_CHANGE | PORT_RESET_CHANGE));
-        if port & PORT_CONNECTED == 0 {
-            resetting = false;
-        } else if !resetting {
-            // Let the plug settle, then reset the bus.
-            timer::delay_ms(40);
-            HC_RH_PORT.write(PORT_RESET);
-            resetting = true;
-        } else if port & PORT_RESET_CHANGE != 0 && port & PORT_ENABLED != 0 {
-            timer::delay_ms(40);
-            return Ok(());
-        }
     }
+    timer::delay_ms(40);
+    Ok(())
 }
+
+/// Whether a device came up on the port since the last call (taken).
+pub fn take_connected() -> bool {
+    irq::free(|| {
+        let connected = CONNECTED.get();
+        CONNECTED.set(false);
+        connected
+    })
+}
+
+/// Whether the device went away since the last call (taken). The bulk
+/// endpoints are then stopped and what they held dropped: nothing is
+/// sent or received until the next [`enumerate`].
+pub fn take_disconnected() -> bool {
+    if !DISCONNECTED.get() {
+        return false;
+    }
+    irq::free(|| {
+        DISCONNECTED.set(false);
+        RX_HANDLER.set(None);
+        take_back(ED_IN, 2);
+        take_back(ED_OUT, 2);
+        TX_BUSY.set(false);
+        STUCK_SINCE.set(0);
+    });
+    true
+}
+
+/// How long a control transfer may take.
+pub const CONTROL_TIMEOUT_MS: u32 = 1000;
 
 /// One control transfer on endpoint 0, waited for. `data` is sent or
 /// filled according to the direction bit of the request; the result is
@@ -445,20 +517,8 @@ pub fn control(
             (TD_OUT_PID, TD_IN_PID)
         };
         let after_setup = if len > 0 { t1 } else { t2 };
-        fill_td(
-            t0,
-            TD_SETUP | TD_DATA0 | TD_NO_INTERRUPT,
-            SETUP,
-            8,
-            after_setup,
-        );
-        fill_td(
-            t1,
-            TD_ROUNDING | data_pid | TD_DATA1 | TD_NO_INTERRUPT,
-            CONTROL_DATA,
-            len,
-            t2,
-        );
+        fill_td(t0, TD_SETUP | TD_DATA0, SETUP, 8, after_setup);
+        fill_td(t1, TD_ROUNDING | data_pid | TD_DATA1, CONTROL_DATA, len, t2);
         fill_td(t2, status_pid | TD_DATA1, 0, 0, t3);
         DATA_MOVED.set(0);
         CONTROL_RESULT.set(PENDING);
@@ -475,7 +535,8 @@ pub fn control(
         if result != PENDING {
             break result;
         }
-        if broken() || timer::since(start) > 500 {
+        // A second, as the C gives every request (usbhcore.c).
+        if broken() || timer::since(start) > CONTROL_TIMEOUT_MS {
             // Take the transfer back from the controller; the next one
             // brings its own toggles, and lets the endpoint go again.
             irq::free(|| take_back(ED_CONTROL, 0));
@@ -513,10 +574,25 @@ const KNOWN: [(u16, u16); 3] = [(0x148F, 0x2573), (0x0DF6, 0x9712), (0x0DB0, 0x6
 pub fn enumerate() -> Result<Device, Error> {
     let mut d = [0u8; 18];
     // The first eight bytes are safe to ask whatever the packet size.
-    control(0, 8, [0x80, 6, 0, 1, 0, 0, 8, 0], &mut d[..8])?;
-    let max_packet = d[7] as u16;
+    // A stick just reset may not answer yet: three tries, 20 ms apart,
+    // as the C (usbhcore.c).
+    let first = [0x80, 6, 0, 1, 0, 0, 8, 0];
+    let mut tries = 0;
+    while control(0, 8, first, &mut d[..8]) != Ok(8) {
+        tries += 1;
+        if tries == 3 {
+            return Err(Error::UnknownDevice);
+        }
+        timer::delay_ms(20);
+    }
     control(0, 8, [0x00, 5, ADDRESS, 0, 0, 0, 0, 0], &mut [])?;
     timer::delay_ms(10);
+    // The same at the new address (the C does, and it checks the
+    // address was taken), then the packet size it gives.
+    if control(ADDRESS, 8, first, &mut d[..8])? < 8 {
+        return Err(Error::UnknownDevice);
+    }
+    let max_packet = d[7] as u16;
     if control(ADDRESS, max_packet, [0x80, 6, 0, 1, 0, 0, 18, 0], &mut d)? < 18 {
         return Err(Error::UnknownDevice);
     }
@@ -529,8 +605,24 @@ pub fn enumerate() -> Result<Device, Error> {
         return Err(Error::UnknownDevice);
     }
     // The configuration must offer a bulk endpoint each way, numbered 1.
+    // Its first nine bytes, then all of it (as far as 64 go), as the C.
     let mut c = [0u8; 64];
-    let got = control(ADDRESS, max_packet, [0x80, 6, 0, 2, 0, 0, 64, 0], &mut c)?;
+    if control(
+        ADDRESS,
+        max_packet,
+        [0x80, 6, 0, 2, 0, 0, 9, 0],
+        &mut c[..9],
+    )? < 9
+    {
+        return Err(Error::UnknownDevice);
+    }
+    let total = u16::from_le_bytes([c[2], c[3]]).clamp(9, 64) as u8;
+    let got = control(
+        ADDRESS,
+        max_packet,
+        [0x80, 6, 0, 2, 0, 0, total, 0],
+        &mut c[..total as usize],
+    )?;
     let (mut has_out, mut has_in) = (false, false);
     let mut at = 0;
     while at + 2 <= got && c[at] as usize >= 2 {

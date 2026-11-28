@@ -2,7 +2,9 @@
 //! transmission and reception of raw 802.11 frames.
 //!
 //! The register values, their order and the delays come from the C
-//! driver this replaces (`src/usb/rt2501usb.c`), itself after Ralink's.
+//! driver this replaces (`src/usb/rt2501usb.c`), itself after Ralink's,
+//! with what Linux's rt73usb does where the C left the chip as it found
+//! it (the beacon registers, after a restart with the stick powered).
 
 use core::cell::UnsafeCell;
 
@@ -37,7 +39,15 @@ const BBP_BUSY: u32 = 1 << 16;
 const RX_OFF: u32 = 0x0257_B032;
 const RX_ON: u32 = 0x025E_B032;
 
-const MAC_DEFAULTS: [(u16, u32); 22] = [
+const MAC_DEFAULTS: [(u16, u32); 27] = [
+    // Beacons off and their four slots empty, as rt73usb starts: the
+    // stick may still be beaconing for the firmware that ran before a
+    // restart (the rescue core's network) — the C never cleared them.
+    (TXRX_CSR9, 0),
+    (BEACON, 0),
+    (BEACON + 0x100, 0),
+    (BEACON + 0x200, 0),
+    (BEACON + 0x300, 0),
     (TXRX_CSR0, 0x025F_B032),
     (0x3044, 0x9EAA_9EAF),
     (0x3048, 0x8A8B_8C8D),
@@ -195,29 +205,53 @@ pub struct Stick {
     rf: [u32; 4],
     channel: u8,
     calibration_in: u8,
+    /// What BBP R94 was last set to.
+    r94: i8,
 }
 
+/// The longest transfer the stick hands over: its descriptor and the
+/// longest frame it passes (4095 bytes, MAC_CSR6), in whole packets.
+const ASSEMBLY_SIZE: usize = (24 + 4095usize).div_ceil(PACKET) * PACKET;
+
 /// Where the interrupt handler puts a frame together from its packets.
-struct Assembly(UnsafeCell<[u8; 2048]>);
+struct Assembly(UnsafeCell<[u8; ASSEMBLY_SIZE]>);
 // SAFETY: only the USB interrupt handler touches it.
 unsafe impl Sync for Assembly {}
 #[unsafe(link_section = ".xram.wifi")]
-static ASSEMBLY: Assembly = Assembly(UnsafeCell::new([0; 2048]));
+static ASSEMBLY: Assembly = Assembly(UnsafeCell::new([0; ASSEMBLY_SIZE]));
 static ASSEMBLED: Shared<usize> = Shared::new(0);
+/// The rest of a transfer is being thrown away, up to its end.
+static DISCARDING: Shared<bool> = Shared::new(false);
 
-/// Called from the USB interrupt with each packet from the stick. A
-/// frame ends on a packet shorter than the maximum.
-fn on_packet(packet: &[u8]) {
+/// Called from the USB interrupt with each packet from the stick (`None`:
+/// one was lost). A frame ends on a packet shorter than the maximum.
+///
+/// What follows a lost packet, or a transfer longer than any the stick
+/// sends, is dropped up to the end of that transfer: read as the start
+/// of a frame, its bytes would be a descriptor the sender of the frame
+/// chose ("decrypted, no error"), the way to slip frames past the keys.
+fn on_packet(packet: Option<&[u8]>) {
     // SAFETY: see `Assembly`.
     let buffer = unsafe { &mut *ASSEMBLY.0.get() };
+    let Some(packet) = packet else {
+        ASSEMBLED.set(0);
+        DISCARDING.set(true);
+        return;
+    };
+    let last = packet.len() < PACKET;
+    if DISCARDING.get() {
+        DISCARDING.set(!last);
+        return;
+    }
     let at = ASSEMBLED.get();
     if at + packet.len() > buffer.len() {
         ASSEMBLED.set(0);
+        DISCARDING.set(!last);
         return;
     }
     buffer[at..at + packet.len()].copy_from_slice(packet);
     let total = at + packet.len();
-    if packet.len() == PACKET {
+    if !last {
         ASSEMBLED.set(total);
         return;
     }
@@ -345,7 +379,35 @@ impl Stick {
     pub fn bring_up() -> Result<Stick, Error> {
         usb::init()?;
         usb::attach(3000)?;
-        Stick::start(usb::enumerate()?)
+        Stick::come_up()
+    }
+
+    /// The stick is back on the port after it was lost
+    /// ([`usb::take_disconnected`], then [`usb::take_connected`]): bring
+    /// it up again, from its enumeration, as the C does.
+    pub fn reconnect() -> Result<Stick, Error> {
+        timer::delay_ms(40);
+        Stick::come_up()
+    }
+
+    /// Enumerate and start the stick on the port; a failure on the way
+    /// (a request refused or lost) gets two more tries, the controller
+    /// reset in between and the stick on its port again. A radio this
+    /// driver does not tune is final.
+    fn come_up() -> Result<Stick, Error> {
+        let mut tries = 0;
+        loop {
+            let result = usb::enumerate().map_err(Error::from).and_then(Stick::start);
+            match result {
+                Err(Error::Radio(_)) => return result,
+                Err(_) if tries < 2 => {
+                    tries += 1;
+                    usb::init()?;
+                    usb::attach(3000)?;
+                }
+                _ => return result,
+            }
+        }
     }
 
     /// Load the stick's firmware, set it up, read its calibration data
@@ -364,10 +426,13 @@ impl Stick {
             rf: [0; 4],
             channel: 1,
             calibration_in: CALIBRATION_PERIOD,
+            r94: BBP_R94_DEFAULT,
         };
         s.write_words(FIRMWARE_BASE, FIRMWARE)?;
-        // Run it.
-        s.request(0x40, 0x01, 0x08, 0, &mut [])?;
+        // Run it. Its answer may be slow (Linux gives it a second, as
+        // every request has here) or lost: as the C, carry on, the waits
+        // below tell whether the stick runs.
+        let _ = s.request(0x40, 0x01, 0x08, 0, &mut []);
         for (register, value) in MAC_DEFAULTS {
             s.write(register, value)?;
         }
@@ -385,7 +450,8 @@ impl Stick {
             }
         }
         tries = 0;
-        while s.bbp_read(0)? == 0 {
+        // A baseband not ready reads 0, a stick not there all ones.
+        while matches!(s.bbp_read(0)?, 0 | 0xFF) {
             timer::delay_ms(500);
             tries += 1;
             if tries == 20 {
@@ -493,8 +559,18 @@ impl Stick {
         self.channel
     }
 
-    /// Tune to a channel, 1 to 14, and turn the receiver on.
+    /// Tune to a channel, 1 to 14, and turn the receiver on. Whatever
+    /// fails on the way, the receiver is turned back on (the C ends so
+    /// whatever happened): a failed request leaves the old channel at
+    /// worst, never a deaf rabbit.
     pub fn set_channel(&mut self, channel: u8) -> Result<(), Error> {
+        let tuned = self.tune(channel);
+        let on = self.write(TXRX_CSR0, RX_ON);
+        tuned?;
+        Ok(on?)
+    }
+
+    fn tune(&mut self, channel: u8) -> Result<(), Error> {
         let channel = channel.clamp(1, 14);
         self.channel = channel;
         self.select_antenna()?;
@@ -534,16 +610,23 @@ impl Stick {
             (r3_power << 9) | (r3_base & 0xFFFF_C1FF),
             (r4 & !0x0003_F000) | self.frequency_offset << 12,
         ];
-        let smart = self.bbp_read(3)?;
-        let smart = if rt2527 { smart & 0xFE } else { smart | 1 };
-        self.bbp_write(3, smart)?;
-        if r94 != BBP_R94_DEFAULT {
+        // The C leaves the RT2528's "smart mode" bit as it is (R3 0x80)
+        // and clears it for the RT2527, as here; rt73usb sets it for the
+        // RT2528, but rabbits have always run the C's value.
+        if rt2527 {
+            let r3 = self.bbp_read(3)?;
+            self.bbp_write(3, r3 & 0xFE)?;
+        }
+        // The C writes R94 only when it is not the default, so a channel
+        // that needed it changed leaves it so on the next one: put back.
+        if r94 != BBP_R94_DEFAULT || self.r94 != BBP_R94_DEFAULT {
             self.bbp_write(94, r94 as u8)?;
+            self.r94 = r94;
         }
         self.update_rf()?;
         // Let the baseband and the radio settle.
         timer::delay_ms(2);
-        Ok(self.write(TXRX_CSR0, RX_ON)?)
+        Ok(())
     }
 
     /// Follow the temperature: nudge the transmit power by what the
@@ -653,6 +736,11 @@ impl Stick {
         let control = self.read(TXRX_CSR9)? & !0x001F_0000;
         self.write(TXRX_CSR9, control)?;
         let Some(frame) = frame else { return Ok(()) };
+        // The descriptor and the frame must fit the slot (256 bytes),
+        // and the frame hold its fixed fields (the interval, at 32).
+        if frame.len() < 36 || 24 + frame.len() > 0x100 {
+            return Err(Error::NotReady);
+        }
         for slot in 0..4 {
             self.write(BEACON + slot * 0x100, 0)?;
         }
@@ -661,7 +749,10 @@ impl Stick {
         options.timestamp = true;
         let at = self.write_words(BEACON, &descriptor(frame.len(), &options))?;
         self.write_words(at, frame)?;
-        // Clock running, no synchronisation to anyone, beacons on.
+        // The frame's interval, in sixteenths of a time unit; clock
+        // running, no synchronisation to anyone, beacons on.
+        let interval = u16::from_le_bytes([frame[32], frame[33]]).clamp(1, 4095) as u32 * 16;
+        let control = (control & !0xFFFF) | interval;
         Ok(self.write(TXRX_CSR9, control | 0x001F_0000)?)
     }
 }
