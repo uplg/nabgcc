@@ -75,6 +75,12 @@ pub struct Machine {
     idle: Option<Idle>,
     /// Board cycles skipped so.
     pub skipped: u64,
+    /// The processor sees the interrupt line one instruction late: a
+    /// source that goes away is still taken once, and the controller
+    /// then has nothing to name (an "illegal interrupt", manual 6.6.2).
+    /// On by default with `NABEMU_IRQ_LAG` set.
+    pub irq_lag: bool,
+    irq_before: bool,
 }
 
 /// The state at the head of a loop, to tell an idle turn.
@@ -114,6 +120,8 @@ impl Machine {
             skip_idle: std::env::var_os("NABEMU_NO_SKIP").is_none(),
             idle: None,
             skipped: 0,
+            irq_lag: std::env::var_os("NABEMU_IRQ_LAG").is_some(),
+            irq_before: false,
         }
     }
 
@@ -164,7 +172,12 @@ impl Machine {
 
     #[inline]
     pub fn step(&mut self) {
-        self.cpu.irq_line = self.soc.irq_asserted();
+        let asserted = self.soc.irq_asserted();
+        self.cpu.irq_line = if self.irq_lag {
+            std::mem::replace(&mut self.irq_before, asserted)
+        } else {
+            asserted
+        };
         let before = self.cpu.pc();
         let cycles = self.cpu.step(&mut self.soc);
         self.instructions += 1;

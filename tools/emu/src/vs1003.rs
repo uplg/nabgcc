@@ -134,6 +134,8 @@ pub struct Vs1003 {
     pub microphone: VecDeque<i16>,
     /// Bytes waiting in the decoder's input buffer.
     pub buffered: usize,
+    /// A broken chip: DREQ stays low for good.
+    pub dead: bool,
     /// Bytes the decoder has consumed from the current track.
     pub consumed: u64,
     /// Words dropped because nobody read the recorder in time.
@@ -174,6 +176,7 @@ impl Vs1003 {
             current: None,
             microphone: VecDeque::new(),
             buffered: 0,
+            dead: false,
             consumed: 0,
             record_overruns: 0,
             gaps: Vec::new(),
@@ -224,7 +227,7 @@ impl Vs1003 {
 
     /// The data request pin: high when the chip can take more.
     pub fn wants_data(&self) -> bool {
-        FIFO_BYTES - self.buffered >= FIFO_MARGIN
+        !self.dead && FIFO_BYTES - self.buffered >= FIFO_MARGIN
     }
 
     /// Output attenuation of the left channel in half decibels: 0 is

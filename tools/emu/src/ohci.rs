@@ -9,6 +9,8 @@ pub const RAM_BASE: u32 = 0xF000_1000;
 pub const RAM_SIZE: usize = 0x1000;
 
 const HOST_CTL: u32 = 0x200;
+const RST_CLK_CTL: u32 = 0x01C;
+const CHIP_RESET: u32 = 1 << 6;
 const STT_TRNS_CNT: u32 = 0x204;
 const HC_REVISION: u32 = 0x100;
 const HC_CONTROL: u32 = 0x104;
@@ -42,6 +44,7 @@ const PS_PES: u32 = 1 << 1;
 const PS_PRS: u32 = 1 << 4;
 const PS_PPS: u32 = 1 << 8;
 const PS_CSC: u32 = 1 << 16;
+const PS_PESC: u32 = 1 << 17;
 const PS_PRSC: u32 = 1 << 20;
 
 const ED_SKIP: u32 = 1 << 14;
@@ -95,6 +98,11 @@ pub struct Ohci {
     /// Transfers the controller could not carry out (bad pointers).
     pub errors: u32,
     pub frames: u64,
+    /// The root hub's status change interrupt as a level: asserted
+    /// again as long as a port change bit is set, as some controllers
+    /// do (Linux's `ohci_irq` copes with those). Off, it is raised once
+    /// per change. On by default with `NABEMU_RHSC_LEVEL` set.
+    pub rhsc_level: bool,
 }
 
 struct Ram<'a>(&'a mut [u8]);
@@ -133,13 +141,50 @@ impl Ohci {
             device: None,
             errors: 0,
             frames: 0,
+            rhsc_level: std::env::var_os("NABEMU_RHSC_LEVEL").is_some(),
+        }
+    }
+
+    /// Pull the device out of the port: the port says so (connect and
+    /// enable changes), and the device is handed back.
+    pub fn unplug(&mut self) -> Option<Box<dyn UsbDevice>> {
+        let device = self.device.take()?;
+        if self.port & PS_PPS != 0 {
+            if self.port & PS_CCS != 0 {
+                self.port |= PS_CSC;
+            }
+            if self.port & PS_PES != 0 {
+                self.port |= PS_PESC;
+            }
+            self.port &= !(PS_CCS | PS_PES | PS_PRS);
+            self.reset_left = 0;
+            self.int_status |= INTR_RHSC;
+        }
+        Some(device)
+    }
+
+    /// Plug a device in (it comes up from power-off).
+    pub fn plug(&mut self, mut device: Box<dyn UsbDevice>) {
+        device.power_cycle();
+        self.device = Some(device);
+        if self.port & PS_PPS != 0 {
+            self.port |= PS_CCS | PS_CSC;
+            self.int_status |= INTR_RHSC;
+        }
+    }
+
+    fn rhsc_again(&mut self) {
+        if self.rhsc_level && self.port & 0x001F_0000 != 0 {
+            self.int_status |= INTR_RHSC;
         }
     }
 
     /// Chip reset. The device stays plugged in.
     pub fn reset(&mut self) {
         let device = self.device.take();
+        let level = self.rhsc_level;
         *self = Ohci::new();
+        self.rhsc_level = level;
         self.device = device;
         if let Some(d) = &mut self.device {
             d.bus_reset();
@@ -215,11 +260,15 @@ impl Ohci {
                 }
             }
             STT_TRNS_CNT => {}
+            // RstClkCtl's chip reset (B_CRST): the whole controller, its
+            // port too, starts over (the device sees a bus reset).
+            RST_CLK_CTL if v & CHIP_RESET != 0 => self.reset(),
             _ => {
                 let i = (off / 4) as usize;
                 self.regs[i] = (self.regs[i] & !mask) | v;
             }
         }
+        self.rhsc_again();
     }
 
     fn power_port(&mut self) {
@@ -235,6 +284,7 @@ impl Ohci {
 
     /// One millisecond of bus time.
     pub fn frame(&mut self, ram: &mut [u8]) {
+        self.rhsc_again();
         if self.reset_left > 0 {
             self.reset_left -= 1;
             if self.reset_left == 0 {

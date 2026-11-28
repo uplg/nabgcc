@@ -848,7 +848,10 @@ impl Soc {
                     self.cil |= 1 << lvl;
                     n
                 }
-                None => 64,
+                // Nothing pending (it went away since the processor took
+                // the interrupt): 0, as the manual says (6.5.6), the
+                // system timer's number, an "illegal interrupt".
+                None => 0,
             },
             CIL => self.cil,
             EXIRQA => ((self.irq_lines >> 16) & 0xFFFF) as u32,

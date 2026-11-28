@@ -126,6 +126,20 @@ pub struct Radio {
     /// as a stick might that does not report them (nothing has shown
     /// the RT2573 does; the C driver never read them).
     pub rx_no_iv: bool,
+    /// Faults to inject. The next this many control requests are
+    /// refused at their setup stage (a stall), as a stick still coming
+    /// up may do.
+    pub refuse_requests: u32,
+    /// The status stage of the request that starts the stick's own
+    /// firmware answers NAK for this many milliseconds.
+    pub firmware_start_nak_ms: u32,
+    /// Writes to the baseband's command register are refused (stall).
+    pub refuse_bbp: bool,
+    /// This packet (counting from 0) of the next frame handed over the
+    /// bulk endpoint in fails (a stall) and its bytes are lost.
+    pub lose_rx_packet: Option<usize>,
+    /// Every baseband register write, in order: (register, value).
+    pub bbp_writes: Vec<(u8, u8)>,
 }
 
 pub type SharedRadio = Rc<RefCell<Radio>>;
@@ -253,6 +267,10 @@ impl Rt2573 {
             (w & 0xFF00) | self.bbp[reg] as u32
         } else {
             self.bbp[reg] = w as u8;
+            self.radio
+                .borrow_mut()
+                .bbp_writes
+                .push((reg as u8, w as u8));
             w & 0xFFFF
         };
         self.mem[PHY_CSR3..PHY_CSR3 + 4].copy_from_slice(&done.to_le_bytes());
@@ -327,7 +345,14 @@ impl Rt2573 {
                 true
             }
             (0x00, 1) | (0x00, 3) | (0x02, 1) => true,
-            (0x40, REQ_WRITE_MULTI_MAC) => self.write_mem(s, data),
+            (0x40, REQ_WRITE_MULTI_MAC) => {
+                let at = s.index as usize;
+                let touches_bbp = at <= PHY_CSR3 && PHY_CSR3 < at + data.len().max(1);
+                if touches_bbp && self.radio.borrow().refuse_bbp {
+                    return false;
+                }
+                self.write_mem(s, data)
+            }
             (0x40, REQ_DEVICE_MODE) => {
                 if s.value == 0x08 {
                     self.radio.borrow_mut().firmware_loaded = true;
@@ -558,6 +583,13 @@ impl UsbDevice for Rt2573 {
     }
 
     fn setup(&mut self, packet: [u8; 8]) -> Xfer {
+        {
+            let mut radio = self.radio.borrow_mut();
+            if radio.refuse_requests > 0 {
+                radio.refuse_requests -= 1;
+                return Xfer::Stall;
+            }
+        }
         let mut ctrl = std::mem::take(&mut self.ctrl);
         let x = ctrl.setup(packet, |s| self.control_read(s));
         self.ctrl = ctrl;
@@ -566,6 +598,14 @@ impl UsbDevice for Rt2573 {
 
     fn data_in(&mut self, ep: u8, buf: &mut [u8]) -> Xfer {
         if ep == 0 {
+            let s = self.ctrl.current();
+            if (s.request_type, s.request, s.value) == (0x40, REQ_DEVICE_MODE, 0x08) {
+                let mut radio = self.radio.borrow_mut();
+                if radio.firmware_start_nak_ms > 0 {
+                    radio.firmware_start_nak_ms -= 1;
+                    return Xfer::Nak;
+                }
+            }
             let mut ctrl = std::mem::take(&mut self.ctrl);
             let x = ctrl.data_in(buf, |s, d| self.control_write(s, d));
             self.ctrl = ctrl;
@@ -582,6 +622,14 @@ impl UsbDevice for Rt2573 {
             return Xfer::Nak;
         }
         let n = buf.len().min(PACKET).min(self.inbound.len() - self.in_pos);
+        {
+            let mut radio = self.radio.borrow_mut();
+            if radio.lose_rx_packet == Some(self.in_pos / PACKET) {
+                radio.lose_rx_packet = None;
+                self.in_pos += n;
+                return Xfer::Stall;
+            }
+        }
         buf[..n].copy_from_slice(&self.inbound[self.in_pos..self.in_pos + n]);
         self.in_pos += n;
         Xfer::Done(n)
