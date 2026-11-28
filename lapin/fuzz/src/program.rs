@@ -85,6 +85,27 @@ impl Gen<'_, '_> {
         }
     }
 
+    /// A small number pushed.
+    fn push_small(&mut self) {
+        let n = self.small();
+        self.int(n);
+    }
+
+    /// A small number pushed, or none (nil, for an optional length).
+    fn push_small_or_nil(&mut self) {
+        if self.input.bool() {
+            self.op(NIL_);
+        } else {
+            self.push_small();
+        }
+    }
+
+    /// Any number pushed.
+    fn push_any(&mut self) {
+        let v = self.any_int();
+        self.int(v);
+    }
+
     fn any_int(&mut self) -> i32 {
         let b = self.input.u8();
         if b < 192 {
@@ -94,20 +115,22 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// A local of `kind` (any table for `Tab(0)`), if there is one.
-    fn pick(&mut self, want: fn(Kind) -> bool) -> Option<usize> {
+    /// The first local that `fits`, from one the input names.
+    fn search(&mut self, fits: impl Fn(&Self, usize) -> bool) -> Option<usize> {
         let start = self.input.u8() as usize;
         (0..LOCALS)
             .map(|k| (start + k) % LOCALS)
-            .find(|&i| want(self.locals[i]))
+            .find(|&i| fits(self, i))
+    }
+
+    /// A local of `kind` (any table for `Tab(0)`), if there is one.
+    fn pick(&mut self, want: fn(Kind) -> bool) -> Option<usize> {
+        self.search(|g, i| want(g.locals[i]))
     }
 
     /// Where a result of `kind` goes: a local free to take it.
     fn dest(&mut self, kind: Kind) -> Option<usize> {
-        let start = self.input.u8() as usize;
-        (0..LOCALS)
-            .map(|k| (start + k) % LOCALS)
-            .find(|&i| self.reserved & 1 << i == 0 && (self.depth == 0 || self.locals[i] == kind))
+        self.search(|g, i| g.reserved & 1 << i == 0 && (g.depth == 0 || g.locals[i] == kind))
     }
 
     fn store(&mut self, kind: Kind) {
@@ -128,12 +151,31 @@ impl Gen<'_, '_> {
         self.pick(|k| k == Kind::Str)
     }
 
+    /// `body`, skipped by an `ELSE` unless local `c` holds true.
+    fn unless_zero(&mut self, c: usize, body: impl FnOnce(&mut Self)) {
+        self.get(c);
+        self.op(ELSE);
+        let at = self.code.len();
+        self.code.extend([0, 0]);
+        body(self);
+        let to = self.code.len() as u16;
+        self.code[at..at + 2].copy_from_slice(&to.to_le_bytes());
+    }
+
+    /// A few statements, one level deeper.
+    fn nested(&mut self) {
+        self.depth += 1;
+        for _ in 0..self.input.u8() % 6 {
+            self.statement();
+        }
+        self.depth -= 1;
+    }
+
     fn statement(&mut self) {
         let choice = self.input.u8() % 37;
         match choice {
             0 => {
-                let v = self.any_int();
-                self.int(v);
+                self.push_any();
                 self.store(Kind::Int);
             }
             1..=4 => {
@@ -154,28 +196,14 @@ impl Gen<'_, '_> {
                 self.get(a);
                 // By zero (or by more than 31) the host differs from the
                 // rabbit: lapin-metal's own tests pin those.
-                match self.input.u8() % 4 {
-                    0 => {
-                        let d = [3, -2, 7, 1000, -1][self.input.u8() as usize % 5];
-                        self.int(d);
-                        self.op(DIV);
-                    }
-                    1 => {
-                        let d = [3, -2, 7, 1000, -1][self.input.u8() as usize % 5];
-                        self.int(d);
-                        self.op(MOD);
-                    }
-                    2 => {
-                        let s = self.input.u8() as i32 % 32;
-                        self.int(s);
-                        self.op(SHL);
-                    }
-                    _ => {
-                        let s = self.input.u8() as i32 % 32;
-                        self.int(s);
-                        self.op(SHR);
-                    }
-                }
+                let o = self.input.u8() as usize % 4;
+                let by = if o < 2 {
+                    [3, -2, 7, 1000, -1][self.input.u8() as usize % 5]
+                } else {
+                    self.input.u8() as i32 % 32
+                };
+                self.int(by);
+                self.op([DIV, MOD, SHL, SHR][o]);
                 self.store(Kind::Int);
             }
             6 => {
@@ -223,8 +251,7 @@ impl Gen<'_, '_> {
             14 => {
                 let Some(a) = self.str_local() else { return };
                 self.get(a);
-                let n = self.small();
-                self.int(n);
+                self.push_small();
                 self.op(STRGET);
                 self.store(Kind::Int);
             }
@@ -232,8 +259,7 @@ impl Gen<'_, '_> {
                 let Some(a) = self.str_local() else { return };
                 let v = self.int_local();
                 self.get(a);
-                let n = self.small();
-                self.int(n);
+                self.push_small();
                 match v {
                     Some(v) => self.get(v),
                     None => self.int(65),
@@ -244,14 +270,8 @@ impl Gen<'_, '_> {
             16 => {
                 let Some(a) = self.str_local() else { return };
                 self.get(a);
-                let s = self.small();
-                self.int(s);
-                if self.input.bool() {
-                    self.op(NIL_);
-                } else {
-                    let l = self.small();
-                    self.int(l);
-                }
+                self.push_small();
+                self.push_small_or_nil();
                 self.op(STRSUB);
                 self.store(Kind::Str);
             }
@@ -284,16 +304,14 @@ impl Gen<'_, '_> {
                     self.int(i);
                 }
                 self.get(b);
-                let j = self.small();
-                self.int(j);
+                self.push_small();
                 // VSTRCMP's default length reads past the shorter
                 // string, in the C as here: within the heap, unless
                 // the length itself is large.
                 if o != VSTRCMP && self.input.bool() {
                     self.op(NIL_);
                 } else {
-                    let l = self.small();
-                    self.int(l);
+                    self.push_small();
                 }
                 self.op(o);
                 self.store(if o == STRCPY { Kind::Str } else { Kind::Int });
@@ -308,14 +326,12 @@ impl Gen<'_, '_> {
             20 => {
                 let Some(a) = self.str_local() else { return };
                 self.get(a);
-                let i = self.small();
-                self.int(i);
+                self.push_small();
                 if self.input.bool() {
                     self.op(STRGETWORD);
                     self.store(Kind::Int);
                 } else {
-                    let v = self.any_int();
-                    self.int(v);
+                    self.push_any();
                     self.op(STRPUTWORD);
                     self.op(DROP);
                 }
@@ -338,8 +354,7 @@ impl Gen<'_, '_> {
                     return;
                 };
                 self.get(t);
-                let i = self.small();
-                self.int(i);
+                self.push_small();
                 self.op(FETCH);
                 self.store(Kind::Any);
             }
@@ -372,8 +387,7 @@ impl Gen<'_, '_> {
                 if self.input.bool() {
                     self.op(RAND);
                 } else {
-                    let v = self.any_int();
-                    self.int(v);
+                    self.push_any();
                     self.op(SRAND);
                 }
                 self.store(Kind::Int);
@@ -385,9 +399,8 @@ impl Gen<'_, '_> {
             }
             // The board.
             28 => {
-                let (a, b) = (self.small(), self.any_int());
-                self.int(a);
-                self.int(b);
+                self.push_small();
+                self.push_any();
                 let o = [LED, MOTORSET][self.input.u8() as usize & 1];
                 self.op(o);
                 self.op(DROP);
@@ -395,17 +408,7 @@ impl Gen<'_, '_> {
             // A block skipped, or not.
             29 | 30 if self.depth < 3 => {
                 let Some(c) = self.int_local() else { return };
-                self.get(c);
-                self.op(ELSE);
-                let at = self.code.len();
-                self.code.extend([0, 0]);
-                self.depth += 1;
-                for _ in 0..self.input.u8() % 6 {
-                    self.statement();
-                }
-                self.depth -= 1;
-                let to = self.code.len() as u16;
-                self.code[at..at + 2].copy_from_slice(&to.to_le_bytes());
+                self.unless_zero(c, Self::nested);
             }
             // A block repeated.
             31 if self.depth < 2 => {
@@ -417,25 +420,17 @@ impl Gen<'_, '_> {
                 self.set(c);
                 self.locals[c] = Kind::Int;
                 let top = self.code.len() as u16;
-                self.get(c);
-                self.op(ELSE);
-                let at = self.code.len();
-                self.code.extend([0, 0]);
-                self.reserved |= 1 << c;
-                self.depth += 1;
-                for _ in 0..self.input.u8() % 6 {
-                    self.statement();
-                }
-                self.depth -= 1;
-                self.reserved &= !(1 << c);
-                self.get(c);
-                self.int(1);
-                self.op(SUB);
-                self.set(c);
-                self.op(GOTO);
-                self.code.extend(top.to_le_bytes());
-                let to = self.code.len() as u16;
-                self.code[at..at + 2].copy_from_slice(&to.to_le_bytes());
+                self.unless_zero(c, |g| {
+                    g.reserved |= 1 << c;
+                    g.nested();
+                    g.reserved &= !(1 << c);
+                    g.get(c);
+                    g.int(1);
+                    g.op(SUB);
+                    g.set(c);
+                    g.op(GOTO);
+                    g.code.extend(top.to_le_bytes());
+                });
             }
             // A call: two integers, an integer back.
             32 | 33 if self.fun + 1 < self.funs => {
@@ -452,17 +447,11 @@ impl Gen<'_, '_> {
             34 => {
                 let Some(a) = self.str_local() else { return };
                 self.get(a);
-                let i = self.small();
-                self.int(i);
-                if self.input.bool() {
-                    self.op(NIL_);
-                } else {
-                    let l = self.small();
-                    self.int(l);
-                }
-                let (key, alpha) = (self.any_int(), self.any_int());
-                self.int(key);
-                self.int(alpha);
+                self.push_small();
+                self.push_small_or_nil();
+                // The key, then the alpha.
+                self.push_any();
+                self.push_any();
                 let o = if self.input.bool() { CRYPT } else { UNCRYPT };
                 self.op(o);
                 self.store(Kind::Int);
