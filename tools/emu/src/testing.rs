@@ -1,6 +1,7 @@
 //! For the acceptance tests in `tests/`: which firmware they run. The
 //! released C one (r3) unless `NABEMU_FIRMWARE=lapin` names the Rust
-//! one, built in `../../lapin` (`lapin/build.sh`).
+//! one, built in `../../lapin` (`lapin/build.sh`). Also what the unit
+//! tests of the modules share.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Firmware {
@@ -30,4 +31,15 @@ pub fn image() -> Vec<u8> {
         Firmware::Lapin => format!("{root}/../../lapin/target/lapin-full.bin"),
     };
     std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+}
+
+/// Bytes from hexadecimal, white space ignored: the standards' test
+/// vectors as the unit tests quote them.
+#[cfg(test)]
+pub(crate) fn hex(s: &str) -> Vec<u8> {
+    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }

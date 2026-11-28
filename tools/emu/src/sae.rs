@@ -118,11 +118,9 @@ pub fn password_element_from_point(point: &Point, a: &Mac, b: &Mac) -> Point {
     // Into 1..=n-1.
     let mut order_less_one = p256::N;
     order_less_one[0] -= 1;
-    let mut one = [0u32; 8];
-    one[0] = 1;
     let scalar = p256::add_mod(
         &p256::reduce(&p256::from_bytes(&value), &order_less_one),
-        &one,
+        &p256::ONE,
         &p256::N,
     );
     point.mul(&scalar)
@@ -168,10 +166,14 @@ pub struct Session {
     pub pmkid: [u8; 16],
 }
 
+fn below_two(n: &Limbs) -> bool {
+    n[1..].iter().all(|l| *l == 0) && n[0] < 2
+}
+
 /// Bring 32 random bytes into 2..n.
 fn private_number(bytes: &[u8; 32]) -> Limbs {
     let mut n = p256::reduce(&p256::from_bytes(bytes), &p256::N);
-    if n[1..].iter().all(|l| *l == 0) && n[0] < 2 {
+    if below_two(&n) {
         n[0] += 2;
     }
     n
@@ -213,8 +215,7 @@ impl Session {
             return Err(SaeError::Reflection);
         }
         let scalar = p256::from_bytes(&peer.scalar);
-        let small = scalar[1..].iter().all(|l| *l == 0) && scalar[0] < 2;
-        if small || !p256::less(&scalar, &p256::N) {
+        if below_two(&scalar) || !p256::less(&scalar, &p256::N) {
             return Err(SaeError::BadScalar);
         }
         let element = Point::from_bytes(&peer.element).ok_or(SaeError::BadElement)?;
@@ -266,14 +267,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
+    use crate::testing::hex;
 
     // IEEE Std 802.11-2020, Annex J.10, as carried by hostapd's tests.
     const ADDR1: Mac = [0x4d, 0x3f, 0x2f, 0xff, 0xe3, 0x87];

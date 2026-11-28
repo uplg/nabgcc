@@ -27,6 +27,8 @@ const fn limbs(hex: &[u8; 64]) -> Limbs {
 pub const P: Limbs = limbs(b"FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF");
 /// The order of the group.
 pub const N: Limbs = limbs(b"FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+/// The number one, as a plain number (not in Montgomery form).
+pub const ONE: Limbs = [1, 0, 0, 0, 0, 0, 0, 0];
 const B: Limbs = limbs(b"5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B");
 const GX: Limbs = limbs(b"6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296");
 const GY: Limbs = limbs(b"4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
@@ -155,8 +157,7 @@ impl Fe {
 
     /// 2^256 mod p: the number one in Montgomery form.
     pub fn one() -> Fe {
-        let mut one = [0u32; 8];
-        one[0] = 1;
+        let mut one = ONE;
         // 2^256 mod p by doubling 1 that many times.
         for _ in 0..256 {
             one = add_mod(&one, &one, &P);
@@ -192,9 +193,7 @@ impl Fe {
 
     /// Back to a plain number below p.
     pub fn value(&self) -> Limbs {
-        let mut one = [0u32; 8];
-        one[0] = 1;
-        mont_mul(&self.0, &one)
+        mont_mul(&self.0, &ONE)
     }
 
     pub fn to_bytes(&self) -> [u8; 32] {
@@ -259,11 +258,7 @@ impl Fe {
 
     /// A square root, if there is one. p is 3 mod 4: `a^((p+1)/4)`.
     pub fn sqrt(&self) -> Option<Fe> {
-        let (p1, _) = add_raw(&P, &{
-            let mut one = [0u32; 8];
-            one[0] = 1;
-            one
-        });
+        let (p1, _) = add_raw(&P, &ONE);
         // p + 1 overflows 256 bits by nothing here: p ends in ...FFFF,
         // so the sum is exact in 256 bits.
         let e = shift_right(&shift_right(&p1));

@@ -213,6 +213,15 @@ fn aes_encrypt(c: &Aes128, block: [u8; 16]) -> [u8; 16] {
     b.into()
 }
 
+/// The block a key wrap step runs through AES: the integrity register,
+/// then one 8-byte half of the data.
+fn wrap_block(a: &[u8; 8], half: &[u8]) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..8].copy_from_slice(a);
+    b[8..].copy_from_slice(half);
+    b
+}
+
 /// AES key wrap (RFC 3394). `plain` is a multiple of 8 bytes.
 pub fn aes_wrap(kek: &[u8; 16], plain: &[u8]) -> Vec<u8> {
     let c = aes(kek);
@@ -221,10 +230,7 @@ pub fn aes_wrap(kek: &[u8; 16], plain: &[u8]) -> Vec<u8> {
     let mut r = plain.to_vec();
     for j in 0..6 {
         for i in 0..n {
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(&a);
-            b[8..].copy_from_slice(&r[i * 8..i * 8 + 8]);
-            let b = aes_encrypt(&c, b);
+            let b = aes_encrypt(&c, wrap_block(&a, &r[i * 8..i * 8 + 8]));
             a.copy_from_slice(&b[..8]);
             let t = (n * j + i + 1) as u64;
             for (x, y) in a.iter_mut().zip(t.to_be_bytes()) {
@@ -253,10 +259,7 @@ pub fn aes_unwrap(kek: &[u8; 16], wrapped: &[u8]) -> Option<Vec<u8>> {
             for (x, y) in a.iter_mut().zip(t.to_be_bytes()) {
                 *x ^= y;
             }
-            let mut b = [0u8; 16];
-            b[..8].copy_from_slice(&a);
-            b[8..].copy_from_slice(&r[i * 8..i * 8 + 8]);
-            let mut blk = Array::from(b);
+            let mut blk = Array::from(wrap_block(&a, &r[i * 8..i * 8 + 8]));
             c.decrypt_block(&mut blk);
             a.copy_from_slice(&blk[..8]);
             r[i * 8..i * 8 + 8].copy_from_slice(&blk[8..]);
@@ -498,6 +501,25 @@ pub struct Key<'a> {
     pub mic: &'a [u8; 8],
 }
 
+/// What WEP and TKIP put on the air: `data`, then its CRC-32 (the ICV),
+/// all through RC4 seeded with `seed`.
+fn rc4_seal(seed: &[u8], mut data: Vec<u8>) -> Vec<u8> {
+    data.extend_from_slice(&crc32(&data).to_le_bytes());
+    rc4(seed, 0, &mut data);
+    data
+}
+
+/// Inverse of [`rc4_seal`]: the data, once its ICV is checked.
+fn rc4_open(seed: &[u8], sealed: &[u8]) -> Result<Vec<u8>, CipherError> {
+    let mut data = sealed.to_vec();
+    rc4(seed, 0, &mut data);
+    let icv = data.split_off(data.len() - 4);
+    if icv != crc32(&data).to_le_bytes() {
+        return Err(CipherError::Icv);
+    }
+    Ok(data)
+}
+
 /// Turn a clear frame (24-byte header, then body) into what goes on the
 /// air. `iv` and `eiv` are the two header words as the transmitter
 /// built them (WEP only uses `iv`). The Protected bit is set.
@@ -510,10 +532,7 @@ pub fn protect(k: &Key, frame: &[u8], iv: u32, eiv: u32) -> Vec<u8> {
         Cipher::Wep => {
             let mut seed = iv.to_le_bytes()[..3].to_vec();
             seed.extend_from_slice(k.key);
-            let mut data = body.to_vec();
-            data.extend_from_slice(&crc32(body).to_le_bytes());
-            rc4(&seed, 0, &mut data);
-            out.extend_from_slice(&data);
+            out.extend_from_slice(&rc4_seal(&seed, body.to_vec()));
         }
         Cipher::Tkip => {
             out.extend_from_slice(&eiv.to_le_bytes());
@@ -523,10 +542,7 @@ pub fn protect(k: &Key, frame: &[u8], iv: u32, eiv: u32) -> Vec<u8> {
             let seed = tkip_mix(k.key.try_into().unwrap(), &ta, eiv, iv16);
             let mut data = body.to_vec();
             data.extend_from_slice(&michael_of(k.mic, header, body));
-            let icv = crc32(&data);
-            data.extend_from_slice(&icv.to_le_bytes());
-            rc4(&seed, 0, &mut data);
-            out.extend_from_slice(&data);
+            out.extend_from_slice(&rc4_seal(&seed, data));
         }
         Cipher::Ccmp => {
             out.extend_from_slice(&eiv.to_le_bytes());
@@ -559,12 +575,7 @@ pub fn unprotect(k: &Key, mpdu: &[u8]) -> Result<(Vec<u8>, u32, u32), CipherErro
         Cipher::Wep => {
             let mut seed = mpdu[24..27].to_vec();
             seed.extend_from_slice(k.key);
-            let mut data = mpdu[28..].to_vec();
-            rc4(&seed, 0, &mut data);
-            let icv = data.split_off(data.len() - 4);
-            if icv != crc32(&data).to_le_bytes() {
-                return Err(CipherError::Icv);
-            }
+            let data = rc4_open(&seed, &mpdu[28..])?;
             out.extend_from_slice(&data);
             Ok((out, iv, 0))
         }
@@ -573,12 +584,7 @@ pub fn unprotect(k: &Key, mpdu: &[u8]) -> Result<(Vec<u8>, u32, u32), CipherErro
             let iv16 = (mpdu[24] as u16) << 8 | mpdu[26] as u16;
             let ta: [u8; 6] = header[10..16].try_into().unwrap();
             let seed = tkip_mix(k.key.try_into().unwrap(), &ta, eiv, iv16);
-            let mut data = mpdu[32..].to_vec();
-            rc4(&seed, 0, &mut data);
-            let icv = data.split_off(data.len() - 4);
-            if icv != crc32(&data).to_le_bytes() {
-                return Err(CipherError::Icv);
-            }
+            let mut data = rc4_open(&seed, &mpdu[32..])?;
             let mic = data.split_off(data.len() - 8);
             if mic != michael_of(k.mic, header, &data) {
                 return Err(CipherError::Mic);
@@ -604,13 +610,14 @@ pub fn unprotect(k: &Key, mpdu: &[u8]) -> Result<(Vec<u8>, u32, u32), CipherErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::hex;
 
-    fn hex(s: &str) -> Vec<u8> {
-        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
+    fn ccmp_key(tk: &[u8]) -> Key<'_> {
+        Key {
+            cipher: Cipher::Ccmp,
+            key: tk,
+            mic: &[0; 8],
+        }
     }
 
     /// IEEE 802.11-2012 M.9.1: BIP with a broadcast deauthentication.
@@ -632,11 +639,7 @@ mod tests {
     fn ccmp_management_frames_match_the_standards_vector() {
         let tk = hex("66ed21042f9f26d7115706e40414cf2e");
         let plain = hex("c0000000020000000100020000000000020000000000 6000 0200");
-        let key = Key {
-            cipher: Cipher::Ccmp,
-            key: &tk,
-            mic: &[0; 8],
-        };
+        let key = ccmp_key(&tk);
         let sealed = protect(&key, &plain, 0x2000_0001, 0);
         assert_eq!(
             sealed,
@@ -792,11 +795,7 @@ mod tests {
         let mut frame = hex("0848c32c0fd2e128a57c5030f1844408abaea5b8fcba8033");
         frame[1] &= !0x40;
         frame.extend(hex("f8ba1a55d02f85ae967bb62fb6cda8eb7e78a050"));
-        let key = Key {
-            cipher: Cipher::Ccmp,
-            key: &tk,
-            mic: &[0; 8],
-        };
+        let key = ccmp_key(&tk);
         // PN b5039776e70c: low two bytes in the first word, key id 0.
         let out = protect(&key, &frame, 0x2000_E70C, 0xB503_9776);
         assert_eq!(
