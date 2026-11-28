@@ -2,11 +2,13 @@
 //! what a person beside the rabbit, or its server, can feel. Each
 //! scenario runs the same way on both firmwares, timed on the board's
 //! own clock, and gives table rows: the measure, r3, lapin, the unit,
-//! and whether lapin does better, worse or the same. Asserted: that every
-//! scenario ran to its end on both, and the rows lapin was made to win
-//! (`NOT_WORSE`, `AT_MOST`, `HIGH_AT_MOST`); the rows it loses are the
-//! goals. It picks both images itself, so it runs once (it is in
-//! `lapin_fixed`), and skips when lapin is not built.
+//! and whether lapin does better, worse or the same. Asserted: that
+//! every scenario ran to its end on both, the rows of [`GOALS`] (lapin's
+//! wins that are to stay: no worse than r3, under a bound, or ahead by
+//! a margin) and the highs of [`HIGH_AT_MOST`]; the other rows lapin
+//! loses are the goals still open. It picks both images itself, so it
+//! runs once (it is in `lapin_fixed`), and skips when lapin is not
+//! built.
 //!
 //! `VERSUS=<part of a scenario's name>` runs only those scenarios. The
 //! table goes to the test's output (`--nocapture`) and to `versus.txt`
@@ -71,30 +73,6 @@ const PEAKS: [(&str, &str); 6] = [
     ("interrupts held back: longest, running", "ms"),
     ("program stack: deepest", "bytes"),
     ("interrupt stack: deepest", "bytes"),
-];
-
-/// The rows where lapin must not do worse than r3, by the table's own
-/// verdict (a tie is allowed).
-const NOT_WORSE: &[&str] = &[
-    "loop of 100 000 turns",
-    "fib 20 (21 891 calls)",
-    "strcat ×2000 (32 + 32 bytes)",
-    "strsub ×2000 (17 bytes)",
-    "itoa ×2000",
-    "table store and fetch ×5000",
-    "20 000 pairs kept and 20 000 strings dropped",
-    "collection with 17 000 pairs live",
-    "button → first sound out, mean of 10",
-    "playStart → first sound out (from the ear's start), mean of 10",
-];
-
-/// Rows where lapin is still behind r3, held to what it takes now: the
-/// application's part of the boot (unpacking the boot bytecode, loading
-/// it) is 42 ms of it, the rescue core's check of the application before
-/// the first console line most of the rest.
-const AT_MOST: &[(&str, f64)] = &[
-    ("open: power-on → boot bytecode running", 150.0),
-    ("WPA2: power-on → boot bytecode running", 150.0),
 ];
 
 /// Highs held to a limit: the high, the scenario (empty: all of them),
@@ -574,12 +552,22 @@ fn at_home_joined(r: &Rabbit, card: &mut Card, sound: bool, busy: bool) -> Machi
 }
 
 /// The access point loses its power for `off_ms` and comes back knowing
-/// no one: what the rabbit sent before is not heard again.
-fn access_point_restarts(m: &mut Machine, off_ms: u64) {
+/// no one: what the rabbit sent before is not heard again. Whether the
+/// rabbit looked for its network meanwhile: a probe, an authentication
+/// or an association request.
+fn access_point_restarts(m: &mut Machine, off_ms: u64) -> bool {
     let ap = m.air.remove(0);
+    m.radio.borrow_mut().tx.clear();
     wait(m, off_ms);
+    let looked = m
+        .radio
+        .borrow()
+        .tx
+        .iter()
+        .any(|f| matches!(f.data[0], 0x40 | 0xB0 | 0x00));
     m.radio.borrow_mut().tx.clear();
     m.air.insert(0, terrier(ap.security));
+    looked
 }
 
 /// Thrown out by the access point (deauthentication): how long until
@@ -602,18 +590,7 @@ fn rejoin_deauth(r: &Rabbit, card: &mut Card) {
 /// nothing of the rabbit.
 fn rejoin_ap_restart(r: &Rabbit, card: &mut Card) {
     let mut m = at_home_joined(r, card, false, false);
-    m.radio.borrow_mut().tx.clear();
-    // A probe, an authentication or an association request, within the
-    // ten seconds: it looks for its network again.
-    let looking = |m: &Machine| {
-        let radio = m.radio.borrow();
-        radio
-            .tx
-            .iter()
-            .any(|f| matches!(f.data[0], 0x40 | 0xB0 | 0x00))
-    };
-    access_point_restarts(&mut m, 10_000);
-    let looked = looking(&m);
+    let looked = access_point_restarts(&mut m, 10_000);
     let marks: [&dyn Fn(&Machine) -> bool; 2] = [
         &|m| {
             m.air[0]
@@ -631,16 +608,42 @@ fn rejoin_ap_restart(r: &Rabbit, card: &mut Card) {
         Better::Higher,
     );
     // Within a turn of the loop callback, where its pulse goes: luck.
-    let thrown = when(at[0]);
+    // (lapin, which noticed the access point gone, is not thrown out:
+    // it joins again when it hears it.)
     card.put(
         "rejoin: access point back → rabbit thrown out (its pulse)",
-        thrown,
+        when(at[0]),
         "ms",
         Better::Info,
     );
     card.ms(
-        "rejoin: thrown out → back on the restarted access point",
-        span(at[0], at[1]),
+        "rejoin: access point back → back on the network",
+        when(at[1]),
+    );
+    card.seen(&m);
+}
+
+/// The access point switched off for 30 s: whether, and when, the
+/// rabbit notices (it tries to join again, its program's loop doing so
+/// once the link is idle), and how long it takes to be back on the
+/// network once the access point is on again.
+fn ap_switched_off(r: &Rabbit, card: &mut Card) {
+    let mut m = at_home_joined(r, card, false, false);
+    let ap = m.air.remove(0);
+    m.radio.borrow_mut().tx.clear();
+    let joining = |m: &Machine| m.radio.borrow().tx.iter().any(|f| f.data[0] == 0xB0);
+    // Off for 30 s, whatever the rabbit does.
+    let noticed = timeline(&mut m, 30_000, &[&joining, &|_| false], |_, _| {})[0];
+    m.air.insert(0, terrier(ap.security));
+    let back: &dyn Fn(&Machine) -> bool = &|m| handshakes(m) >= 1 && authorized(m);
+    let back = timeline(&mut m, 60_000, &[back], |_, _| {})[0];
+    card.ms(
+        "access point off → rabbit notices (joins again)",
+        when(noticed),
+    );
+    card.ms(
+        "access point off 30 s, back → rabbit on the network",
+        when(back),
     );
     card.seen(&m);
 }
@@ -872,7 +875,9 @@ fn rfid(r: &Rabbit, card: &mut Card) {
             .jump(GOTO, top)
             .here(end);
         c.op(&[TIME_MS, SETLOCALB, X]).op(write).op(&[DROP]);
-        c.op(&[TIME_MS, GETLOCALB, X, SUB, GETLOCALB, ACC, ADD, SETLOCALB, ACC]);
+        c.op(&[
+            TIME_MS, GETLOCALB, X, SUB, GETLOCALB, ACC, ADD, SETLOCALB, ACC,
+        ]);
     });
     main.op(&[GETLOCALB, ACC]).say().end();
     let with = program(&globals, &[&main]);
@@ -1434,6 +1439,82 @@ fn images(r: &Rabbit, card: &mut Card) {
     );
 }
 
+/// What a row asserts of lapin's value against r3's.
+#[derive(Clone, Copy)]
+enum Goal {
+    /// As good as r3, or better (within the table's tie).
+    NoWorse,
+    /// Under this, whatever r3 does (or where r3 has nothing).
+    Under(f64),
+    /// Under r3's by at least this.
+    Ahead(f64),
+}
+
+/// The rows held (by the start of their name, so that the highs match
+/// whatever scenario they were seen in): each was lapin's loss, or a
+/// defect of both, until it was fixed.
+const GOALS: &[(&str, Goal)] = &[
+    // The machine: strings copied by words, allocations written in
+    // place, the speed it had over r3 kept.
+    ("loop of 100 000 turns", Goal::NoWorse),
+    ("fib 20 (21 891 calls)", Goal::NoWorse),
+    ("strcat ×2000 (32 + 32 bytes)", Goal::NoWorse),
+    ("strsub ×2000 (17 bytes)", Goal::NoWorse),
+    ("itoa ×2000", Goal::NoWorse),
+    ("table store and fetch ×5000", Goal::NoWorse),
+    (
+        "20 000 pairs kept and 20 000 strings dropped",
+        Goal::NoWorse,
+    ),
+    ("collection with 17 000 pairs live", Goal::NoWorse),
+    // The sound FIFO filled by a slice copy.
+    ("button → first sound out, mean of 10", Goal::NoWorse),
+    (
+        "playStart → first sound out (from the ear's start), mean of 10",
+        Goal::NoWorse,
+    ),
+    // Still behind r3, held to what it takes now.
+    ("open: power-on → boot bytecode running", Goal::Under(150.0)),
+    ("WPA2: power-on → boot bytecode running", Goal::Under(150.0)),
+    // The PMK derivation: SHA-1 without the library's division.
+    ("setup: settings sent → answer", Goal::Ahead(5000.0)),
+    // The tag's programming waited out after the bytecode's answer.
+    ("rfidWrite of a block", Goal::NoWorse),
+    // The rescue core's CRC of the application, a byte a step.
+    ("interrupts held back: longest, booting", Goal::Under(40.0)),
+    // Beacon loss: r3 never notices.
+    ("access point off → rabbit notices", Goal::Under(5000.0)),
+    (
+        "access point off 30 s, back → rabbit on the network",
+        Goal::Under(1000.0),
+    ),
+    (
+        "rejoin: access point back → back on the network",
+        Goal::Under(1000.0),
+    ),
+];
+
+/// The goals a row misses: (row, r3, lapin, unit).
+fn missed(rows: &[(String, Option<f64>, Option<f64>, &str)]) -> Vec<String> {
+    let mut missed = Vec::new();
+    for (name, goal) in GOALS {
+        for (metric, a, b, unit) in rows.iter().filter(|r| r.0.starts_with(name)) {
+            let held = match (goal, a, b) {
+                (Goal::NoWorse, _, _) => {
+                    matches!(verdict(*a, *b, unit, Better::Lower), "better" | "equal")
+                }
+                (Goal::Under(bound), _, Some(b)) => b < bound,
+                (Goal::Ahead(by), Some(a), Some(b)) => b <= &(a - by),
+                _ => false,
+            };
+            if !held {
+                missed.push(format!("{metric}: r3 {}, lapin {}", show(*a), show(*b)));
+            }
+        }
+    }
+    missed
+}
+
 type Scenario = fn(&Rabbit, &mut Card);
 
 const SCENARIOS: &[(&str, Scenario)] = &[
@@ -1443,6 +1524,7 @@ const SCENARIOS: &[(&str, Scenario)] = &[
     ("boot crowded", boot_crowded),
     ("rejoin deauth", rejoin_deauth),
     ("rejoin access point", rejoin_ap_restart),
+    ("access point off", ap_switched_off),
     ("power cut", rejoin_power_cut),
     ("netScan few", scan_few),
     ("netScan crowded", scan_crowded),
@@ -1567,7 +1649,8 @@ fn scorecard() {
             .collect::<Vec<_>>(),
     ];
     let mut failures = Vec::new();
-    let mut missed = Vec::new();
+    let mut raw = Vec::new();
+    let mut highs_missed = Vec::new();
     let mut peaks = [[(0.0, ""); 6]; 2];
     for pair in cards.chunks(2) {
         let (r3, lapin) = (&pair[0].0, &pair[1].0);
@@ -1580,7 +1663,7 @@ fn scorecard() {
             let i = PEAKS.iter().position(|(name, _)| *name == high).unwrap();
             let b = lapin.peaks[i].0;
             if (scenario.is_empty() || scenario == lapin.scenario) && b > limit {
-                missed.push(format!("{high} in {}: {b}, over {limit}", lapin.scenario));
+                highs_missed.push(format!("{high} in {}: {b}, over {limit}", lapin.scenario));
             }
         }
         let mut row = vec![r3.scenario.to_string()];
@@ -1609,32 +1692,20 @@ fn scorecard() {
                     .and_then(|m| m.value)
             };
             let (a, b) = (value(r3), value(lapin));
-            let judged = verdict(a, b, row.unit, row.better);
-            if NOT_WORSE.contains(&row.metric.as_str()) && !matches!(judged, "better" | "equal") {
-                missed.push(format!(
-                    "{}: {} on r3, {} on lapin",
-                    row.metric,
-                    show(a),
-                    show(b)
-                ));
-            }
-            for &(metric, limit) in AT_MOST {
-                if metric == row.metric && b.is_none_or(|b| b > limit) {
-                    missed.push(format!("{metric}: {}, over {limit}", show(b)));
-                }
-            }
+            raw.push((row.metric.clone(), a, b, row.unit));
             table.push(vec![
                 row.metric.clone(),
                 show(a),
                 show(b),
                 row.unit.into(),
-                judged.into(),
+                verdict(a, b, row.unit, row.better).into(),
             ]);
         }
     }
     for (i, (name, unit)) in PEAKS.iter().enumerate() {
         let [(a, at_a), (b, at_b)] =
             [peaks[0][i], peaks[1][i]].map(|(v, at)| (v, if at.is_empty() { "none" } else { at }));
+        raw.push((name.to_string(), Some(a), Some(b), unit));
         table.push(vec![
             format!("{name} (r3 in {at_a}, lapin in {at_b})"),
             show(Some(a)),
@@ -1657,9 +1728,7 @@ fn scorecard() {
         "scenarios that did not run to their end:\n{}",
         failures.join("\n")
     );
-    assert!(
-        missed.is_empty(),
-        "lapin fell behind where it had won:\n{}",
-        missed.join("\n")
-    );
+    let mut missed = missed(&raw);
+    missed.extend(highs_missed);
+    assert!(missed.is_empty(), "goals missed:\n{}", missed.join("\n"));
 }
