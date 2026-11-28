@@ -62,6 +62,11 @@ impl World {
         Self::with_wifi(body, nabemu::config::Wifi::Open, 0)
     }
 
+    /// The same, its server answering every request with nothing.
+    pub fn quiet() -> Self {
+        Self::new(Vec::new())
+    }
+
     /// The same, set up for `wifi`, the access point advertising
     /// `encryption` (`IEEE80211_CRYPT_*`).
     pub fn with_wifi(body: Vec<u8>, wifi: nabemu::config::Wifi, encryption: u8) -> Self {
@@ -631,6 +636,55 @@ pub fn run_c(world: World, bytecode: &[u8], turns: usize) -> Outcome {
             registers: (cvm_stack(), cvm_heapindex(), cvm_start()),
             turns: done,
         }
+    }
+}
+
+/// Run both machines on worlds `world` makes alike, fail on the first
+/// difference between them, and give back what the C one did.
+pub fn run_both(world: impl Fn() -> World, bytecode: &[u8], turns: usize) -> Outcome {
+    let c = run_c(world(), bytecode, turns);
+    let r = run_rust(world(), bytecode, turns);
+    assert_same(&c, &r);
+    c
+}
+
+/// Fail on the first difference between a run of the C machine and one
+/// of the Rust machine.
+pub fn assert_same(c: &Outcome, r: &Outcome) {
+    let (cc, rc) = (
+        String::from_utf8_lossy(&c.world.console),
+        String::from_utf8_lossy(&r.world.console),
+    );
+    if cc != rc {
+        let at = cc
+            .chars()
+            .zip(rc.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        panic!(
+            "consoles differ at {at}:\nC:    {:?}\nRust: {:?}",
+            &cc[at.saturating_sub(200).min(cc.len())..(at + 200).min(cc.len())],
+            &rc[at.saturating_sub(200).min(rc.len())..(at + 200).min(rc.len())]
+        );
+    }
+    for (i, (a, b)) in c.world.log.iter().zip(&r.world.log).enumerate() {
+        assert_eq!(a, b, "call {i} differs");
+    }
+    assert_eq!(c.world.log.len(), r.world.log.len(), "number of calls");
+    assert_eq!(c.registers, r.registers, "stack, heap index, heap start");
+    assert_same_memory(&c.heap, &r.heap, "");
+    assert_eq!(c.fifo, r.fifo, "audio buffer");
+    assert_eq!(c.turns, r.turns, "turns");
+}
+
+/// Fail on the first word where the C machine's memory and the Rust
+/// one's differ; `what` heads the message.
+pub fn assert_same_memory(c: &[i32], r: &[i32], what: &str) {
+    if let Some(i) = (0..c.len()).find(|&i| c[i] != r[i]) {
+        panic!(
+            "{what}memory differs from word {i}: C {:08x}, Rust {:08x}",
+            c[i], r[i]
+        );
     }
 }
 

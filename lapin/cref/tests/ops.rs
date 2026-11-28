@@ -2,7 +2,7 @@
 //! same console, same calls, same memory to the word.
 
 use lapin_metal::op::*;
-use lapin_metal_cref::{Outcome, World, run_c, run_rust};
+use lapin_metal_cref::{Outcome, World, assert_same_memory, run_both, run_c, run_rust};
 
 /// A function being assembled, with labels for its jumps.
 #[derive(Default)]
@@ -48,6 +48,11 @@ impl Fun {
         self.fixups.push((self.code.len(), l));
         self.code.extend([0, 0]);
         self
+    }
+    /// An integer, or nil for a negative one: the natives' optional
+    /// arguments.
+    fn int_or_nil(&mut self, v: i32) -> &mut Self {
+        if v < 0 { self.op(NIL_) } else { self.int(v) }
     }
     /// Print the top of the stack as a number and drop it.
     fn show(&mut self) -> &mut Self {
@@ -102,27 +107,9 @@ fn bytecode_with(strings: &[&[u8]], ints: &[i32], funs: &[&Fun]) -> Vec<u8> {
     bc
 }
 
-fn same(c: &Outcome, r: &Outcome) {
-    assert_eq!(
-        String::from_utf8_lossy(&c.world.console),
-        String::from_utf8_lossy(&r.world.console)
-    );
-    assert_eq!(c.world.log, r.world.log);
-    assert_eq!(c.registers, r.registers, "stack, heap index, heap start");
-    if let Some(i) = (0..c.heap.len()).find(|&i| c.heap[i] != r.heap[i]) {
-        panic!(
-            "memory differs from word {i}: C {:08x}, Rust {:08x}",
-            c.heap[i], r.heap[i]
-        );
-    }
-    assert_eq!(c.fifo, r.fifo);
-}
-
 /// Run on both, compare, give back what the C printed.
 fn both(bc: &[u8]) -> String {
-    let c = run_c(World::new(Vec::new()), bc, 3);
-    let r = run_rust(World::new(Vec::new()), bc, 3);
-    same(&c, &r);
+    let c = run_both(World::quiet, bc, 3);
     String::from_utf8_lossy(&c.world.console).into_owned()
 }
 
@@ -201,13 +188,7 @@ fn strings() {
     // strsub, out of range and nil lengths.
     for (start, len) in [(0, 3), (2, -1), (4, 100), (-1, 2), (10, 1), (3, 0)] {
         g(&mut f, 0);
-        f.int(start);
-        if len < 0 {
-            f.op(NIL_);
-        } else {
-            f.int(len);
-        }
-        f.op(STRSUB).shows();
+        f.int(start).int_or_nil(len).op(STRSUB).shows();
     }
     // strcat with nil on either side.
     g(&mut f, 0);
@@ -224,13 +205,7 @@ fn strings() {
             g(&mut f, 0);
             f.int(from);
             g(&mut f, 2);
-            f.int(0);
-            if len < 0 {
-                f.op(NIL_);
-            } else {
-                f.int(len);
-            }
-            f.op(o).show();
+            f.int(0).int_or_nil(len).op(o).show();
         }
     }
     g(&mut f, 0);
@@ -331,13 +306,7 @@ fn strings() {
     // rotated halfword, the host's does not (pinned in lapin-metal).
     for (i, l) in [(0, -1), (2, -1), (0, 7), (4, 4), (-1, 2)] {
         g(&mut f, 0);
-        f.int(i);
-        if l < 0 {
-            f.op(NIL_);
-        } else {
-            f.int(l);
-        }
-        f.int(0x1234).op(NETCHK).show();
+        f.int(i).int_or_nil(l).int(0x1234).op(NETCHK).show();
     }
     g(&mut f, 0);
     f.int(-5).op(NETSEQADD).shows();
@@ -368,34 +337,25 @@ fn tables_and_calls() {
         .int(1)
         .op(ADD)
         .op(RET);
-    // g(n) = if n == 0 then 0 else g(n - 1): a tail call, so it runs in
-    // constant stack.
-    let mut g = Fun::new(1, 0);
-    let rec = g.label();
-    g.b(GETLOCALB, 0)
-        .int(0)
-        .op(EQ)
-        .jump(ELSE, rec)
-        .int(0)
-        .op(RET);
-    g.here(rec)
-        .b(GETLOCALB, 0)
-        .int(1)
-        .op(SUB)
-        .int(2)
-        .op(EXEC)
-        .op(RET);
+    // Both recursions start with: if n == 0 then 0 else ...
+    let zero_or = || {
+        let mut f = Fun::new(1, 0);
+        let rec = f.label();
+        f.b(GETLOCALB, 0)
+            .int(0)
+            .op(EQ)
+            .jump(ELSE, rec)
+            .int(0)
+            .op(RET)
+            .here(rec);
+        f
+    };
+    // g(n) = g(n - 1): a tail call, so it runs in constant stack.
+    let mut g = zero_or();
+    g.b(GETLOCALB, 0).int(1).op(SUB).int(2).op(EXEC).op(RET);
     // h(n) = n + h(n - 1), not a tail call.
-    let mut h = Fun::new(1, 0);
-    let rec = h.label();
+    let mut h = zero_or();
     h.b(GETLOCALB, 0)
-        .int(0)
-        .op(EQ)
-        .jump(ELSE, rec)
-        .int(0)
-        .op(RET);
-    h.here(rec)
-        .b(GETLOCALB, 0)
         .b(GETLOCALB, 0)
         .int(1)
         .op(SUB)
@@ -531,9 +491,7 @@ fn out_of_memory_breaks_both_the_same_way() {
         .b(SETLOCALB, 1)
         .jump(GOTO, top);
     end(&mut f);
-    let c = run_c(World::new(Vec::new()), &bytecode(&[], &[&f]), 2);
-    let r = run_rust(World::new(Vec::new()), &bytecode(&[], &[&f]), 2);
-    same(&c, &r);
+    let c = run_both(World::quiet, &bytecode(&[], &[&f]), 2);
     assert!(c.world.log.contains(&"reboot".to_string()));
 }
 
@@ -637,9 +595,7 @@ fn sound_streams() {
     end(&mut f);
     let pcm: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
     let bc = bytecode_with(&[&pcm], &[0], &[&f, &feed, &got, &tick]);
-    let c = run_c(World::new(Vec::new()), &bc, 40);
-    let r = run_rust(World::new(Vec::new()), &bc, 40);
-    same(&c, &r);
+    let c = run_both(World::quiet, &bc, 40);
     assert!(c.world.codec_fed > 4000, "{}", c.world.codec_fed);
     assert!(String::from_utf8_lossy(&c.world.console).contains("256"));
 }
@@ -796,7 +752,7 @@ fn rust_within(bc: &[u8], runs: usize, secs: u64) -> Left {
     let bc = bc.to_vec();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(left(&run_rust(World::new(Vec::new()), &bc, runs)));
+        let _ = tx.send(left(&run_rust(World::quiet(), &bc, runs)));
     });
     rx.recv_timeout(std::time::Duration::from_secs(secs))
         .expect("the Rust machine never finished")
@@ -824,11 +780,7 @@ fn a_store_at_a_negative_index_into_a_negative_header_is_skipped_as_in_c() {
         }
         m.op(DROP);
         end(&mut m);
-        let bc = bytecode(&[], &[&m]);
-        same(
-            &run_c(World::new(Vec::new()), &bc, 0),
-            &run_rust(World::new(Vec::new()), &bc, 0),
-        );
+        run_both(World::quiet, &bytecode(&[], &[&m]), 0);
     }
 }
 
@@ -857,18 +809,16 @@ fn a_recording_block_moved_by_its_own_push_gets_the_samples() {
             .op(RET);
         bytecode(&[], &[&m, &cb])
     };
-    let (stack, heapindex, _) = run_c(World::new(Vec::new()), &prog(0), 0).registers;
+    let (stack, heapindex, _) = run_c(World::quiet(), &prog(0), 0).registers;
     // 16 words left after the recording's block: its push collects.
     let want = LEN + stack - heapindex + 4 - 84;
     let mut collected = 0;
     for dw in -3..=3 {
         let bc = prog((want + dw - 3) * 4 - 4);
-        let c = run_c(World::new(Vec::new()), &bc, 1);
-        let r = run_rust(World::new(Vec::new()), &bc, 1);
+        let c = run_both(World::quiet, &bc, 1);
         collected += String::from_utf8_lossy(&c.world.console)
             .matches("#GC")
             .count();
-        same(&c, &r);
     }
     assert!(collected > 0, "no collection met: the test lost its point");
 }
@@ -903,19 +853,14 @@ fn the_collector_finishes_with_a_pointer_outside_the_memory() {
             // what matters here.
             assert!(String::from_utf8_lossy(&r.console).contains("42"));
         } else {
-            let c = left(&run_c(World::new(Vec::new()), &bc, 0));
+            let c = left(&run_c(World::quiet(), &bc, 0));
             assert_eq!(
                 String::from_utf8_lossy(&c.console),
                 String::from_utf8_lossy(&r.console)
             );
             assert_eq!(c.registers, r.registers, "k {k}");
             assert_eq!(c.log, r.log, "k {k}");
-            if let Some(i) = (0..c.heap.len()).find(|&i| c.heap[i] != r.heap[i]) {
-                panic!(
-                    "k {k}: memory differs from word {i}: C {:08x}, Rust {:08x}",
-                    c.heap[i], r.heap[i]
-                );
-            }
+            assert_same_memory(&c.heap, &r.heap, &format!("k {k}: "));
             assert_eq!(c.fifo, r.fifo, "k {k}");
         }
     }
