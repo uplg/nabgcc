@@ -8,7 +8,7 @@
 //! for integrity, SHA-256 for derivation), then exchanges CCMP data.
 //! Frames go straight on a [`Radio`]: no emulated processor involved.
 
-use crate::air::{Mac, eapol_key_data, element, mac_header, random_bytes, seal_ccmp};
+use crate::air::{Mac, Rng, eapol_key_data, element, mac_header, seal_ccmp};
 use crate::crypto::{self, Cipher, Key};
 use crate::rt2573::{Radio, TxFrame};
 use crate::sae;
@@ -95,7 +95,7 @@ pub struct Supplicant {
     rx_pn: u64,
     group_rx_pn: u64,
     seq: u16,
-    rng: u64,
+    rng: Rng,
 }
 
 const LLC_EAPOL: [u8; 8] = [0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00, 0x88, 0x8E];
@@ -133,13 +133,8 @@ impl Supplicant {
             rx_pn: 0,
             group_rx_pn: 0,
             seq: 0,
-            rng: u64::from_le_bytes([mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], 0x3C, 0xC3])
-                | 1,
+            rng: Rng::new(mac, [0x3C, 0xC3]),
         }
-    }
-
-    fn random(&mut self) -> [u8; 32] {
-        random_bytes(&mut self.rng)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -199,7 +194,7 @@ impl Supplicant {
                 )
             }
         };
-        let (rand, mask) = (self.random(), self.random());
+        let (rand, mask) = (self.rng.bytes(), self.rng.bytes());
         let session = sae::Session::new(element, &rand, &mask);
         let mut body = vec![3, 0, 1, 0];
         body.extend_from_slice(&status.to_le_bytes());
@@ -557,7 +552,7 @@ impl Supplicant {
                 return;
             }
             let anonce = &eapol[17..49];
-            self.snonce = self.random();
+            self.snonce = self.rng.bytes();
             let (lo_mac, hi_mac) = if self.bssid < self.mac {
                 (self.bssid, self.mac)
             } else {

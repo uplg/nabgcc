@@ -324,7 +324,7 @@ pub struct AccessPoint {
     /// Keys of past password exchanges, by station: what PMKSA caching
     /// lets a station associate with again, without SAE.
     pmksa: BTreeMap<Mac, ([u8; 32], [u8; 16])>,
-    rng: u64,
+    rng: Rng,
     seq: u16,
     heard: usize,
     next_beacon: u64,
@@ -432,15 +432,26 @@ pub(crate) fn mac_header(fc0: u8, fc1: u8, a1: Mac, a2: Mac, a3: Mac, seq: &mut 
     f
 }
 
-/// Bytes from a xorshift generator. The emulated ends draw their nonces
-/// from one seeded by their address, so that runs repeat.
-pub(crate) fn random_bytes<const N: usize>(rng: &mut u64) -> [u8; N] {
-    std::array::from_fn(|_| {
-        *rng ^= *rng << 13;
-        *rng ^= *rng >> 7;
-        *rng ^= *rng << 17;
-        (*rng >> 24) as u8
-    })
+/// A xorshift generator. The emulated ends draw their nonces from one
+/// seeded by their address, so that runs repeat.
+pub(crate) struct Rng(u64);
+
+impl Rng {
+    /// Seeded by an address and two bytes of the end's own.
+    pub(crate) fn new(mac: Mac, salt: [u8; 2]) -> Rng {
+        let [a, b, c, d, e, f] = mac;
+        Rng(u64::from_le_bytes([a, b, c, d, e, f, salt[0], salt[1]]) | 1)
+    }
+
+    pub(crate) fn bytes<const N: usize>(&mut self) -> [u8; N] {
+        let rng = &mut self.0;
+        std::array::from_fn(|_| {
+            *rng ^= *rng << 13;
+            *rng ^= *rng >> 7;
+            *rng ^= *rng << 17;
+            (*rng >> 24) as u8
+        })
+    }
 }
 
 /// A unicast frame sealed with CCMP under the temporal key of `ptk`,
@@ -500,25 +511,19 @@ impl AccessPoint {
             group_pn: 0,
             stations: BTreeMap::new(),
             pmksa: BTreeMap::new(),
-            rng: u64::from_le_bytes([
-                bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], 0x5A, 0xA5,
-            ]) | 1,
+            rng: Rng::new(bssid, [0x5A, 0xA5]),
             seq: 0,
             heard: 0,
             next_beacon: 0,
             now: 0,
         };
-        ap.gtk = ap.random();
-        ap.igtk = ap.random();
-        ap.comeback_key = ap.random();
+        ap.gtk = ap.rng.bytes();
+        ap.igtk = ap.rng.bytes();
+        ap.comeback_key = ap.rng.bytes();
         if let Security::Psk { passphrase, .. } = &ap.security {
             ap.passphrase = passphrase.clone();
         }
         ap
-    }
-
-    fn random<const N: usize>(&mut self) -> [u8; N] {
-        random_bytes(&mut self.rng)
     }
 
     /// Whether this station completed everything the network demands.
@@ -664,8 +669,8 @@ impl AccessPoint {
     pub fn power_cut(&mut self) {
         self.stations.clear();
         self.pmksa.clear();
-        self.gtk = self.random();
-        self.igtk = self.random();
+        self.gtk = self.rng.bytes();
+        self.igtk = self.rng.bytes();
         self.group_pn = 0;
         self.ipn = 0;
     }
@@ -899,7 +904,7 @@ impl AccessPoint {
                 } else {
                     sae::password_element_looping(&self.bssid, &sta, self.passphrase.as_bytes())
                 };
-                let (rand, mask) = (self.random(), self.random());
+                let (rand, mask) = (self.rng.bytes(), self.rng.bytes());
                 let mut session = sae::Session::new(element, &rand, &mask);
                 if session.process_commit(&theirs).is_err() {
                     return self.events.push(ApEvent::SaeRejected {
@@ -1032,7 +1037,7 @@ impl AccessPoint {
     /// One SA Query request, protected with the station's pairwise key,
     /// with a fresh transaction identifier.
     fn sa_query_round(&mut self, radio: &mut Radio, sta: Mac) {
-        let id: [u8; 2] = self.random();
+        let id: [u8; 2] = self.rng.bytes();
         let (now, retry) = (self.now, Self::tu_to_ms(self.sa_query_retry_tu));
         let s = self.stations.get_mut(&sta).unwrap();
         if s.sa_query.is_empty() {
@@ -1196,7 +1201,7 @@ impl AccessPoint {
                 });
             }
             (1, 1) if wep.is_some() => {
-                let challenge: [u8; 128] = self.random();
+                let challenge: [u8; 128] = self.rng.bytes();
                 let mut s = Self::new_station();
                 s.challenge = challenge.to_vec();
                 self.stations.insert(sta, s);
@@ -1575,7 +1580,7 @@ impl AccessPoint {
         let out = match (&security, protect) {
             (Security::Open, _) | (_, false) => frame,
             (Security::Wep { key, .. }, true) => {
-                let iv: [u8; 3] = self.random();
+                let iv: [u8; 3] = self.rng.bytes();
                 let iv = u32::from_le_bytes([iv[0], iv[1], iv[2], 0]);
                 crypto::protect(
                     &Key {
@@ -1730,7 +1735,7 @@ impl AccessPoint {
             }
             (crypto::aes_wrap(&kek, &data), [0; 16])
         } else {
-            let iv: [u8; 16] = self.random();
+            let iv: [u8; 16] = self.rng.bytes();
             let mut seed = iv.to_vec();
             seed.extend_from_slice(&kek);
             crypto::rc4(&seed, 256, &mut data);
@@ -1746,7 +1751,7 @@ impl AccessPoint {
 
     /// Message 1 of a pairwise handshake, with a fresh nonce.
     fn send_anonce(&mut self, radio: &mut Radio, sta: Mac, pairwise: Cipher) {
-        let anonce = self.random();
+        let anonce = self.rng.bytes();
         let s = self.stations.get_mut(&sta).unwrap();
         s.anonce = anonce;
         // After SAE, message 1 names the key both ends just derived.
@@ -1820,13 +1825,13 @@ impl AccessPoint {
         if self.psk_params().is_none() {
             return;
         }
-        self.gtk = self.random();
+        self.gtk = self.rng.bytes();
         self.gtk_index = if self.gtk_index == 1 { 2 } else { 1 };
         self.group_pn = 0;
         // The integrity group key is renewed with it, under the other
         // of its two identifiers (as hostapd's `wpa_gtk_update`).
         if self.wpa3 != Wpa3::Off {
-            self.igtk = self.random();
+            self.igtk = self.rng.bytes();
             self.igtk_index = if self.igtk_index == 4 { 5 } else { 4 };
             self.ipn = 0;
         }

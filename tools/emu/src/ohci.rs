@@ -466,6 +466,9 @@ impl Ohci {
         // Packets that went through, and the descriptor as they leave
         // it: its toggle field, once a packet moved.
         let mut packets_ok = 0u32;
+        // Bytes moved by a transfer the device cut short with a NAK:
+        // they stay moved, the rest waits for the next frame.
+        let mut partly = None;
         let td_toggle = |td_ctl: u32, packets_ok: u32, toggle: bool| {
             if packets_ok == 0 {
                 td_ctl & (3 << 24)
@@ -535,16 +538,9 @@ impl Ohci {
                                 }
                             }
                             Xfer::Nak if sent > 0 => {
-                                // What went out stays out: come back next
-                                // frame for the rest, with its toggle.
-                                ram.wr32(
-                                    td,
-                                    (td_ctl & !(3 << 24)) | td_toggle(td_ctl, packets_ok, toggle),
-                                )?;
-                                ram.wr32(td + 4, cbp + sent as u32)?;
-                                self.toggles[ep as usize] = device_toggles;
-                                self.toggle_drops += drops;
-                                return Some(false);
+                                partly = Some(sent);
+                                result = Some(Xfer::Nak);
+                                break;
                             }
                             other => {
                                 result = Some(other);
@@ -589,15 +585,8 @@ impl Ohci {
                                 }
                             }
                             Xfer::Nak if got > 0 => {
-                                // Keep what arrived, come back next frame.
-                                ram.wr32(
-                                    td,
-                                    (td_ctl & !(3 << 24)) | td_toggle(td_ctl, packets_ok, toggle),
-                                )?;
-                                ram.wr32(td + 4, cbp + got as u32)?;
-                                self.toggles[ep as usize] = device_toggles;
-                                self.toggle_drops += drops;
-                                return Some(false);
+                                partly = Some(got);
+                                break Xfer::Nak;
                             }
                             other => break other,
                         }
@@ -609,6 +598,15 @@ impl Ohci {
             self.toggles[ep as usize] = device_toggles;
         }
         self.toggle_drops += drops;
+        if let Some(moved) = partly {
+            // Come back next frame for the rest, with its toggle.
+            ram.wr32(
+                td,
+                (td_ctl & !(3 << 24)) | td_toggle(td_ctl, packets_ok, toggle),
+            )?;
+            ram.wr32(td + 4, cbp + moved as u32)?;
+            return Some(false);
+        }
 
         let (cc, moved) = match outcome {
             None => (CC_NOT_RESPONDING, 0),

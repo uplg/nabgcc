@@ -148,6 +148,14 @@ fn mont_mul(a: &Limbs, b: &Limbs) -> Limbs {
     }
 }
 
+/// `a * 2^256 mod p`, by doubling `a` that many times.
+fn times_2_256(mut a: Limbs) -> Limbs {
+    for _ in 0..256 {
+        a = add_mod(&a, &a, &P);
+    }
+    a
+}
+
 /// An element of the field, in Montgomery form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fe(Limbs);
@@ -157,22 +165,13 @@ impl Fe {
 
     /// 2^256 mod p: the number one in Montgomery form.
     pub fn one() -> Fe {
-        let mut one = ONE;
-        // 2^256 mod p by doubling 1 that many times.
-        for _ in 0..256 {
-            one = add_mod(&one, &one, &P);
-        }
-        Fe(one)
+        Fe(times_2_256(ONE))
     }
 
     /// From a plain number, reduced modulo p first.
     pub fn new(n: &Limbs) -> Fe {
         // To Montgomery form: multiply by 2^512 mod p.
-        let mut r2 = Fe::one().0;
-        for _ in 0..256 {
-            r2 = add_mod(&r2, &r2, &P);
-        }
-        Fe(mont_mul(&reduce(n, &P), &r2))
+        Fe(mont_mul(&reduce(n, &P), &times_2_256(Fe::one().0)))
     }
 
     pub fn from_bytes(bytes: &[u8; 32]) -> Fe {
@@ -229,14 +228,7 @@ impl Fe {
     }
 
     fn pow(&self, exponent: &Limbs) -> Fe {
-        let mut result = Fe::one();
-        for i in (0..256).rev() {
-            result = result.square();
-            if exponent[i / 32] >> (i % 32) & 1 != 0 {
-                result = result.mul(self);
-            }
-        }
-        result
+        binary_method(exponent, Fe::one(), Fe::square, |r| r.mul(self))
     }
 
     /// The inverse, or zero for zero (Fermat: `a^(p-2)`).
@@ -265,6 +257,20 @@ impl Fe {
         let root = self.pow(&e);
         (root.square() == *self).then_some(root)
     }
+}
+
+/// Left to right over the 256 bits of `bits`, from `start`: `twice` for
+/// every bit, then `plus` where it is set. A power of a field element
+/// (square, multiply), or a multiple of a point (double, add).
+fn binary_method<T>(bits: &Limbs, start: T, twice: impl Fn(&T) -> T, plus: impl Fn(&T) -> T) -> T {
+    let mut result = start;
+    for i in (0..256).rev() {
+        result = twice(&result);
+        if bits[i / 32] >> (i % 32) & 1 != 0 {
+            result = plus(&result);
+        }
+    }
+    result
 }
 
 fn shift_right(a: &Limbs) -> Limbs {
@@ -403,14 +409,7 @@ impl Point {
 
     /// `scalar` times the point.
     pub fn mul(&self, scalar: &Limbs) -> Point {
-        let mut result = Point::infinity();
-        for i in (0..256).rev() {
-            result = result.double();
-            if scalar[i / 32] >> (i % 32) & 1 != 0 {
-                result = result.add(self);
-            }
-        }
-        result
+        binary_method(scalar, Point::infinity(), Point::double, |r| r.add(self))
     }
 }
 

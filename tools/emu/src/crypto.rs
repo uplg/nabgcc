@@ -620,6 +620,19 @@ mod tests {
         }
     }
 
+    /// CCMP against a standard's vector: `plain` sealed under `tk`
+    /// with the PN in (`iv`, `eiv`) is `sealed`, and opens back to
+    /// the same body and PN. The sealed frame comes back.
+    fn ccmp_vector(tk: &[u8], plain: &[u8], (iv, eiv): (u32, u32), sealed: &str) -> Vec<u8> {
+        let key = ccmp_key(tk);
+        let out = protect(&key, plain, iv, eiv);
+        assert_eq!(out, hex(sealed));
+        let (opened, opened_iv, opened_eiv) = unprotect(&key, &out).unwrap();
+        assert_eq!(opened[HEADER_LEN..], plain[HEADER_LEN..]);
+        assert_eq!((opened_iv, opened_eiv), (iv, eiv));
+        out
+    }
+
     /// IEEE 802.11-2012 M.9.1: BIP with a broadcast deauthentication.
     #[test]
     fn bip_matches_the_standards_vector() {
@@ -637,17 +650,13 @@ mod tests {
     /// the management flag in the nonce.
     #[test]
     fn ccmp_management_frames_match_the_standards_vector() {
-        let tk = hex("66ed21042f9f26d7115706e40414cf2e");
-        let plain = hex("c0000000020000000100020000000000020000000000 6000 0200");
-        let key = ccmp_key(&tk);
-        let sealed = protect(&key, &plain, 0x2000_0001, 0);
-        assert_eq!(
-            sealed,
-            hex("c0400000020000000100020000000000020000000000 6000
-                 0100002000000000 1d07 cafd0409bb8bafef")
+        ccmp_vector(
+            &hex("66ed21042f9f26d7115706e40414cf2e"),
+            &hex("c0000000020000000100020000000000020000000000 6000 0200"),
+            (0x2000_0001, 0),
+            "c0400000020000000100020000000000020000000000 6000
+             0100002000000000 1d07 cafd0409bb8bafef",
         );
-        let (opened, _, _) = unprotect(&key, &sealed).unwrap();
-        assert_eq!(opened[24..], plain[24..]);
     }
 
     #[test]
@@ -795,22 +804,16 @@ mod tests {
         let mut frame = hex("0848c32c0fd2e128a57c5030f1844408abaea5b8fcba8033");
         frame[1] &= !0x40;
         frame.extend(hex("f8ba1a55d02f85ae967bb62fb6cda8eb7e78a050"));
-        let key = ccmp_key(&tk);
         // PN b5039776e70c: low two bytes in the first word, key id 0.
-        let out = protect(&key, &frame, 0x2000_E70C, 0xB503_9776);
-        assert_eq!(
-            out,
-            hex(
-                "0848c32c0fd2e128a57c5030f1844408abaea5b8fcba8033 0ce70020769703b5
-                 f3d0a2fe9a3dbf2342a643e43246e80c3c04d019 7845ce0b16f97623"
-            )
+        let mut bad = ccmp_vector(
+            &tk,
+            &frame,
+            (0x2000_E70C, 0xB503_9776),
+            "0848c32c0fd2e128a57c5030f1844408abaea5b8fcba8033 0ce70020769703b5
+             f3d0a2fe9a3dbf2342a643e43246e80c3c04d019 7845ce0b16f97623",
         );
-        let (clear, iv, eiv) = unprotect(&key, &out).unwrap();
-        assert_eq!(clear[HEADER_LEN..], frame[HEADER_LEN..]);
-        assert_eq!((iv, eiv), (0x2000_E70C, 0xB503_9776));
-        let mut bad = out;
         bad[40] ^= 1;
-        assert_eq!(unprotect(&key, &bad), Err(CipherError::Icv));
+        assert_eq!(unprotect(&ccmp_key(&tk), &bad), Err(CipherError::Icv));
     }
 
     #[test]

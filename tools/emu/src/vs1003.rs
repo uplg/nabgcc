@@ -610,7 +610,7 @@ fn recognise(data: &[u8]) -> Format {
         };
     };
     if h[0] == 0xFF && h[1] & 0xE0 == 0xE0 {
-        let (kbps, sample_rate) = mpeg_rates(h);
+        let (_, kbps, sample_rate) = mpeg_rates(h);
         if kbps != 0 && sample_rate != 0 {
             return Format::Mp3 {
                 bitrate: kbps * 1000,
@@ -628,9 +628,10 @@ fn id3_len(data: &[u8]) -> usize {
         .fold(0usize, |n, b| n << 7 | (*b & 0x7F) as usize)
 }
 
-/// The bit rate in kbit/s and the sample rate in Hz of an MPEG audio
-/// frame header, read as layer III; zero for the reserved values.
-fn mpeg_rates(h: &[u8]) -> (u32, u32) {
+/// The version, the bit rate in kbit/s and the sample rate in Hz of an
+/// MPEG audio frame header, read as layer III; zero rates for the
+/// reserved values. Version 3 is MPEG 1, 2 MPEG 2, 0 MPEG 2.5, 1 reserved.
+fn mpeg_rates(h: &[u8]) -> (u8, u32, u32) {
     const KBPS_V1: [u32; 16] = [
         0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
     ];
@@ -645,7 +646,7 @@ fn mpeg_rates(h: &[u8]) -> (u32, u32) {
         2 => base / 2,
         _ => base / 4,
     };
-    (kbps, sample_rate)
+    (version, kbps, sample_rate)
 }
 
 /// One MPEG layer III frame header, as the decoder needs it.
@@ -662,17 +663,12 @@ fn mp3_frame(h: &[u8]) -> Option<Mp3Frame> {
     if h.len() < 4 || h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[1] & 0x06 != 0x02 {
         return None;
     }
-    let version = (h[1] >> 3) & 3;
-    if version == 1 {
-        return None;
-    }
-    let v1 = version == 3;
-    let (kbps, sample_rate) = mpeg_rates(h);
-    if kbps == 0 || sample_rate == 0 {
+    let (version, kbps, sample_rate) = mpeg_rates(h);
+    if version == 1 || kbps == 0 || sample_rate == 0 {
         return None;
     }
     let pad = ((h[2] >> 1) & 1) as usize;
-    let (samples, coef) = if v1 { (1152, 144) } else { (576, 72) };
+    let (samples, coef) = if version == 3 { (1152, 144) } else { (576, 72) };
     Some(Mp3Frame {
         len: (coef * kbps * 1000 / sample_rate) as usize + pad,
         samples,
@@ -992,22 +988,24 @@ pub fn adpcm_decode(blocks: &[u8]) -> Vec<i16> {
 mod tests {
     use super::*;
 
-    fn write(c: &mut Vs1003, reg: u8, value: u16) {
-        for b in [2, reg, (value >> 8) as u8, value as u8] {
+    /// One SCI command, four bytes in; what came back for each.
+    fn sci(c: &mut Vs1003, bytes: [u8; 4]) -> [u8; 4] {
+        let replies = bytes.map(|b| {
             c.control(b);
-        }
+            c.reply()
+        });
         c.control_done();
+        replies
+    }
+
+    fn write(c: &mut Vs1003, reg: u8, value: u16) {
+        let [hi, lo] = value.to_be_bytes();
+        sci(c, [2, reg, hi, lo]);
     }
 
     fn read(c: &mut Vs1003, reg: u8) -> u16 {
-        c.control(3);
-        c.control(reg);
-        c.control(0);
-        let hi = c.reply();
-        c.control(0);
-        let lo = c.reply();
-        c.control_done();
-        (hi as u16) << 8 | lo as u16
+        let [_, _, hi, lo] = sci(c, [3, reg, 0, 0]);
+        u16::from_be_bytes([hi, lo])
     }
 
     fn wav_header(rate: u32) -> Vec<u8> {
