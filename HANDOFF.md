@@ -38,7 +38,7 @@ passes in the emulator everything the C firmware passes there.
 | 3. 802.11 station and access point: WEP, WPA, WPA2, WPA3 | done, in `lapin/core/src/wifi.rs` |
 | 4. Metal virtual machine, to run the boot bytecode and garenne as they are | done, `lapin/metal`, checked word for word against the C machine (`lapin/cref`) |
 | 5. Resident loader, so a failed update no longer kills the rabbit | done: the rescue core (see below) |
-| 6. Size, soak, then a real rabbit | size 115.4 KB (rescue core included), two hours of garenne soaked, an independent review's findings fixed, in the emulator; the real rabbit waits for Léonard's go |
+| 6. Size, soak, then a real rabbit | size 111.2 KB (rescue core included), two hours of garenne soaked, an independent review's findings fixed, in the emulator; the real rabbit waits for Léonard's go |
 
 Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
@@ -46,8 +46,9 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 
 ## Things worth knowing before continuing
 
-**Flash budget.** 124 KB below the settings sector. lapin takes 115.4
-KB, the boot bytecode's 27.6 KB included, packed to 16 KB, and the rescue core's 20 KB: 11.3 KB left. The curve and the
+**Flash budget.** 124 KB below the settings sector. lapin takes 111.2
+KB (113 840 bytes), the boot bytecode's 27.6 KB included, packed to 16
+KB, and the rescue core's 20 KB (19 232 bytes used): 12.8 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -59,9 +60,14 @@ not hold the machine's state.
 **Limits.** `tools/emu/tests/limits.rs` measures, under the heaviest
 work (WPA3 with garenne and rekeys, the setup page deriving a key, the
 factory test, a collection over an 85 % full heap): the program stack
-at most 6.8 KB of its 12 KB (asserted by the linker against the data),
-the interrupt stack 196 bytes of 1 KB, the watchdog at most 664 ms
-unfed (an SAE step) against a budget of half its 2.09 s. The first
+at most 6.5 KB of its 12 KB (asserted by the linker against the data),
+the interrupt stack 196 bytes of 1 KB, the watchdog at most 157 ms
+unfed under WPA3 (126 ms by hunting and pecking, which
+`wpa3_by_hunting_and_pecking` checks) against a budget of half its
+2.09 s: the password exchange runs in steps of at most about 60 ms
+across the main loop's turns, which feed the sound between them
+(`tests/wpa3_sound.rs`). Before, one step left it 664 ms unfed and a
+WPA3 rejoin cut a playing sound for 0.6 s. The first
 measurement found 12.8 KB of stack, 5.4 KB of it a scan array built on
 the stack, and a collection three times slower than the C one's.
 
@@ -137,7 +143,7 @@ SAE is reported as WPA2, and the station uses SAE when the settings
 hold the passphrase (the setup page stores it next to the derived key).
 The stick cannot protect management frames, so on a WPA3 link it holds
 no key and the firmware does CCMP itself. On the emulated ARM7 a join
-takes 1.6 s after the scan; after a power cut the access point's SA
+takes 2.0 s after the scan; after a power cut the access point's SA
 Query is waited out (status 30) and the rabbit is back in 9 s.
 
 **Defects found in the C firmware (r3).** Not to be fixed in C; lapin
@@ -149,6 +155,94 @@ a pairwise rekey on a running link is ignored (`eapol.c:383`);
 CCMP frame is numbered 0 and dropped by Linux access points
 (`eapol.c:545`). Probe requests without a network name element is the
 fourth.
+
+## Deliberate differences from r3
+
+lapin behaves as r3 wherever the bytecode or the outside can see it,
+except where r3 is wrong or unsafe. Each difference below is checked
+by a test that runs on both firmwares; a "Known defect" test checks
+r3's misbehaviour where the emulator shows it.
+
+What the bytecode sees:
+
+- **Scan results**: one entry per network (BSSID and name), the
+  strongest frame heard, up to 256 networks; r3 lists every frame it
+  hears, as many as its heap holds, and loses some neighbours in a
+  crowded band (175 of 201 listed, `tests/crowded.rs`). The boot keeps
+  the strongest per name anyway (`filterscan`).
+- **Scan codes**: a WPA element whose group cipher is WEP is reported
+  0xFF (cannot join: neither handshake installs a WEP group key); r3
+  says WPA. An RSN network offering SAE alone is WPA2 to lapin, which
+  joins it with WPA3; r3 says 0xFF (`tests/scan.rs`).
+- **netAuth** on an open or WPA network with a non-zero mode: lapin
+  authenticates as open system; r3 sends a shared-key request, then
+  reads the answer as open system's, and stays off the network. On WEP
+  both take any mode but 0 for a shared key.
+- **netSetmode** to master with a nil name: an empty name; r3 copies
+  from address 0.
+- **netState** says broken (0) while the stick fails every receive, and
+  no longer once it works; r3 never says it (its host controller driver
+  hands a failed transfer over as a short packet) and sees the link
+  lost when its wait runs out.
+- **Environment** across a change of bytecode: up to 32 KB, as r3
+  effectively keeps (its 4 KB audio buffer and what follows, up to its
+  USB heap); past that r3 corrupts its USB heap and restarts, lapin
+  carries the first 32 KB.
+- **netSend** during the first handshake is refused (r3 sent the
+  bytecode's frames in clear before the keys); a frame over about 2360
+  bytes is refused (0), where r3 copies it past the stick's buffer and
+  restarts.
+- **netPmk** and **netScan** take at most 32 bytes of a network name;
+  r3 copies a longer one over what follows its buffer (netPmk then
+  hangs).
+- **Frames**: EAPOL never reaches the bytecode, in any mode, and is
+  acted on only on a WPA link (lapin used to answer message 1 on open
+  and WEP links, and hand EAPOL up in master mode: fixed, as r3 does).
+  Protected frames the stick could not open are dropped; r3 hands them
+  up as they came.
+- **Reboot** asked by the bytecode does not count as a failed start for
+  the rescue core.
+- The audio converters: an ADPCM step index past 88 reads a step of 0
+  where r3 reads past its table; a negative length to `alaw2wav` or
+  `wav2alaw` does nothing where r3 loops until the watchdog bites. A
+  codec that never asks for data is waited for 500 ms, not for ever.
+  The tag reader's "Error" (8 bytes, padded) and a jammed I2C bus are
+  handled as `tests/odd_audio.rs`, `tests/rfid.rs` and
+  `tests/hardening.rs` describe.
+
+What the access point and the air see:
+
+- **Rates**: lapin sends at 12 and 18 Mb/s when the access point's
+  rates and the signal call for them; r3 has no case for those two
+  rates and sends at 1 Mb/s, with a duration computed for the faster
+  rate (its DHCP retries go out at 1 Mb/s, lapin's at 18). The signal
+  average is fed by the same frames in both (management frames from
+  the access point once associated, data frames from it).
+- **EAPOL bodies**: messages 2 and 4 and the group key answer have
+  their exact length; r3 adds 24 zero bytes.
+- **The handshake**: a message 1 sent again keeps the nonce and does
+  not commit the replay counter (as wpa_supplicant); a message 3
+  without a group key is not answered; the group key is installed
+  before message 4 or the group answer goes out; a WPA (TKIP era)
+  association names the access point's own pairwise cipher, where r3
+  always says TKIP; all four key slots are cleared on a join; a pairwise
+  rekey on a running link is taken (r3 ignored it); 104-bit WEP keys
+  are kept whole; the first CCMP frame is numbered 1; probe requests
+  carry a network name element. WPA2 with TKIP alone joins (r3 never
+  installs its group key, `tests/join.rs`).
+- **Shared-key authentication** with a challenge that is not 128 bytes
+  ends the attempt at once and uses the first challenge element; r3
+  waits for its timeout and uses the last.
+- **Elements**: the first RSN element is read and a truncated one is
+  ignored; a deauthentication during a scan is ignored (the scan runs
+  its course, as in r3).
+- **A scan** listens 120 ms per channel (r3 350) and sends no probe on
+  channel 14.
+- **Replay check**: frames the stick decrypts are checked against their
+  packet numbers from the receive descriptor; if the stick gives none
+  (IV words without the extended IV bit) the check is left out for
+  them and the console says so once (`tests/observable.rs`). r3 never
+  checked.
 
 **Unverified assumptions.** In the emulator: flash erase and program
 times (from a comment in the C code, within the manual's maxima), ear
