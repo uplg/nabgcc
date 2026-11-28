@@ -138,6 +138,12 @@ pub struct Vs1003 {
     pub consumed: u64,
     /// Words dropped because nobody read the recorder in time.
     pub record_overruns: u64,
+    /// Underruns in the middle of a stream: when the decoder ran out of
+    /// bytes it was due to play, and for how long (ms) until the next
+    /// came. Running dry at the end of a stream is not one.
+    pub gaps: Vec<(u64, u64)>,
+    /// Since when the decoder has been waiting for bytes it was due.
+    dry_since: Option<u64>,
     play: Play,
     /// Playback time of the current stream, in µs.
     clock_us: u64,
@@ -170,6 +176,8 @@ impl Vs1003 {
             buffered: 0,
             consumed: 0,
             record_overruns: 0,
+            gaps: Vec::new(),
+            dry_since: None,
             play: Play::Detect,
             clock_us: 0,
             decoded: 0,
@@ -199,6 +207,7 @@ impl Vs1003 {
         }
         self.buffered = 0;
         self.consumed = 0;
+        self.dry_since = None;
         self.play = Play::Detect;
         self.clock_us = 0;
         self.decoded = 0;
@@ -301,6 +310,9 @@ impl Vs1003 {
             pcm: Vec::new(),
         });
         track.data.push(byte);
+        if let Some(since) = self.dry_since.take() {
+            self.gaps.push((since, now - since));
+        }
         if track.format == Format::Unknown {
             track.format = recognise(&track.data);
         }
@@ -332,6 +344,7 @@ impl Vs1003 {
         if !matches!(play, Play::Detect | Play::Skip) {
             self.clock_us += elapsed_us;
         }
+        let mut starved = false;
         loop {
             match &mut play {
                 Play::Detect => {
@@ -419,7 +432,11 @@ impl Vs1003 {
                 }
                 Play::Wav { byte_rate, credit } => {
                     *credit += (elapsed_us * *byte_rate as u64 / 1000) as u32;
-                    let take = ((*credit / 1000) as usize).min(data.len() - at);
+                    let due = (*credit / 1000) as usize;
+                    let take = due.min(data.len() - at);
+                    if take < due {
+                        starved = true;
+                    }
                     *credit %= 1000;
                     at += take;
                     self.decoded += take as u64;
@@ -431,6 +448,7 @@ impl Vs1003 {
                 Play::Mp3 { due_us } => {
                     let rest = &data[at..];
                     if rest.len() < 4 {
+                        starved = *due_us <= self.clock_us;
                         break;
                     }
                     let Some(frame) = mp3_frame(rest) else {
@@ -441,6 +459,7 @@ impl Vs1003 {
                     if rest.len() < frame.len {
                         // Waiting for the rest of the frame: the output
                         // runs dry, playback resumes when it comes.
+                        starved = *due_us <= self.clock_us;
                         *due_us = (*due_us).max(self.clock_us);
                         break;
                     }
@@ -480,6 +499,9 @@ impl Vs1003 {
         self.consumed = at as u64;
         self.buffered = track.data.len() - at;
         self.current = Some(track);
+        if starved && elapsed_us > 0 && self.dry_since.is_none() {
+            self.dry_since = Some(self.now_ms);
+        }
     }
 
     /// One millisecond passes: the decoder drains its buffer at the
