@@ -53,6 +53,22 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
     });
 }
 
+/// The first image is for r3 only: sent to a rabbit that runs lapin, it
+/// is refused (its application is packed), nothing written, and the
+/// rabbit goes on.
+#[test]
+fn the_first_image_sent_to_a_lapin_rabbit_is_refused() {
+    let (Some(image), Some(first)) = (lapin(), lapin_target("lapin-first.bin")) else {
+        return;
+    };
+    let mut m = rabbit(&image, &metal::flash_firmware(&first));
+    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    assert_eq!(m.soc.flash_erases, 0, "something written");
+    until(&mut m, 60_000, "the application back", |m| {
+        m.console().contains("4242")
+    });
+}
+
 #[test]
 fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
     let Some(image) = lapin() else { return };
@@ -115,6 +131,76 @@ fn an_application_that_keeps_restarting_is_taken_back() {
         tail.contains("lapin 0.1"),
         "the application runs again:\n{tail}"
     );
+}
+
+/// The words the rescue core counts restarts in (lapin/fw/src/boot.rs,
+/// Slots), at the bottom of the internal RAM.
+const SLOT_WORDS: std::ops::Range<usize> = 0..8;
+
+/// Run until the next reset, and stop right on it: the rescue core has
+/// not run an instruction yet.
+fn to_next_reset(m: &mut Machine, limit_ms: u64) {
+    let n = m.events.len();
+    let by = m.soc.millis() + limit_ms;
+    while m.events.len() == n {
+        assert!(m.soc.millis() < by, "no reset: {}", m.console());
+        m.step();
+    }
+}
+
+/// An application that restarts within its first minute, every time
+/// (a stick that takes no frame to send).
+fn restarting(image: &[u8]) -> Machine {
+    let m = on_network(image, open());
+    m.radio.borrow_mut().tx_stuck = true;
+    m
+}
+
+/// A power-on is no failed start, even when the RAM kept the words that
+/// count them (a short cut can leave the internal RAM as it was): the
+/// rescue core tells it from a restart by the watchdog's RSTSTATUS
+/// (manual table 11-2), set by its overflow only, and cleared by a
+/// power-on. Two failed starts, then the power cut with the words kept:
+/// the application gets its three tries again.
+#[test]
+fn a_power_on_is_no_failed_start_even_if_the_ram_kept_its_words() {
+    let Some(image) = lapin() else { return };
+    let mut m = restarting(&image);
+    to_next_reset(&mut m, 120_000);
+    to_next_reset(&mut m, 120_000);
+    let kept = m.soc.iram[SLOT_WORDS].to_vec();
+    m.power_cycle();
+    m.soc.iram[SLOT_WORDS].copy_from_slice(&kept);
+    let said = m.console().len();
+    until(&mut m, 20_000, "a start", |m| {
+        let after = &m.console()[said..];
+        after.contains("lapin 0.1") || after.contains("secours")
+    });
+    let after = &m.console()[said..];
+    assert!(after.contains("lapin 0.1"), "taken back at once:\n{after}");
+    // And it is counted from there: three more, then the rescue core.
+    until(&mut m, 200_000, "the rescue core taking over", |m| {
+        m.console()[said..].contains("secours: the application keeps restarting")
+    });
+    assert_eq!(m.events.len(), 2 + 3, "{:?}", m.events);
+}
+
+/// A restart by the watchdog counts as a failed start even when the RAM
+/// lost the words that count them: the first one, its words wiped,
+/// counts one, and the rescue core takes over after three as ever (it
+/// read a lost count as a power-on, and took four).
+#[test]
+fn a_watchdog_restart_counts_even_if_the_ram_lost_its_words() {
+    let Some(image) = lapin() else { return };
+    let mut m = restarting(&image);
+    to_next_reset(&mut m, 120_000);
+    assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
+    m.soc.iram[SLOT_WORDS].fill(0);
+    until(&mut m, 200_000, "the rescue core taking over", |m| {
+        m.console()
+            .contains("secours: the application keeps restarting")
+    });
+    assert_eq!(m.events.len(), 3, "{:?}", m.events);
 }
 
 #[test]

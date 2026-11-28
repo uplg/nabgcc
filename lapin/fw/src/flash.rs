@@ -257,10 +257,20 @@ pub fn write_app(app: &[u8]) -> ! {
     let Some(len) = crate::boot::check_app(app) else {
         crate::watchdog::reset_now()
     };
+    write_at(&app[..len], crate::boot::APP_BASE)
+}
+
+/// Write `part` (word aligned, outside the flash) from the sector at
+/// `to`, after the rescue core, then restart: the first start's two
+/// steps (`rescue::install_packed`), and [`write_app`].
+pub fn write_at(part: &[u8], to: usize) -> ! {
+    let to = to.max(crate::boot::APP_BASE);
+    let len = part.len().min(SETTINGS.saturating_sub(to));
     stop_for_rewrite();
-    // SAFETY: as in `write_firmware`; the application's place starts on
-    // a sector boundary and ends below the settings (checked).
-    unsafe { flash_image_from_ram(app.as_ptr().cast(), len, crate::boot::APP_BASE) }
+    // SAFETY: as in `write_firmware`; `to` is a sector boundary after
+    // the rescue core (the callers' sectors of the application's place)
+    // and the length stops below the settings.
+    unsafe { flash_image_from_ram(part.as_ptr().cast(), len, to) }
 }
 
 /// One sector's worth of scratch space, in the external RAM.

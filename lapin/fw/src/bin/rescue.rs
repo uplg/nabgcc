@@ -60,12 +60,15 @@ const RED: u32 = 0xFF0000;
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
     lapin_fw::start::link();
+    // Whether the watchdog made this reset, before its start clears it:
+    // a power-on is never a failed start.
+    let bitten = watchdog::bit_last();
     // The watchdog first of all (on the ring oscillator its period is
     // only longer): whatever hangs from here, the clock's switch or the
     // check of the application, ends in a restart, which counts; and an
     // application that hangs before its own start of it comes back here.
     watchdog::start();
-    let failed = Slots::count_boot();
+    let failed = Slots::count_boot(bitten);
     // The application finds the clock running and leaves it so.
     clock::init();
     // The pins at rest (amplifier off, codec in reset, ears still) as
@@ -77,6 +80,12 @@ extern "C" fn main() -> ! {
         // and checked header gives; it takes over the processor from
         // scratch, as from a reset.
         unsafe { asm!("bx {0}", in(reg) entry, options(noreturn)) }
+    }
+    if app.is_none() && failed < MAX_FAILED_BOOTS {
+        // The first start after the C firmware: the application packed
+        // behind this core, if that is what is there (restarts once
+        // written).
+        lapin_fw::rescue::install_packed();
     }
 
     lapin_fw::init();

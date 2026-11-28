@@ -22,6 +22,14 @@
 //! [`RESCUE_SIZE`] and ending on a trailer of its own ([`RESCUE_MAGIC`],
 //! then the CRC-32 of the bytes before it), then the application.
 //!
+//! The first image, which the C firmware writes once (`lapin-first.bin`,
+//! from `lapin/pack`), is the same rescue core followed by the
+//! application packed (`lapin_core::pack`, about two thirds of its
+//! size), so that the C firmware's write, with the watchdog unfed, is
+//! short. At its first start the rescue core finds no application but
+//! the packed one ([`packed_app`]), unpacks it into the external RAM,
+//! checks it, and writes it (`rescue::install_packed`).
+//!
 //! The two share four words at the bottom of the internal RAM, which
 //! neither one's startup clears: see [`Slots`].
 
@@ -49,14 +57,17 @@ pub const MAX_FAILED_BOOTS: u32 = 3;
 pub const ASKED: u32 = u32::MAX;
 
 /// The words at the bottom of the internal RAM, kept across a restart
-/// (not across a power cut): `SLOT_MAGIC` there when the rest is
-/// meaningful, the restarts since the application last said it was
+/// (not always across a power cut, which INTST's RSTSTATUS tells apart:
+/// [`Slots::count_boot`]): `SLOT_MAGIC` there when the rest is
+/// meaningful (`FRESH` when the next start counts 0), the restarts since the application last said it was
 /// well, and where the vectors of the rescue core send interrupts and
 /// undefined instructions.
 pub struct Slots;
 
 const SLOTS: usize = 0x1000_0000;
 const SLOT_MAGIC: u32 = 0x5A17_B007;
+/// In the first word instead: the next start counts 0.
+const FRESH: u32 = 0xF2E5_B007;
 
 fn slot(i: usize) -> crate::reg::Reg<u32> {
     // SAFETY: the four words below the linker's RAM, reserved for this
@@ -73,14 +84,18 @@ fn mark(restarts: u32) {
 
 impl Slots {
     /// Count one more start; returns how many in a row the application
-    /// has had without saying it was well (0 after a power cut).
-    pub fn count_boot() -> u32 {
-        if slot(0).read() != SLOT_MAGIC {
-            mark(0);
-            return 0;
-        }
-        let n = slot(1).read().saturating_add(1);
-        slot(1).write(n);
+    /// has had without saying it was well. `bitten`: the watchdog made
+    /// this reset ([`crate::watchdog::bit_last`]). A power-on counts 0,
+    /// whatever the RAM kept; a watchdog reset whose words were lost
+    /// counts 1.
+    pub fn count_boot(bitten: bool) -> u32 {
+        let n = match slot(0).read() {
+            _ if !bitten => 0,
+            SLOT_MAGIC => slot(1).read().saturating_add(1),
+            FRESH => 0,
+            _ => 1,
+        };
+        mark(n);
         n
     }
 
@@ -88,7 +103,7 @@ impl Slots {
     /// rescue core handing back to the application gives it its three
     /// tries again).
     pub fn fresh() {
-        slot(0).write(0);
+        slot(0).write(FRESH);
     }
 
     /// Have the rescue core take over at the next start (the gesture
@@ -168,10 +183,33 @@ pub fn check_rescue(core: &[u8]) -> bool {
 
 /// The application in the flash, if it is whole: its reset address.
 pub fn installed_app() -> Option<u32> {
-    // SAFETY: the flash is mapped and readable; nothing writes it now.
-    let flash = unsafe { core::slice::from_raw_parts(APP_BASE as *const u8, APP_END - APP_BASE) };
+    let flash = installed_area();
     check_app(flash)?;
     word(flash, 12)
+}
+
+/// The packed application of a first image (`lapin-first.bin`), in the
+/// application's place, if its header and its CRC check: the stream,
+/// the unpacked length and CRC-32.
+pub fn packed_app() -> Option<(&'static [u8], usize, u32)> {
+    use lapin_core::pack::{HEADER_LEN, MAGIC};
+    let flash = installed_area();
+    if word(flash, 0)? != MAGIC {
+        return None;
+    }
+    let stream = flash.get(HEADER_LEN..HEADER_LEN.checked_add(word(flash, 4)? as usize)?)?;
+    let len = word(flash, 8)? as usize;
+    if !(HEADER_LEN..=APP_END - APP_BASE).contains(&len) || crc32(stream) != word(flash, 16)? {
+        return None;
+    }
+    Some((stream, len, word(flash, 12)?))
+}
+
+/// The application's place in the flash, as it is.
+pub fn installed_area() -> &'static [u8] {
+    // SAFETY: the flash is mapped and readable; only the rewrite
+    // routines change it, which never come back.
+    unsafe { core::slice::from_raw_parts(APP_BASE as *const u8, APP_END - APP_BASE) }
 }
 
 /// The rescue core as it is in the flash.

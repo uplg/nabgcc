@@ -26,6 +26,13 @@ fn arm(timebase: u8) {
     WDTCON.write(0x3C);
 }
 
+/// Whether the last reset was the watchdog's: INTST's RSTSTATUS, set by
+/// its overflow and cleared only by a power-on (manual table 11-2) or
+/// by [`start`]. Read it before.
+pub fn bit_last() -> bool {
+    INTST.read() & 1 != 0
+}
+
 /// Start it. There is no stopping it afterwards.
 pub fn start() {
     // Clock divided by 1024 (32 microseconds a count, 65536 counts),

@@ -7,6 +7,7 @@
 //! one segment in flight: enough for a page and an upload.
 
 use crate::boot::{self, RESCUE_SIZE, Slots};
+use crate::flash::{self, SECTOR};
 use crate::wifi::rt2573::{Stick, TxOptions};
 use crate::{timer, uart, watchdog};
 
@@ -77,6 +78,45 @@ struct Upload(core::cell::UnsafeCell<[u8; 128 * 1024]>);
 unsafe impl Sync for Upload {}
 #[unsafe(link_section = ".xram.upload")]
 static UPLOAD: Upload = Upload(core::cell::UnsafeCell::new([0; 128 * 1024]));
+
+/// The first start after the C firmware wrote `lapin-first.bin`: the
+/// packed application (`boot::packed_app`) unpacked into the upload
+/// buffer, behind a copy of this core (the history it was packed
+/// against), checked whole, then written. Returns only if there is
+/// nothing to install, or it does not check.
+///
+/// It is written in two steps, each ending in a restart: first the
+/// sectors past the packed application's, which leaves it whole (a
+/// power cut there: unpacked and written again); then the rest, over
+/// it (a cut there leaves neither: the rescue network). The sectors
+/// already right are left alone, so the second time round the first
+/// step is skipped.
+pub fn install_packed() {
+    let Some((stream, len, crc)) = boot::packed_app() else {
+        return;
+    };
+    // SAFETY: the upload buffer, which nothing else uses before the
+    // rescue network is up; an application fits in it behind the core.
+    let buf = unsafe { &mut (&mut *UPLOAD.0.get())[..RESCUE_SIZE + len] };
+    buf[..RESCUE_SIZE].copy_from_slice(boot::installed_rescue());
+    if !lapin_core::pack::unpack(stream, buf, RESCUE_SIZE, watchdog::feed) {
+        return;
+    }
+    let app = &mut buf[RESCUE_SIZE..];
+    lapin_core::pack::thumb_calls(app, true);
+    if boot::crc32(app) != crc || boot::check_app(app).is_none() {
+        return;
+    }
+    uart::init();
+    uart::write(b"secours: unpacked\n");
+    let packed_end = (lapin_core::pack::HEADER_LEN + stream.len()).next_multiple_of(SECTOR);
+    let placed = boot::installed_area();
+    if packed_end < len && placed[packed_end..len] != app[packed_end..] {
+        flash::write_at(&app[packed_end..], boot::APP_BASE + packed_end)
+    }
+    Slots::fresh();
+    flash::write_app(app)
+}
 
 /// Supported rates: 802.11b's four, 1 Mbit/s the basic one (all the
 /// rescue core sends at), which phones expect to find.
@@ -256,7 +296,7 @@ impl Rescue {
                         } else {
                             &image[RESCUE_SIZE..]
                         };
-                        crate::flash::write_app(app)
+                        flash::write_app(app)
                     }
                     _ => {
                         Slots::fresh();
@@ -610,7 +650,18 @@ impl Rescue {
                 let v = l
                     .strip_prefix(b"Content-Length: ")
                     .or_else(|| l.strip_prefix(b"content-length: "))?;
-                core::str::from_utf8(v).ok()?.trim().parse::<usize>().ok()
+                // Decimal digits only (`str::parse` and `trim` would
+                // bring Unicode's tables into the rescue core's 20 KB).
+                let v = v.trim_ascii();
+                let mut n = (!v.is_empty()).then_some(0usize)?;
+                for &c in v {
+                    let digit = c.wrapping_sub(b'0');
+                    if digit > 9 {
+                        return None;
+                    }
+                    n = n.checked_mul(10)?.checked_add(digit as usize)?;
+                }
+                Some(n)
             })
             .unwrap_or(0);
         // More than the buffer holds (or a length that wraps): refused at
@@ -628,10 +679,17 @@ impl Rescue {
                 image.len() > RESCUE_SIZE && boot::check_app(&image[RESCUE_SIZE..]).is_some();
             if whole || boot::check_app(image).is_some() {
                 // Keep it where the upload already is: move it to the
-                // buffer's start for the writer.
+                // buffer's start for the writer (word aligned), in pieces
+                // that do not overlap (no `memmove` in the rescue core).
                 // SAFETY: as above.
                 let b = unsafe { &mut *UPLOAD.0.get() };
-                b.copy_within(body..body + length, 0);
+                let mut done = 0;
+                while done < length {
+                    let n = (length - done).min(body);
+                    let (to, from) = b.split_at_mut(body + done);
+                    to[done..done + n].copy_from_slice(&from[..n]);
+                    done += n;
+                }
                 (FLASHING, After::Flash(length))
             } else {
                 (REFUSED, After::Nothing)
