@@ -80,9 +80,16 @@ jobs:
       - run: cargo test --release --doc
 
   on-lapin:
-    name: the acceptance tests, on lapin, and the browser build
+    # The tests on lapin take the longest: three runners share them,
+    # each test run once (nextest's partition), and the browser build
+    # has its own.
+    name: the acceptance tests, on lapin (${{ matrix.shard }}/3)
     needs: lapin
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     defaults:
       run:
         working-directory: tools/emu
@@ -101,11 +108,29 @@ jobs:
       - name: The same acceptance tests, on the Rust firmware
         env:
           NABEMU_FIRMWARE: lapin
+          SHARD: ${{ matrix.shard }}
         run: |
           read -ra suites < <(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
           read -ra fixed < <(sed -n 's/^lapin_fixed: //p' ../../.github/lapin-suites)
           for t in "${fixed[@]}"; do suites+=(--test "$t"); done
-          cargo nextest run --release --no-fail-fast "${suites[@]}"
+          cargo nextest run --release --no-fail-fast --partition "count:$SHARD/3" "${suites[@]}"
+
+  browser:
+    name: the browser build
+    needs: lapin
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/emu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/emu
+      - uses: actions/download-artifact@v8
+        with:
+          name: lapin-images
+          path: lapin/target
       - uses: oven-sh/setup-bun@v2
       - name: Build for the browser and test that build under bun
         run: |
