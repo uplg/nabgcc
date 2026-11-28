@@ -153,7 +153,7 @@ impl Reader {
                 self.selected = None;
                 vec![0]
             }
-            [0x0B] => match self.selected {
+            [0x0B] => match self.selected.filter(|&i| i < self.tags.len()) {
                 Some(i) => {
                     // Least significant byte first on the air.
                     let mut answer = vec![8];
@@ -162,7 +162,7 @@ impl Reader {
                 }
                 None => vec![0],
             },
-            [0x08, block] => match self.selected {
+            [0x08, block] => match self.selected.filter(|&i| i < self.tags.len()) {
                 Some(i) if (*block as usize) < 128 => {
                     let mut answer = vec![4];
                     answer.extend_from_slice(&self.tags[i].blocks[*block as usize]);
@@ -171,7 +171,7 @@ impl Reader {
                 _ => vec![0],
             },
             [0x09, block, data @ ..] if data.len() == 4 => {
-                if let Some(i) = self.selected
+                if let Some(i) = self.selected.filter(|&i| i < self.tags.len())
                     && (*block as usize) < 128
                 {
                     self.tags[i].blocks[*block as usize].copy_from_slice(data);
@@ -260,6 +260,24 @@ mod tests {
         assert_eq!(read(&mut r, REG_IO_FRAME, 5), [4, b'c', b'a', b'r', b'r']);
         write(&mut r, &[REG_IO_FRAME, 6, 0x09, 8, 1, 2, 3, 4]);
         assert_eq!(r.tags[0].blocks[8], [1, 2, 3, 4]);
+    }
+
+    /// A tag taken away between its selection and the next frame
+    /// answers nothing, as a real one gone from the field.
+    #[test]
+    fn a_selected_tag_taken_away_answers_nothing() {
+        let mut r = Reader::default();
+        r.tags.push(Tag::new(UID));
+        write(&mut r, &[REG_PARAMETER, CARRIER_ON]);
+        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
+        let id = read(&mut r, REG_IO_FRAME, 2)[1];
+        write(&mut r, &[REG_IO_FRAME, 2, 0x0E, id]);
+        r.tags.clear();
+        write(&mut r, &[REG_IO_FRAME, 1, 0x0B]);
+        assert_eq!(read(&mut r, REG_IO_FRAME, 1), [0]);
+        write(&mut r, &[REG_IO_FRAME, 2, 0x08, 7]);
+        assert_eq!(read(&mut r, REG_IO_FRAME, 1), [0]);
+        write(&mut r, &[REG_IO_FRAME, 6, 0x09, 8, 1, 2, 3, 4]);
     }
 
     #[test]
