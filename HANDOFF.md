@@ -44,6 +44,43 @@ Every acceptance test written for the C firmware (`boot`, `board`,
 `join`, `link`, `network`, `setup`, `rfid`, `factory`, `flash`,
 `garenne`) passes on lapin, and CI runs them on both images.
 
+## Where we stopped (2026-11-28), and what comes next
+
+Three independent audits (bytecode-visible behaviour, the C firmware
+function by function, the emulator against the real hardware) found
+critical problems the green emulator suite never exercised; all are
+fixed or documented, with tests (`tools/emu/tests/c_audit.rs`,
+`observable.rs`, `crowded.rs`, `scan.rs`, `scan_connected.rs`,
+`first_flash.rs`, `wpa3_sound.rs`, ...). lapin is NOT ready for Garen.
+Léonard rules out a first flash by JTAG: the C to lapin migration must
+be safe over the air by construction. In this order:
+
+1. **A packed first image.** r3 writes lapin-full.bin with the watchdog
+   unfed (its `flash_uc`): 1907 ms of the 2097 with typical flash
+   timings, a bite at the manual's slowest erase (`first_flash.rs`).
+   The first image r3 writes is to be the rescue core plus the
+   application LZ-packed (about 75 KB, under the watchdog even at the
+   manual's worst); the rescue core unpacks it into the external RAM,
+   checks its CRC and writes it, feeding the watchdog. The rescue core
+   has 432 bytes left of its budget. A power cut in the first ~0.35 s,
+   while r3 writes the rescue core itself, stays fatal (pinned as a
+   Known defect): nothing on the lapin side can change that.
+2. **The final nose pass** over the whole repository, the Svelte page
+   included.
+3. **Review `docs/first-flash.md`** (no JTAG in it). Its largest open
+   risk: nobody has read Garen's radio type; an unknown one leaves the
+   rescue core without a network too.
+4. **Measure the CI cold** (local and GitHub): the audits added about a
+   hundred tests; nothing slow should be left that need not be.
+5. Leftovers: the flash command timing made explicit (manual 20.5.5)
+   and checked by the model; INTST.RSTSTATUS read before `arm()`;
+   tests that could not fail before (M11, A14 in the emulator, I1, the
+   data toggle after a take-back, the I2C STOP after a timeout, the
+   receive overflow path); a quirk seen in `scan_connected.rs`: the last
+   global of a test bytecode read empty in a loop callback, on r3 and
+   lapin alike (the test builder, or the machine?).
+6. **cargo-mutants** only on Léonard's go; then nose once more.
+
 ## Things worth knowing before continuing
 
 **Flash budget.** 124 KB below the settings sector. lapin takes 111.2
