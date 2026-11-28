@@ -38,6 +38,16 @@ pub enum Trap {
     Fiq,
 }
 
+/// The fields of every ARM load and store, single or multiple, in this
+/// order: P (index before), U (up), W (write back), L (load), and the
+/// base register.
+#[inline(always)]
+fn transfer_fields(op: u32) -> (bool, bool, bool, bool, usize) {
+    let bit = |n: u32| op & (1 << n) != 0;
+    let rn = ((op >> 16) & 15) as usize;
+    (bit(24), bit(23), bit(21), bit(20), rn)
+}
+
 /// The width of a single data transfer, and how a load extends it.
 #[derive(Clone, Copy)]
 enum Width {
@@ -230,7 +240,18 @@ impl Cpu {
         }
     }
 
-    fn exception(&mut self, vector: u32, mode: u32, lr: u32) {
+    /// Take an exception: its vector and mode, with the return address
+    /// in the new mode's link register; `last_trap` says which.
+    #[inline(always)]
+    fn exception(&mut self, trap: Trap, lr: u32) {
+        let (vector, mode) = match trap {
+            Trap::Undefined { .. } => (0x04, MODE_UND),
+            Trap::Swi { .. } => (0x08, MODE_SVC),
+            Trap::Irq => (0x18, MODE_IRQ),
+            Trap::Fiq => (0x1C, MODE_FIQ),
+            Trap::None => unreachable!("no exception to take"),
+        };
+        self.last_trap = trap;
         let old = self.cpsr;
         let mut new = (old & !0x3F) | mode | FLAG_I;
         if mode == MODE_FIQ {
@@ -242,21 +263,16 @@ impl Cpu {
         self.r[15] = vector;
     }
 
-    /// Run one instruction, or take one pending interrupt.
     /// Run one instruction, or take one pending interrupt. Returns the
     /// number of clock cycles it took on a real core without wait states.
     pub fn step<B: Bus>(&mut self, bus: &mut B) -> u32 {
         self.last_trap = Trap::None;
         if self.fiq_line && !self.flag(FLAG_F) {
-            let lr = self.r[15].wrapping_add(4);
-            self.exception(0x1C, MODE_FIQ, lr);
-            self.last_trap = Trap::Fiq;
+            self.exception(Trap::Fiq, self.r[15].wrapping_add(4));
             return 3;
         }
         if self.irq_line && !self.flag(FLAG_I) {
-            let lr = self.r[15].wrapping_add(4);
-            self.exception(0x18, MODE_IRQ, lr);
-            self.last_trap = Trap::Irq;
+            self.exception(Trap::Irq, self.r[15].wrapping_add(4));
             return 3;
         }
         if self.thumb() {
@@ -415,15 +431,20 @@ impl Cpu {
     }
 
     fn undefined(&mut self, addr: u32, opcode: u32) {
-        let lr = self.r[15];
-        self.exception(0x04, MODE_UND, lr);
-        self.last_trap = Trap::Undefined { addr, opcode };
+        self.exception(Trap::Undefined { addr, opcode }, self.r[15]);
     }
 
-    fn swi(&mut self, addr: u32, number: u32) {
-        let lr = self.r[15];
-        self.exception(0x08, MODE_SVC, lr);
-        self.last_trap = Trap::Swi { addr, number };
+    /// Thumb's LDMIA and POP: the low registers in `list`, from `addr`
+    /// up, word-aligned. Returns the address after the last.
+    #[inline]
+    fn load_low<B: Bus>(&mut self, bus: &mut B, list: u32, mut addr: u32) -> u32 {
+        for i in 0..8usize {
+            if list & (1 << i) != 0 {
+                self.r[i] = bus.read32(addr & !3);
+                addr = addr.wrapping_add(4);
+            }
+        }
+        addr
     }
 
     fn branch(&mut self, target: u32) {
@@ -606,7 +627,13 @@ impl Cpu {
             0b110 => self.undefined(pc, op),
             _ => {
                 if op & (1 << 24) != 0 {
-                    self.swi(pc, op & 0x00FF_FFFF);
+                    self.exception(
+                        Trap::Swi {
+                            addr: pc,
+                            number: op & 0x00FF_FFFF,
+                        },
+                        self.r[15],
+                    );
                 } else {
                     self.undefined(pc, op);
                 }
@@ -831,11 +858,7 @@ impl Cpu {
     /// so that each caller keeps its own straight-line code.
     #[inline(always)]
     fn single_transfer<B: Bus>(&mut self, bus: &mut B, op: u32, off: u32, width: Width) {
-        let pre = op & (1 << 24) != 0;
-        let up = op & (1 << 23) != 0;
-        let wb = op & (1 << 21) != 0;
-        let load = op & (1 << 20) != 0;
-        let rn = ((op >> 16) & 15) as usize;
+        let (pre, up, wb, load, rn) = transfer_fields(op);
         let rd = ((op >> 12) & 15) as usize;
         let base = self.reg(rn);
         let moved = if up {
@@ -882,12 +905,8 @@ impl Cpu {
     }
 
     fn arm_ldm_stm<B: Bus>(&mut self, bus: &mut B, op: u32) {
-        let pre = op & (1 << 24) != 0;
-        let up = op & (1 << 23) != 0;
+        let (pre, up, wb, load, rn) = transfer_fields(op);
         let psr = op & (1 << 22) != 0;
-        let wb = op & (1 << 21) != 0;
-        let load = op & (1 << 20) != 0;
-        let rn = ((op >> 16) & 15) as usize;
         let mut list = op & 0xFFFF;
         // An empty list transfers r15 alone, yet moves the base as if
         // all sixteen registers had gone through.
@@ -1090,12 +1109,7 @@ impl Cpu {
                 let mut addr = self.r[rb] & !3;
                 let end = self.r[rb].wrapping_add(list.count_ones() * 4);
                 if op & (1 << 11) != 0 {
-                    for i in 0..8usize {
-                        if list & (1 << i) != 0 {
-                            self.r[i] = bus.read32(addr);
-                            addr = addr.wrapping_add(4);
-                        }
-                    }
+                    self.load_low(bus, list, addr);
                     if list & (1 << rb) == 0 {
                         self.r[rb] = end;
                     }
@@ -1115,7 +1129,13 @@ impl Cpu {
             0b11010 | 0b11011 => {
                 let c = (op >> 8) & 15;
                 match c {
-                    0xF => self.swi(pc, op & 0xFF),
+                    0xF => self.exception(
+                        Trap::Swi {
+                            addr: pc,
+                            number: op & 0xFF,
+                        },
+                        self.r[15],
+                    ),
                     0xE => self.undefined(pc, op),
                     _ => {
                         if self.cond(c) {
@@ -1270,14 +1290,7 @@ impl Cpu {
                 }
             }
             0xC | 0xD => {
-                let list = op & 0xFF;
-                let mut addr = self.r[13];
-                for i in 0..8usize {
-                    if list & (1 << i) != 0 {
-                        self.r[i] = bus.read32(addr & !3);
-                        addr = addr.wrapping_add(4);
-                    }
-                }
+                let mut addr = self.load_low(bus, op & 0xFF, self.r[13]);
                 if op & 0x100 != 0 {
                     let t = bus.read32(addr & !3);
                     addr = addr.wrapping_add(4);
