@@ -45,16 +45,30 @@ entry number here) is not checked.
 
 ## In a browser
 
-    web/build.sh                       # builds web/nabemu.wasm (about 260 KB)
-    python3 -m http.server             # from the repository root
-    # then open http://localhost:8000/tools/emu/web/
+    web/build.sh                       # the module, the firmwares, the page (in web/dist)
+    cd web && bun run dev              # then open the address it prints
+    cd web && bun run test             # the module under bun, headless
 
-The page shows the rabbit with its leds and ears, its serial console,
-and lets you press its button, hear what it plays, talk to its
-microphone, hold a tag at its nose, choose the network around it and
-the firmware and bytecode it runs. `?warp=20000` skips ahead. The module
-has a plain C interface (`src/web.rs`), wrapped by `web/nabemu.mjs`;
-`node web/test.mjs` runs the same module without a browser.
+The page (Svelte, in `web/`) runs the emulator in a Web Worker and lets
+you test the rabbit by hand: run, pause, step, power-cycle or reset
+it, at a quarter, one or four times real time or as fast as the
+machine goes; watch its leds and ears, press its head, turn its ears
+and its volume wheel, hold a tag of your choice at its nose, hear its
+loudspeaker and talk to its microphone; follow and filter its serial
+console. Around it: access points (open, WEP, WPA, WPA2, WPA2/WPA3,
+WPA3; hidden or not; signal strength) to add, restart or switch off;
+the settings in its flash, as the setup page writes them; the server
+behind the network (garenne, a bytecode file, a sample program), with
+its log and the UDP the rabbit sends; an update over the air, with a
+power cut in the middle if wanted; a phone that joins the setup or
+the rescue network, browses the rabbit's pages and uploads an image;
+and the scenarios that take a button held at power-on (setup mode,
+factory test, lapin's rescue). It offers r3, lapin when it is built
+and garenne when its build is around (`NABEMU_GARENNE`, or
+`../clapier`), or any file you load.
+
+The module has a plain C interface (`src/web.rs`), typed and wrapped
+by `web/src/lib/emu/nabemu.ts`, which the page and the test share.
 
 ## What the numbers are worth
 
@@ -105,7 +119,7 @@ real chip reports in that case has not been checked.
 | `tests/rfid.rs` | the firmware reading and writing a tag |
 | `tests/wpa3.rs` | WPA3 between the access point and the reference station: both password element methods, anti-clogging tokens, a station that restarts (SA Query, status 30, comeback), an impostor, forged and genuine deauthentications, BIP, replays |
 | `tests/setup.rs` | a phone on the rabbit's own network: setup page, saving settings, firmware upload |
-| `web/test.mjs` | the WebAssembly build, under Node |
+| `web/test/nabemu.test.ts` | the WebAssembly build under bun: joining, setup from a phone, the factory test, the world around the rabbit; on lapin, WPA3 and a power cut during an update put right from the rescue network |
 | `tests/garenne.rs` | the real application bytecode, when a build is around |
 | `tests/soak.rs` | garenne for minutes (`NABEMU_SOAK_MINUTES`, 3 by default) through group key renewals |
 | `tests/lapin.rs` | what only the Rust firmware in `../../lapin` has, when it is built: its banner, the radios it refuses, WPA3 on the ARM7 timed against the watchdog, the wait after a power cut, the interpreter's speed against the C one's |
