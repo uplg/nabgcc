@@ -191,7 +191,8 @@ fn udp_frame(to: ([u8; 6], [u8; 4]), ports: (u16, u16), payload: &[u8]) -> Vec<u
     eth
 }
 
-fn checksum(data: &[u8]) -> u16 {
+/// The internet checksum (RFC 1071) of IPv4, UDP and TCP headers.
+pub fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     for pair in data.chunks(2) {
         sum += (pair[0] as u32) << 8 | *pair.get(1).unwrap_or(&0) as u32;
