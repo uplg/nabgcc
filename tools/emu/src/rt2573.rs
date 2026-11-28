@@ -119,6 +119,9 @@ pub struct Radio {
     /// The bulk endpoint out answers NAK to every packet while set: a
     /// stick that has stopped taking frames to send.
     pub tx_stuck: bool,
+    /// The bulk endpoint in stalls every transfer while set: a stick
+    /// that has stopped delivering what it receives.
+    pub rx_stall: bool,
 }
 
 pub type SharedRadio = Rc<RefCell<Radio>>;
@@ -561,7 +564,7 @@ impl UsbDevice for Rt2573 {
             }
             return x;
         }
-        if ep != 1 {
+        if ep != 1 || self.radio.borrow().rx_stall {
             return Xfer::Stall;
         }
         if self.in_pos >= self.inbound.len() && !self.load_inbound() {

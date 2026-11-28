@@ -19,6 +19,38 @@ static RING: Ring = Ring(UnsafeCell::new([0; SIZE]));
 static HEAD: Shared<usize> = Shared::new(0);
 static TAIL: Shared<usize> = Shared::new(0);
 static DROPPED: Shared<u32> = Shared::new(0);
+static RECEIVED: Shared<u32> = Shared::new(0);
+/// Whether beacons and probe responses of every network are kept (a
+/// scan), or only those of `BSS_LOW`/`BSS_HIGH`'s network.
+static ALL_NETWORKS: Shared<bool> = Shared::new(true);
+static BSS_LOW: Shared<u32> = Shared::new(0);
+static BSS_HIGH: Shared<u32> = Shared::new(0);
+
+/// Keep the announcements (beacons, probe responses) of every network,
+/// for a scan, or of `bss`'s alone. The C driver handled them in the
+/// interrupt and kept nothing of them: here, with the main program
+/// busy (a long bytecode), the neighbours' would fill the queue and
+/// push out the frames that matter.
+pub fn keep_announcements(bss: Option<&[u8; 6]>) {
+    crate::irq::free(|| match bss {
+        None => ALL_NETWORKS.set(true),
+        Some(b) => {
+            BSS_LOW.set(u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+            BSS_HIGH.set(u16::from_le_bytes([b[4], b[5]]) as u32);
+            ALL_NETWORKS.set(false);
+        }
+    });
+}
+
+/// An announcement of a network other than the one followed.
+fn foreign_announcement(frame: &[u8]) -> bool {
+    if ALL_NETWORKS.get() || frame.len() < 22 || !matches!(frame[0], 0x80 | 0x50) {
+        return false;
+    }
+    let b = &frame[16..22];
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != BSS_LOW.get()
+        || u16::from_le_bytes([b[4], b[5]]) as u32 != BSS_HIGH.get()
+}
 
 /// A frame as the stick delivered it.
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +74,10 @@ fn byte(at: usize) -> *mut u8 {
 /// From the interrupt handler: queue a frame, or drop it if there is
 /// no room.
 pub(super) fn push(frame: &[u8], rssi: i8, decrypted: bool, iv: u32, eiv: u32) {
+    RECEIVED.set(RECEIVED.get().wrapping_add(1));
+    if foreign_announcement(frame) {
+        return;
+    }
     let (head, tail) = (HEAD.get(), TAIL.get());
     // The indexes are volatile, the bytes are not: without these fences
     // the compiler may move a byte's access across an index's, and the
@@ -108,6 +144,11 @@ pub(super) fn pop(out: &mut [u8]) -> Option<Received> {
             return Some(info);
         }
     }
+}
+
+/// Frames the stick delivered so far, kept or not.
+pub fn received() -> u32 {
+    RECEIVED.get()
 }
 
 /// Frames lost because the main program was not keeping up.

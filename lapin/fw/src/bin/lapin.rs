@@ -35,6 +35,8 @@ static mut STICK: MaybeUninit<Stick> = MaybeUninit::uninit();
 static mut FRAME: [u8; 2400] = [0; 2400];
 #[unsafe(link_section = ".xram_high.scan")]
 static mut SCAN: MaybeUninit<[ScanResult; SCAN_RESULTS]> = MaybeUninit::uninit();
+#[unsafe(link_section = ".xram_high.inbox")]
+static mut INBOX: [u8; lapin_fw::inbox::SIZE] = [0; lapin_fw::inbox::SIZE];
 
 // `&mut *&raw mut` is how a static is borrowed once, by hand.
 #[allow(clippy::deref_addrof)]
@@ -51,7 +53,7 @@ extern "C" fn main() -> ! {
 
     // SAFETY: each of these is taken once, here, before anything else
     // can reach it.
-    let (station, frame, scan, stick_slot, memory) = unsafe {
+    let (station, frame, scan, stick_slot, memory, inbox) = unsafe {
         (
             (*(&raw mut STATION)).write(Station::new()),
             &mut *(&raw mut FRAME),
@@ -67,6 +69,7 @@ extern "C" fn main() -> ! {
             },
             &mut *(&raw mut STICK),
             &mut *(&raw mut MEMORY),
+            &mut *(&raw mut INBOX),
         )
     };
 
@@ -78,7 +81,7 @@ extern "C" fn main() -> ! {
     // The Wi-Fi stick comes up in the first turn of the main loop, as
     // in the C firmware: the bytecode starts at once, and sees the
     // network broken until then.
-    let host = Board::new(stick_slot, station, pool, frame, scan);
+    let host = Board::new(stick_slot, station, pool, frame, scan, inbox);
     let mut vm = Vm::new(host, memory);
     // SAFETY: taken once, here.
     let boot = unsafe { &mut *(&raw mut BOOT) };

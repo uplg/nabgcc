@@ -4,4 +4,4 @@ pub mod link;
 pub mod rt2573;
 mod rxq;
 
-pub use rxq::Received;
+pub use rxq::{Received, keep_announcements, received};

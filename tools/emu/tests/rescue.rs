@@ -7,7 +7,7 @@
 mod common;
 
 use common::{
-    RESCUE, lapin, on_network, open, page, phone_on_the_rescue_network, rescue_network_up, serve,
+    RESCUE, lapin, on_network, open, page, phone_on_the_rescue_network, rescue_network_up,
     serve_first, until, wait, without_application,
 };
 use nabemu::soc::ResetCause;
@@ -91,19 +91,17 @@ fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
 #[test]
 fn an_application_that_keeps_restarting_is_taken_back() {
     let Some(image) = lapin() else { return };
-    // A bytecode that restarts the rabbit at once, every time.
-    let mut f = metal::FUNCTION_HEADER.to_vec();
-    f.extend(metal::int(0x0407_FE58));
-    f.extend(metal::int(0x13FB_6754));
-    f.extend([136, 1]);
-    let reboot = metal::bytecode(&[], &f);
+    // A stick that takes no frame to send: the application gives up on
+    // it and restarts, every time, within its first minute. (A restart
+    // the bytecode asks for does not count: tests/observable.rs.)
     let mut m = on_network(&image, open());
-    serve(&mut m, metal::boot_response(&reboot));
-    until(&mut m, 120_000, "the rescue core taking over", |m| {
+    m.radio.borrow_mut().tx_stuck = true;
+    until(&mut m, 200_000, "the rescue core taking over", |m| {
         m.console()
             .contains("secours: the application keeps restarting")
     });
     assert_eq!(m.events.len(), 3, "{:?}", m.events);
+    m.radio.borrow_mut().tx_stuck = false;
     // From the phone: back to the application, the count forgotten.
     let answer = visit(&mut m, "/restart", None);
     assert!(answer.contains("200 OK"), "{answer}");

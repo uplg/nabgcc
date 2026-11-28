@@ -75,14 +75,17 @@ fn a_power_cut_during_the_flash_leaves_a_dead_rabbit() {
     // A third of the way through: sectors erased, the image half written.
     m.soc.cut_power_after_flash_ops = Some(8000);
     until(&mut m, 90_000, "the power cut", |m| !m.events.is_empty());
-    // What the half-written image does next varies: it may never run,
-    // or run into an undefined instruction. It never comes back.
+    // What the half-written image does next varies with the old image
+    // left past the cut: it may never run, run into an undefined
+    // instruction, or put a few stray bytes on the serial port. It
+    // never comes back.
     assert_eq!(m.events[0], Event::Reset(ResetCause::PowerLoss));
 
     let said = m.soc.uart_tx.len();
     let asked = m.lan.as_ref().unwrap().requests.len();
     wait(&mut m, 60_000);
-    assert_eq!(m.soc.uart_tx.len(), said, "it never spoke again");
+    let stray = &m.soc.uart_tx[said..];
+    assert!(stray.len() < 16, "it spoke again: {stray:?}");
     assert_eq!(m.lan.as_ref().unwrap().requests.len(), asked);
     assert!(
         !m.radio.borrow().firmware_loaded,

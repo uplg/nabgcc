@@ -3,13 +3,14 @@
 
 use lapin_core::rng::Pool;
 use lapin_core::sha1;
-use lapin_core::wifi::{self, Delivery, Link, Station};
+use lapin_core::wifi::{self, Link, Station};
 use lapin_metal::{Auth, Host, Motor, ScanResult};
 
 use crate::ears::{self, Turn};
+use crate::inbox::{self, Inbox};
 use crate::wifi::link::Radio;
 use crate::wifi::rt2573::{self, Stick};
-use crate::{board, codec, flash, i2c, led, rfid, timer, uart, watchdog};
+use crate::{board, codec, flash, i2c, led, rfid, timer, uart, usb, watchdog};
 
 /// How many networks a scan keeps for the bytecode. The C driver put
 /// every frame it heard on the machine's stack, as many as the heap
@@ -25,14 +26,24 @@ pub struct Board {
     stick_slot: Option<&'static mut core::mem::MaybeUninit<Stick>>,
     pub station: &'static mut Station,
     pub pool: Pool,
-    /// The last frame received, and what of it waits for the bytecode.
+    /// The last frame received; what of the frames is for the bytecode
+    /// waits in `inbox`.
     pub frame: &'static mut [u8; 2400],
-    held: Option<Delivery>,
+    inbox: Inbox,
     pub scan: &'static mut [ScanResult; SCAN_RESULTS],
     scanned: usize,
     tags: [rfid::Tag; 16],
     tag_count: usize,
+    /// Frames the stick had delivered, and the USB transfer errors
+    /// then: errors piling up with no frame since mean it has stopped
+    /// receiving.
+    rx_seen: u32,
+    errors_at_rx: u32,
 }
+
+/// Transfer errors in a row, no frame received, that make the stick
+/// broken for the bytecode (a stalled endpoint fails every millisecond).
+const RX_FAILURES: u32 = 16;
 
 pub const SCAN_NONE: ScanResult = ScanResult {
     ssid: [0; 33],
@@ -51,6 +62,7 @@ impl Board {
         pool: Pool,
         frame: &'static mut [u8; 2400],
         scan: &'static mut [ScanResult; SCAN_RESULTS],
+        inbox: &'static mut [u8; inbox::SIZE],
     ) -> Board {
         scan.fill(SCAN_NONE);
         Board {
@@ -59,12 +71,25 @@ impl Board {
             station,
             pool,
             frame,
-            held: None,
+            inbox: Inbox::new(inbox),
             scan,
             scanned: 0,
             tags: [rfid::Tag::default(); 16],
             tag_count: 0,
+            rx_seen: 0,
+            errors_at_rx: 0,
         }
+    }
+
+    /// The stick has stopped delivering what it receives, or the USB
+    /// controller has failed: until a frame comes again.
+    fn receiving_fails(&mut self) -> bool {
+        let (got, errors) = (crate::wifi::received(), usb::bulk_errors());
+        if got != self.rx_seen {
+            self.rx_seen = got;
+            self.errors_at_rx = errors;
+        }
+        usb::broken() || errors.wrapping_sub(self.errors_at_rx) >= RX_FAILURES
     }
 
     /// The station and the stick together, if there is a stick.
@@ -72,12 +97,11 @@ impl Board {
         Some((&mut *self.station, link(&mut self.stick, &mut self.pool)?))
     }
 
-    /// Take frames from the stick until one is for the bytecode (kept
-    /// in `frame`) or none is left. Handshakes are handled on the way.
+    /// Take every frame from the stick: the station handles what is
+    /// its own (management, handshakes), what is for the bytecode goes
+    /// to the inbox. As the C driver did in the USB interrupt, whatever
+    /// the bytecode has not taken yet.
     fn pump(&mut self) {
-        if self.held.is_some() {
-            return;
-        }
         let frame = &mut *self.frame;
         let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return;
@@ -85,18 +109,15 @@ impl Board {
         self.station.poll(&mut radio);
         while let Some(rx) = radio.receive(frame) {
             if let Some(d) = self.station.input(&mut radio, frame, rx) {
-                self.held = Some(d);
-                return;
+                self.inbox.push(&frame[d.start..d.start + d.len], &d.source);
             }
         }
     }
 
     /// Throw away everything received (`rt2501_setmode` does).
     fn flush(&mut self) {
-        self.held = None;
-        while self.net_pending().is_some() {
-            self.held = None;
-        }
+        self.pump();
+        self.inbox.clear();
     }
 }
 
@@ -147,7 +168,7 @@ impl Host for Board {
     }
 
     fn time_s(&mut self) -> u32 {
-        timer::millis() / 1000
+        timer::seconds()
     }
 
     fn led(&mut self, n: u8, color: u32) {
@@ -250,6 +271,8 @@ impl Host for Board {
     }
 
     fn reboot(&mut self) -> ! {
+        // Asked for: not a start that failed, for the rescue core.
+        crate::boot::Slots::confirm();
         watchdog::reset_now()
     }
 
@@ -274,9 +297,16 @@ impl Host for Board {
     }
 
     fn net_state(&mut self) -> i32 {
-        if self.stick.is_none() {
+        // The C driver reported it broken once a receive failed, and
+        // never received again; this one tries again, and says broken
+        // only while receiving fails.
+        if self.stick.is_none() || self.receiving_fails() {
             return wifi::S_BROKEN;
         }
+        // The C driver handled management frames in the interrupt, so
+        // the state moved while the bytecode ran: what has arrived is
+        // taken into account first.
+        self.pump();
         self.station.net_state()
     }
 
@@ -292,9 +322,16 @@ impl Host for Board {
     }
 
     fn net_set_mode(&mut self, mode: i32, ssid: Option<&[u8]>, channel: u8) {
+        // A nil name for the access point is an empty one: the C driver
+        // copied from address 0.
         let name = ssid.map(cstr).unwrap_or(&[]);
-        if let Some((sta, mut radio)) = self.radio() {
+        // Any other mode changes nothing, as in the C driver; what was
+        // received is thrown away all the same.
+        if let (0 | 1, Some((sta, mut radio))) = (mode, self.radio()) {
             sta.set_mode(&mut radio, mode == 1, name, channel);
+            // An access point hears its own announcements only.
+            let own = radio.stick.mac;
+            crate::wifi::keep_announcements((mode == 1).then_some(&own));
         }
         self.flush();
     }
@@ -306,6 +343,7 @@ impl Host for Board {
         let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return 0;
         };
+        crate::wifi::keep_announcements(None);
         self.station
             .scan(&mut radio, ssid.map(cstr), frame, &mut |r| {
                 let mut ssid = [0u8; 33];
@@ -326,7 +364,7 @@ impl Host for Board {
                     scan[slot] = heard;
                 }
             });
-        self.held = None;
+        self.inbox.clear();
         self.scanned = n;
         n
     }
@@ -357,6 +395,8 @@ impl Host for Board {
             wifi::CRYPT_WEP => &key[..key.len().min(13)],
             _ => &key[..key.len().min(32)],
         };
+        // From now on only this network's announcements matter.
+        crate::wifi::keep_announcements(Some(&auth.bssid));
         if let Some((sta, mut radio)) = self.radio() {
             sta.auth(
                 &mut radio,
@@ -365,7 +405,11 @@ impl Host for Board {
                 &auth.bssid,
                 auth.channel,
                 auth.rateset,
-                auth.authmode == 1,
+                // Any mode but open system is a shared key's, as in the
+                // C driver; only WEP has shared keys (the station uses
+                // it for WEP alone, where the C driver sent it on any
+                // network).
+                auth.authmode != 0,
                 auth.encryption,
                 key,
                 password,
@@ -397,15 +441,11 @@ impl Host for Board {
 
     fn net_pending(&mut self) -> Option<usize> {
         self.pump();
-        self.held.map(|d| d.len)
+        self.inbox.front()
     }
 
     fn net_take(&mut self, data: &mut [u8], source: &mut [u8; 6]) {
-        if let Some(d) = self.held.take() {
-            let n = d.len.min(data.len());
-            data[..n].copy_from_slice(&self.frame[d.start..d.start + n]);
-            *source = d.source;
-        }
+        self.inbox.pop(data, source);
     }
 
     fn usb_events(&mut self) {

@@ -14,6 +14,7 @@ pub mod ears;
 pub mod flash;
 pub mod host;
 pub mod i2c;
+pub mod inbox;
 pub mod irq;
 pub mod led;
 pub mod reg;

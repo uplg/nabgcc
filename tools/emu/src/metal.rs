@@ -28,6 +28,12 @@ pub fn int(value: i32) -> Vec<u8> {
 
 /// Assemble a bytecode with one function and string globals.
 pub fn bytecode(strings: &[&[u8]], function: &[u8]) -> Vec<u8> {
+    bytecode_functions(strings, &[function])
+}
+
+/// The same with several functions, numbered from 0 in that order
+/// (the first runs at load).
+pub fn bytecode_functions(strings: &[&[u8]], functions: &[&[u8]]) -> Vec<u8> {
     let mut globals = Vec::new();
     for s in strings {
         globals.extend_from_slice(&((s.len() as u32) << 2 | 1).to_le_bytes());
@@ -35,10 +41,15 @@ pub fn bytecode(strings: &[&[u8]], function: &[u8]) -> Vec<u8> {
     }
     let mut bc = (globals.len() as u32 + 4).to_le_bytes().to_vec();
     bc.extend_from_slice(&globals);
-    bc.extend_from_slice(&(function.len() as u32).to_le_bytes());
-    bc.extend_from_slice(function);
-    bc.extend_from_slice(&1u16.to_le_bytes());
-    bc.extend_from_slice(&0u32.to_le_bytes());
+    let code: Vec<u8> = functions.concat();
+    bc.extend_from_slice(&(code.len() as u32).to_le_bytes());
+    bc.extend_from_slice(&code);
+    bc.extend_from_slice(&(functions.len() as u16).to_le_bytes());
+    let mut at = 0u32;
+    for f in functions {
+        bc.extend_from_slice(&at.to_le_bytes());
+        at += f.len() as u32;
+    }
     bc
 }
 
