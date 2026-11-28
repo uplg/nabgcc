@@ -545,10 +545,7 @@ fn recognise(data: &[u8]) -> Format {
         if data.len() < 10 {
             return Format::Unknown;
         }
-        at = 10
-            + data[6..10]
-                .iter()
-                .fold(0usize, |n, b| n << 7 | (*b & 0x7F) as usize);
+        at = id3_len(data);
     }
     let Some(h) = data.get(at..at + 4) else {
         return if data.len() > 4096 {
@@ -558,20 +555,7 @@ fn recognise(data: &[u8]) -> Format {
         };
     };
     if h[0] == 0xFF && h[1] & 0xE0 == 0xE0 {
-        const KBPS_V1_L3: [u32; 16] = [
-            0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
-        ];
-        const KBPS_V2_L3: [u32; 16] = [
-            0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
-        ];
-        let v1 = h[1] & 0x18 == 0x18;
-        let kbps = if v1 { KBPS_V1_L3 } else { KBPS_V2_L3 }[(h[2] >> 4) as usize];
-        let base = [44100, 48000, 32000, 0][((h[2] >> 2) & 3) as usize];
-        let sample_rate = match h[1] & 0x18 {
-            0x18 => base,
-            0x10 => base / 2,
-            _ => base / 4,
-        };
+        let (kbps, sample_rate) = mpeg_rates(h);
         if kbps != 0 && sample_rate != 0 {
             return Format::Mp3 {
                 bitrate: kbps * 1000,
@@ -580,6 +564,33 @@ fn recognise(data: &[u8]) -> Format {
         }
     }
     Format::Other
+}
+
+/// The length of an ID3 tag at least 10 bytes long, header included.
+fn id3_len(data: &[u8]) -> usize {
+    10 + data[6..10]
+        .iter()
+        .fold(0usize, |n, b| n << 7 | (*b & 0x7F) as usize)
+}
+
+/// The bit rate in kbit/s and the sample rate in Hz of an MPEG audio
+/// frame header, read as layer III; zero for the reserved values.
+fn mpeg_rates(h: &[u8]) -> (u32, u32) {
+    const KBPS_V1: [u32; 16] = [
+        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
+    ];
+    const KBPS_V2: [u32; 16] = [
+        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+    ];
+    let version = (h[1] >> 3) & 3;
+    let kbps = if version == 3 { KBPS_V1 } else { KBPS_V2 }[(h[2] >> 4) as usize];
+    let base = [44100, 48000, 32000, 0][((h[2] >> 2) & 3) as usize];
+    let sample_rate = match version {
+        3 => base,
+        2 => base / 2,
+        _ => base / 4,
+    };
+    (kbps, sample_rate)
 }
 
 /// One MPEG layer III frame header, as the decoder needs it.
@@ -596,24 +607,12 @@ fn mp3_frame(h: &[u8]) -> Option<Mp3Frame> {
     if h.len() < 4 || h[0] != 0xFF || h[1] & 0xE0 != 0xE0 || h[1] & 0x06 != 0x02 {
         return None;
     }
-    const KBPS_V1: [u32; 16] = [
-        0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
-    ];
-    const KBPS_V2: [u32; 16] = [
-        0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
-    ];
     let version = (h[1] >> 3) & 3;
     if version == 1 {
         return None;
     }
     let v1 = version == 3;
-    let kbps = if v1 { KBPS_V1 } else { KBPS_V2 }[(h[2] >> 4) as usize];
-    let base = [44100, 48000, 32000, 0][((h[2] >> 2) & 3) as usize];
-    let sample_rate = match version {
-        3 => base,
-        2 => base / 2,
-        _ => base / 4,
-    };
+    let (kbps, sample_rate) = mpeg_rates(h);
     if kbps == 0 || sample_rate == 0 {
         return None;
     }
@@ -631,10 +630,7 @@ fn mp3_frame(h: &[u8]) -> Option<Mp3Frame> {
 fn mp3_sync(data: &[u8]) -> Option<usize> {
     let mut at = 0;
     if data.starts_with(b"ID3") && data.len() >= 10 {
-        at = 10
-            + data[6..10]
-                .iter()
-                .fold(0usize, |n, b| n << 7 | (*b & 0x7F) as usize);
+        at = id3_len(data);
     }
     (at..data.len()).find(|i| mp3_frame(&data[*i..]).is_some())
 }

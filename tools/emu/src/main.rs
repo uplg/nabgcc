@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -55,6 +55,12 @@ fn parse_args() -> Result<Args, String> {
         return Err("no firmware image given".into());
     }
     Ok(a)
+}
+
+/// The first `n` addresses of a set, in hexadecimal.
+fn addresses(set: &BTreeSet<u32>, n: usize) -> String {
+    let list: Vec<String> = set.iter().take(n).map(|a| format!("{a:08x}")).collect();
+    list.join(" ")
 }
 
 fn main() -> ExitCode {
@@ -158,26 +164,15 @@ fn main() -> ExitCode {
         m.soc.ext_wait_total as f64 * 1000.0 / nabemu::soc::CLOCK_HZ as f64
     );
     if !m.soc.bus_faults.is_empty() {
-        let list: Vec<String> = m
-            .soc
-            .bus_faults
-            .iter()
-            .take(16)
-            .map(|a| format!("{a:08x}"))
-            .collect();
-        println!("accesses outside the memory map: {}", list.join(" "));
+        println!(
+            "accesses outside the memory map: {}",
+            addresses(&m.soc.bus_faults, 16)
+        );
     }
     if !m.soc.unmodelled.is_empty() {
-        let list: Vec<String> = m
-            .soc
-            .unmodelled
-            .iter()
-            .take(32)
-            .map(|a| format!("{a:08x}"))
-            .collect();
         println!(
             "registers read before any write, no model: {}",
-            list.join(" ")
+            addresses(&m.soc.unmodelled, 32)
         );
     }
     if args.profile

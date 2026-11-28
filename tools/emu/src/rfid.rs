@@ -153,33 +153,38 @@ impl Reader {
                 self.selected = None;
                 vec![0]
             }
-            [0x0B] => match self.selected.filter(|&i| i < self.tags.len()) {
-                Some(i) => {
+            [0x0B] => match self.selected_tag() {
+                Some(tag) => {
                     // Least significant byte first on the air.
                     let mut answer = vec![8];
-                    answer.extend(self.tags[i].uid.iter().rev());
+                    answer.extend(tag.uid.iter().rev());
                     answer
                 }
                 None => vec![0],
             },
-            [0x08, block] => match self.selected.filter(|&i| i < self.tags.len()) {
-                Some(i) if (*block as usize) < 128 => {
+            [0x08, block] => match self.selected_tag() {
+                Some(tag) if (*block as usize) < 128 => {
                     let mut answer = vec![4];
-                    answer.extend_from_slice(&self.tags[i].blocks[*block as usize]);
+                    answer.extend_from_slice(&tag.blocks[*block as usize]);
                     answer
                 }
                 _ => vec![0],
             },
             [0x09, block, data @ ..] if data.len() == 4 => {
-                if let Some(i) = self.selected.filter(|&i| i < self.tags.len())
+                if let Some(tag) = self.selected_tag()
                     && (*block as usize) < 128
                 {
-                    self.tags[i].blocks[*block as usize].copy_from_slice(data);
+                    tag.blocks[*block as usize].copy_from_slice(data);
                 }
                 vec![0]
             }
             _ => vec![0],
         }
+    }
+
+    /// The selected tag, while it is still there.
+    fn selected_tag(&mut self) -> Option<&mut Tag> {
+        self.selected.and_then(|i| self.tags.get_mut(i))
     }
 
     /// The sixteen-slot poll: which slots answered, and with what.
@@ -218,6 +223,12 @@ mod tests {
         (0..n).map(|_| r.read()).collect()
     }
 
+    /// An Initiate frame, and the first `n` bytes of the answer.
+    fn initiate(r: &mut Reader, n: usize) -> Vec<u8> {
+        write(r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
+        read(r, REG_IO_FRAME, n)
+    }
+
     const UID: [u8; 8] = [0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F];
 
     #[test]
@@ -225,13 +236,11 @@ mod tests {
         let mut r = Reader::default();
         write(&mut r, &[REG_PARAMETER, CARRIER_ON]);
         assert_eq!(read(&mut r, REG_PARAMETER, 1), [CARRIER_ON]);
-        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
-        assert_eq!(read(&mut r, REG_IO_FRAME, 2), [0, 0]);
+        assert_eq!(initiate(&mut r, 2), [0, 0]);
 
         r.tags.push(Tag::new(UID));
         write(&mut r, &[REG_PARAMETER, 0]);
-        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
-        assert_eq!(read(&mut r, REG_IO_FRAME, 2), [0, 0]);
+        assert_eq!(initiate(&mut r, 2), [0, 0]);
     }
 
     #[test]
@@ -240,8 +249,7 @@ mod tests {
         r.tags.push(Tag::new(UID));
         r.tags[0].blocks[7] = *b"carr";
         write(&mut r, &[REG_PARAMETER, CARRIER_ON]);
-        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
-        let id = read(&mut r, REG_IO_FRAME, 2)[1];
+        let id = initiate(&mut r, 2)[1];
 
         write(&mut r, &[REG_SLOT_MARKER]);
         let slots = read(&mut r, REG_IO_FRAME, 19);
@@ -269,8 +277,7 @@ mod tests {
         let mut r = Reader::default();
         r.tags.push(Tag::new(UID));
         write(&mut r, &[REG_PARAMETER, CARRIER_ON]);
-        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
-        let id = read(&mut r, REG_IO_FRAME, 2)[1];
+        let id = initiate(&mut r, 2)[1];
         write(&mut r, &[REG_IO_FRAME, 2, 0x0E, id]);
         r.tags.clear();
         write(&mut r, &[REG_IO_FRAME, 1, 0x0B]);
@@ -289,8 +296,7 @@ mod tests {
             r.tags.push(Tag::new(uid));
         }
         write(&mut r, &[REG_PARAMETER, CARRIER_ON]);
-        write(&mut r, &[REG_IO_FRAME, 2, 0x06, 0x00]);
-        assert_eq!(read(&mut r, REG_IO_FRAME, 1), [0xFF]);
+        assert_eq!(initiate(&mut r, 1), [0xFF]);
         write(&mut r, &[REG_SLOT_MARKER]);
         let slots = read(&mut r, REG_IO_FRAME, 19);
         assert_eq!(u16::from_le_bytes([slots[1], slots[2]]).count_ones(), 3);

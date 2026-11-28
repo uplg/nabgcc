@@ -271,13 +271,12 @@ impl Ohci {
 
         let mut budget = TDS_PER_FRAME;
         let control = self.r(HC_CONTROL);
-        if control & CTRL_CLE != 0 {
-            let head = self.r(HC_CONTROL_HEAD_ED);
-            self.serve_list(&mut ram, head, &mut budget);
-        }
-        if control & CTRL_BLE != 0 {
-            let head = self.r(HC_BULK_HEAD_ED);
-            self.serve_list(&mut ram, head, &mut budget);
+        // The control list first, then the bulk list, from one budget.
+        for (enable, head) in [(CTRL_CLE, HC_CONTROL_HEAD_ED), (CTRL_BLE, HC_BULK_HEAD_ED)] {
+            if control & enable != 0 {
+                let head = self.r(head);
+                self.serve_list(&mut ram, head, &mut budget);
+            }
         }
 
         // Hand the done queue over, but only once the driver has
