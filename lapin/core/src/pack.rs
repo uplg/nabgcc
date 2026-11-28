@@ -623,10 +623,7 @@ mod tests {
         let table = crc_table();
         let words: Vec<u32> = (0..1000u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        assert_eq!(
-            crc_words(&table, !0, &words),
-            crc_bytes(&table, !0, &bytes)
-        );
+        assert_eq!(crc_words(&table, !0, &words), crc_bytes(&table, !0, &bytes));
         assert_eq!(!crc_bytes(&table, !0, &bytes), crc32(&bytes, || {}));
     }
 

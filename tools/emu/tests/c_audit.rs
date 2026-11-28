@@ -164,7 +164,9 @@ fn a_transfer_past_the_reassembly_buffer_is_dropped_to_its_end() {
 fn lose_a_packet_of_the_next_frame(m: &mut Machine) {
     let beacon = |m: &Machine| m.radio.borrow().rx.iter().any(|f| f.data[0] == 0x80);
     until(m, 1000, "a beacon", beacon);
-    until(m, 1000, "the beacon handed over", |m| m.radio.borrow().rx.is_empty());
+    until(m, 1000, "the beacon handed over", |m| {
+        m.radio.borrow().rx.is_empty()
+    });
     wait(m, 5);
     m.radio.borrow_mut().lose_rx_packet = Some(1);
 }

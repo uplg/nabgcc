@@ -79,7 +79,12 @@ fn a_written_block_is_left_to_program_and_reads_back() {
     for (block, data) in [(2, 1), (3, 2)] {
         f.extend([metal::OP_GETGLOBALB, 0]);
         f.extend(metal::int(block));
-        f.extend([metal::OP_GETGLOBALB, data, metal::OP_RFID_WRITE, metal::OP_DROP]);
+        f.extend([
+            metal::OP_GETGLOBALB,
+            data,
+            metal::OP_RFID_WRITE,
+            metal::OP_DROP,
+        ]);
     }
     for block in [2, 3] {
         f.extend([metal::OP_GETGLOBALB, 0]);
@@ -106,9 +111,18 @@ fn the_field_goes_off_after_a_write() {
     let mut f = Vec::new();
     f.extend([metal::OP_GETGLOBALB, 0]);
     f.extend(metal::int(2));
-    f.extend([metal::OP_GETGLOBALB, 1, metal::OP_RFID_WRITE, metal::OP_DROP]);
+    f.extend([
+        metal::OP_GETGLOBALB,
+        1,
+        metal::OP_RFID_WRITE,
+        metal::OP_DROP,
+    ]);
     let (m, _) = run(&f, &[&UID, b"noix"], vec![Tag::new(UID)]);
     assert!(!m.soc.board.rfid.field_on(), "the field left on");
     assert_eq!(m.soc.board.rfid.tags[0].blocks[9], *b"noix");
-    assert_eq!(m.soc.board.rfid.cut_short == 0, is_lapin(), "Known defect on r3");
+    assert_eq!(
+        m.soc.board.rfid.cut_short == 0,
+        is_lapin(),
+        "Known defect on r3"
+    );
 }
