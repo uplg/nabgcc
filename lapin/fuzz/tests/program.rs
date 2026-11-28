@@ -35,6 +35,19 @@ fn instructions(bc: &[u8]) -> Vec<u8> {
     ops
 }
 
+/// A program generated from 3000 bytes of xorshift, `seed` its state.
+fn generated(seed: &mut u32) -> Vec<u8> {
+    let data: Vec<u8> = (0..3000)
+        .map(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 17;
+            *seed ^= *seed << 5;
+            *seed as u8
+        })
+        .collect();
+    lapin_fuzz::program::program(&mut Input::new(&data))
+}
+
 #[test]
 fn the_generator_reaches_every_instruction_it_compares() {
     #[rustfmt::skip]
@@ -48,15 +61,7 @@ fn the_generator_reaches_every_instruction_it_compares() {
     let mut seen = [false; 256];
     let mut seed = 0x2545_F491u32;
     for _ in 0..400 {
-        let data: Vec<u8> = (0..3000)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                seed as u8
-            })
-            .collect();
-        let bc = lapin_fuzz::program::program(&mut Input::new(&data));
+        let bc = generated(&mut seed);
         for op in instructions(&bc) {
             seen[op as usize] = true;
         }
@@ -75,15 +80,7 @@ fn generated_programs_run_the_same_on_both_machines() {
     let mut seed = 0x9E37_79B9u32;
     let (mut sent, mut read, mut lines) = (0, 0, 0);
     for k in 0..200 {
-        let data: Vec<u8> = (0..3000)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                seed as u8
-            })
-            .collect();
-        let bc = lapin_fuzz::program::program(&mut Input::new(&data));
+        let bc = generated(&mut seed);
         let c = run_both(
             || {
                 let mut w = World::new(Vec::new());

@@ -264,13 +264,13 @@ pub fn unwrap(kek: &[u8; 16], wrapped: &[u8], out: &mut [u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hex;
+    use crate::{hex, hex_array};
 
     #[test]
     fn fips_197() {
-        let key: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
+        let key: [u8; 16] = hex_array("000102030405060708090a0b0c0d0e0f");
         let aes = Aes::new(&key);
-        let mut b: Block = hex("00112233445566778899aabbccddeeff").try_into().unwrap();
+        let mut b: Block = hex_array("00112233445566778899aabbccddeeff");
         aes.encrypt(&mut b);
         assert_eq!(b[..], hex("69c4e0d86a7b0430d8cdb78070b4c55a"));
         aes.decrypt(&mut b);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn cmac_rfc4493() {
-        let key: [u8; 16] = hex("2b7e151628aed2a6abf7158809cf4f3c").try_into().unwrap();
+        let key: [u8; 16] = hex_array("2b7e151628aed2a6abf7158809cf4f3c");
         let m = hex(
             "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51
              30c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710",
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn unwrap_rfc3394() {
-        let kek: [u8; 16] = hex("000102030405060708090a0b0c0d0e0f").try_into().unwrap();
+        let kek: [u8; 16] = hex_array("000102030405060708090a0b0c0d0e0f");
         let wrapped = hex("1fa68b0a8112b447aef34bd8fb5a7b829d3e862371d2cfe5");
         let mut out = [0u8; 16];
         assert!(unwrap(&kek, &wrapped, &mut out));
@@ -314,9 +314,9 @@ mod tests {
     #[test]
     fn ccm_rfc3610_packet_1() {
         // Eight-byte tag, two-byte length: the parameters of CCMP.
-        let key: [u8; 16] = hex("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf").try_into().unwrap();
+        let key: [u8; 16] = hex_array("c0c1c2c3c4c5c6c7c8c9cacbcccdcecf");
         let aes = Aes::new(&key);
-        let nonce: [u8; 13] = hex("00000003020100a0a1a2a3a4a5").try_into().unwrap();
+        let nonce: [u8; 13] = hex_array("00000003020100a0a1a2a3a4a5");
         let mut data = hex("08090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
         let plain = data.clone();
         let tag = ccm(&aes, &nonce, &hex("0001020304050607"), &mut data, false);

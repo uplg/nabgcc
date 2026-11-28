@@ -31,3 +31,9 @@ fn hex(s: &str) -> std::vec::Vec<u8> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
         .collect()
 }
+
+/// The same, as an array of their number.
+#[cfg(test)]
+fn hex_array<const N: usize>(s: &str) -> [u8; N] {
+    hex(s).try_into().unwrap()
+}

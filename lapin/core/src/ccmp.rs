@@ -153,18 +153,25 @@ pub fn bip_check(igtk: &[u8; 16], frame: &[u8]) -> Option<(u16, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hex;
+    use crate::{hex, hex_array};
+
+    /// `plain` protected under `tk` (key 0), packet number `pn`.
+    fn protected(tk: &[u8; 16], pn: u64, plain: &[u8]) -> std::vec::Vec<u8> {
+        let mut f = plain.to_vec();
+        f.resize(plain.len() + OVERHEAD, 0);
+        let n = protect(tk, 0, pn, &mut f, plain.len());
+        f.truncate(n);
+        f
+    }
 
     /// IEEE 802.11-2012 M.9.2: a unicast deauthentication.
     #[test]
     fn management_frame_vector() {
-        let tk: [u8; 16] = hex("66ed21042f9f26d7115706e40414cf2e").try_into().unwrap();
+        let tk: [u8; 16] = hex_array("66ed21042f9f26d7115706e40414cf2e");
         let plain = hex("c0000000020000000100020000000000020000000000 6000 0200");
-        let mut f = plain.clone();
-        f.resize(plain.len() + OVERHEAD, 0);
-        let n = protect(&tk, 0, 1, &mut f, plain.len());
+        let mut f = protected(&tk, 1, &plain);
         assert_eq!(
-            f[..n],
+            f[..],
             hex("c0400000020000000100020000000000020000000000 6000
                  0100002000000000 1d07 cafd0409bb8bafef")[..]
         );
@@ -173,9 +180,7 @@ mod tests {
         assert_eq!((m, pn), (plain.len(), 1));
         assert_eq!(f[..m], plain[..]);
         // One bit off anywhere and it no longer opens.
-        let mut g = plain.clone();
-        g.resize(plain.len() + OVERHEAD, 0);
-        protect(&tk, 0, 1, &mut g, plain.len());
+        let mut g = protected(&tk, 1, &plain);
         g[30] ^= 4;
         assert!(unprotect(&tk, &mut g).is_none());
     }
@@ -183,16 +188,13 @@ mod tests {
     /// IEEE 802.11-2012 M.6.4: a data frame (CCMP test vector).
     #[test]
     fn data_frame_vector() {
-        let tk: [u8; 16] = hex("c97c1f67ce371185514a8a19f2bdd52f").try_into().unwrap();
+        let tk: [u8; 16] = hex_array("c97c1f67ce371185514a8a19f2bdd52f");
         let plain = hex(
             "08 48 c3 2c 0f d2 e1 28 a5 7c 50 30 f1 84 44 08 ab ae a5 b8 fc ba 80 33
              f8 ba 1a 55 d0 2f 85 ae 96 7b b6 2f b6 cd a8 eb 7e 78 a0 50",
         );
-        let mut f = plain.clone();
-        f.resize(plain.len() + OVERHEAD, 0);
-        let n = protect(&tk, 0, 0xB5039776E70C, &mut f, plain.len());
         assert_eq!(
-            f[..n],
+            protected(&tk, 0xB5039776E70C, &plain)[..],
             hex(
                 "08 48 c3 2c 0f d2 e1 28 a5 7c 50 30 f1 84 44 08 ab ae a5 b8 fc ba 80 33
                  0c e7 00 20 76 97 03 b5
@@ -205,7 +207,7 @@ mod tests {
     /// IEEE 802.11-2012 M.9.1: BIP over a broadcast deauthentication.
     #[test]
     fn bip_vector() {
-        let igtk: [u8; 16] = hex("4ea9543e09cf2b1eca66ffc58bdecbcf").try_into().unwrap();
+        let igtk: [u8; 16] = hex_array("4ea9543e09cf2b1eca66ffc58bdecbcf");
         let mut f = hex("c0000000ffffffffffff020000000000020000000000 0900 0200
              4c10 0400 040000000000 0000000000000000");
         assert_eq!(bip_mic(&igtk, &f)[..], hex("48dfbfa7b8278872"));

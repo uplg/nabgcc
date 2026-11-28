@@ -3038,16 +3038,53 @@ mod tests {
         pairwise: Some(Cipher::Ccmp),
     };
 
+    /// A frame of frame control `fc`, its three addresses, sequence 0.
+    fn frame(fc: [u8; 2], a1: &Mac, a2: &Mac, a3: &Mac, body: &[u8]) -> Vec<u8> {
+        [&fc[..], &[0, 0], a1, a2, a3, &[0, 0], body].concat()
+    }
+
     /// A data frame from the access point, `fc1` its flags beyond
     /// "from the network".
     fn from_ap(fc1: u8, to: &Mac, body: &[u8]) -> Vec<u8> {
-        let mut f = std::vec![0x08, 0x02 | fc1, 0, 0];
-        f.extend_from_slice(to);
-        f.extend_from_slice(&AP);
-        f.extend_from_slice(&AP);
-        f.extend_from_slice(&[0, 0]);
-        f.extend_from_slice(body);
-        f
+        frame([0x08, 0x02 | fc1], to, &AP, &AP, body)
+    }
+
+    /// An IP datagram's first bytes, behind their LLC header.
+    const IP: [u8; 12] = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
+
+    /// A frame from the access point carrying the EAPOL frame `e`.
+    fn eapol_frame(e: &[u8]) -> Vec<u8> {
+        let mut body = LLC_EAPOL.to_vec();
+        body.extend_from_slice(e);
+        from_ap(0, &OWN, &body)
+    }
+
+    /// An EAPOL-Key frame by hand (802.1X version 2, descriptor 2, no
+    /// key data): its length field says `declared`, then `info`, the
+    /// replay counter and the nonce, every byte `nonce`.
+    fn raw_key(declared: u16, info: u16, counter: u64, nonce: u8) -> Vec<u8> {
+        let mut e = std::vec![0u8; 99];
+        e[..2].copy_from_slice(&[2, 3]);
+        e[2..4].copy_from_slice(&declared.to_be_bytes());
+        e[4] = 2;
+        e[5..7].copy_from_slice(&info.to_be_bytes());
+        e[9..17].copy_from_slice(&counter.to_be_bytes());
+        e[17..49].fill(nonce);
+        e
+    }
+
+    /// The group key, index 1, as its KDE carries it (sixteen 0x47).
+    fn gtk_kde() -> Vec<u8> {
+        let mut kde = std::vec![0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0];
+        kde.extend_from_slice(&[0x47; 16]);
+        kde
+    }
+
+    /// Message 3's key data: the RSN element `rsn`, then the group key.
+    fn with_gtk(rsn: &[u8]) -> Vec<u8> {
+        let mut data = rsn.to_vec();
+        data.extend_from_slice(&gtk_kde());
+        data
     }
 
     fn input(s: &mut Station, air: &mut Air, f: &[u8], decrypted: bool) -> Option<Delivery> {
@@ -3086,20 +3123,10 @@ mod tests {
         for declared in [0u16, 8, 50, 94] {
             let mut s = running(WPA2);
             s.replay_active = true;
-            let mut e = std::vec![0u8; 99];
-            e[..2].copy_from_slice(&[2, 3]);
-            e[2..4].copy_from_slice(&declared.to_be_bytes());
-            e[4] = 2;
             // Message 3: pairwise, ack, MIC, secure.
-            e[5..7].copy_from_slice(&0x038Au16.to_be_bytes());
-            e[9..17].fill(0xFF);
-            let mut body = LLC_EAPOL.to_vec();
-            body.extend_from_slice(&e);
+            let e = raw_key(declared, 0x038A, u64::MAX, 0);
             let mut air = Air::default();
-            assert_eq!(
-                input(&mut s, &mut air, &from_ap(0, &OWN, &body), false),
-                None
-            );
+            assert_eq!(input(&mut s, &mut air, &eapol_frame(&e), false), None);
             assert_eq!(s.state, State::Run);
             assert!(air.sent.is_empty());
         }
@@ -3113,7 +3140,7 @@ mod tests {
     fn a_frame_still_sealed_is_not_handed_up() {
         // The CCMP header names key 3; then an IP datagram, in clear.
         let mut body = std::vec![0, 0, 0, 0xE0, 0, 0, 0, 0];
-        body.extend_from_slice(&[0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20]);
+        body.extend_from_slice(&IP);
         for security in [
             WPA2,
             Security::Open,
@@ -3152,9 +3179,8 @@ mod tests {
     fn frames_the_stick_opened_are_not_taken_twice() {
         let mut s = running(WPA2);
         let mut air = Air::default();
-        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
-        let unicast = from_ap(0, &OWN, &ip);
-        let group = from_ap(0, &BROADCAST, &ip);
+        let unicast = from_ap(0, &OWN, &IP);
+        let group = from_ap(0, &BROADCAST, &IP);
         for (f, pn, up) in [
             (&unicast, 5, true),
             (&unicast, 5, false),
@@ -3177,20 +3203,14 @@ mod tests {
     /// the message gave for the key was ignored.
     #[test]
     fn a_group_key_handed_over_again_keeps_its_counter() {
-        let mut s = running(Security::Psk {
-            wpa2: true,
-            group: Cipher::Ccmp,
-            pairwise: Some(Cipher::Tkip),
-        });
+        let mut s = running(WPA2_TKIP);
         s.ptk = [0x5C; 64];
-        let mut kde = std::vec![0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0];
-        kde.extend_from_slice(&[0x47; 16]);
+        let kde = gtk_kde();
         let mut air = Air::default();
         let f = group_message_at(&s, 1, &kde, 100);
         input(&mut s, &mut air, &f, true);
         assert_eq!(air.keys, [(1, std::vec![0x47; 16])]);
-        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
-        let group = from_ap(0, &BROADCAST, &ip);
+        let group = from_ap(0, &BROADCAST, &IP);
         // At or below the counter the access point gave: old frames.
         assert!(input_numbered(&mut s, &mut air, &group, true, 100).is_none());
         assert!(input_numbered(&mut s, &mut air, &group, true, 101).is_some());
@@ -3231,32 +3251,18 @@ mod tests {
     /// failed and the link went down.
     #[test]
     fn a_forged_message_1_does_not_move_the_replay_counter() {
-        let mut s = running(Security::Psk {
-            wpa2: true,
-            group: Cipher::Ccmp,
-            pairwise: Some(Cipher::Tkip),
-        });
+        let mut s = running(WPA2_TKIP);
         s.ptk = [0x5C; 64];
         s.replay = 5u64.to_be_bytes();
         s.replay_active = true;
-        let mut e = std::vec![0u8; 99];
-        e[..2].copy_from_slice(&[2, 3]);
-        e[2..4].copy_from_slice(&95u16.to_be_bytes());
-        e[4] = 2;
-        e[5..7].copy_from_slice(&0x0089u16.to_be_bytes());
-        e[9..17].fill(0xFF);
-        e[17..49].fill(0x77);
-        let mut body = LLC_EAPOL.to_vec();
-        body.extend_from_slice(&e);
+        let e = raw_key(95, 0x0089, u64::MAX, 0x77);
         let mut air = Air::default();
-        input(&mut s, &mut air, &from_ap(0, &OWN, &body), true);
+        input(&mut s, &mut air, &eapol_frame(&e), true);
         // Answered, with its counter.
         assert_eq!(air.sent.len(), 1);
         assert_eq!(air.sent[0][24 + 8 + 9..24 + 8 + 17], [0xFF; 8]);
         // The access point's next group key still goes in.
-        let mut kde = std::vec![0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0];
-        kde.extend_from_slice(&[0x47; 16]);
-        let f = group_message(&s, 6, &kde);
+        let f = group_message(&s, 6, &gtk_kde());
         input(&mut s, &mut air, &f, true);
         assert_eq!(air.keys, [(1, std::vec![0x47; 16])]);
         assert_eq!(s.state, State::Run);
@@ -3268,23 +3274,8 @@ mod tests {
     /// until the rabbit restarted.
     #[test]
     fn a_rekey_left_half_done_does_not_sign_the_next_handshake() {
-        let mut s = running(Security::Psk {
-            wpa2: true,
-            group: Cipher::Ccmp,
-            pairwise: Some(Cipher::Tkip),
-        });
-        let msg1 = |anonce: u8| {
-            let mut e = std::vec![0u8; 99];
-            e[..2].copy_from_slice(&[2, 3]);
-            e[2..4].copy_from_slice(&95u16.to_be_bytes());
-            e[4] = 2;
-            e[5..7].copy_from_slice(&0x0089u16.to_be_bytes());
-            e[9..17].copy_from_slice(&1u64.to_be_bytes());
-            e[17..49].fill(anonce);
-            let mut body = LLC_EAPOL.to_vec();
-            body.extend_from_slice(&e);
-            from_ap(0, &OWN, &body)
-        };
+        let mut s = running(WPA2_TKIP);
+        let msg1 = |anonce: u8| eapol_frame(&raw_key(95, 0x0089, 1, anonce));
         let mut air = Air::default();
         input(&mut s, &mut air, &msg1(0x77), true);
         assert!(s.next_ptk.is_some());
@@ -3335,12 +3326,7 @@ mod tests {
             mac: PHONE,
         };
         let mut air = Air::default();
-        let mut f = std::vec![0x08, 0x01, 0, 0];
-        f.extend_from_slice(&OWN);
-        f.extend_from_slice(&PHONE);
-        f.extend_from_slice(&OWN);
-        f.extend_from_slice(&[0, 0]);
-        f.extend_from_slice(&LLC_EAPOL);
+        let mut f = frame([0x08, 0x01], &OWN, &PHONE, &OWN, &LLC_EAPOL);
         f.extend_from_slice(&[2, 1, 0, 0]);
         let before = input(&mut s, &mut air, &f, false);
         f[24..32].copy_from_slice(&[0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00]);
@@ -3363,11 +3349,7 @@ mod tests {
             let mut s = running(Security::Sae { h2e: false });
             s.state = State::Assoc;
             s.timeout = ASSOC_TIMEOUT;
-            let mut f = std::vec![0x10, 0, 0, 0];
-            f.extend_from_slice(&OWN);
-            f.extend_from_slice(&AP);
-            f.extend_from_slice(&AP);
-            f.extend_from_slice(&[0, 0, 0x01, 0, 30, 0, 1, 0xC0]);
+            let mut f = frame([0x10, 0], &OWN, &AP, &AP, &[0x01, 0, 30, 0, 1, 0xC0]);
             f.extend_from_slice(&[56, 5, 3]);
             f.extend_from_slice(&tu.to_le_bytes());
             let mut air = Air::default();
@@ -3382,14 +3364,21 @@ mod tests {
         }
     }
 
+    /// What `suites` reads in an RSN element's body of CCMP for both
+    /// keys, then `akm`: its key management suites and capabilities.
+    fn rsn_suites(akm: &[u8]) -> Option<(u8, u8, u16, u16)> {
+        let mut rsn = std::vec![1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4];
+        rsn.extend_from_slice(akm);
+        suites(&rsn, [0x00, 0x0F, 0xAC])
+    }
+
     /// An RSN element offering SAE-EXT-KEY (suite 24) alone: the bit of
     /// the suite modulo 16 was set, 8, and the station took the network
     /// for one offering SAE (and 18 for PSK, 2).
     #[test]
     fn a_key_management_suite_past_15_aliases_none() {
-        let mut rsn = std::vec![1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4];
-        rsn.extend_from_slice(&[2, 0, 0x00, 0x0F, 0xAC, 24, 0x00, 0x0F, 0xAC, 18, 0, 0]);
-        let (_, _, akm, _) = suites(&rsn, [0x00, 0x0F, 0xAC]).unwrap();
+        let rsn = rsn_suites(&[2, 0, 0x00, 0x0F, 0xAC, 24, 0x00, 0x0F, 0xAC, 18, 0, 0]);
+        let (_, _, akm, _) = rsn.unwrap();
         assert_eq!(akm, 0);
     }
 
@@ -3472,9 +3461,7 @@ mod tests {
             let mic = hmac_md5(&s.ptk[..16], &[&e]);
             e[81..97].copy_from_slice(&mic);
         }
-        let mut body = LLC_EAPOL.to_vec();
-        body.extend_from_slice(&e);
-        from_ap(0, &OWN, &body)
+        eapol_frame(&e)
     }
 
     /// A station between messages 1 and 3 of its first handshake with
@@ -3483,16 +3470,50 @@ mod tests {
         let mut s = running(WPA2_TKIP);
         s.state = State::Eapol;
         s.keys = KeyState::Msg1;
-        s.bss = Offer::from_elements(AP, &AP_RSN);
-        s.bss_known = true;
-        let mut air = Air::default();
-        let msg1 = eapol_key(&s, 0x0088, 1, &[0x77; 32], &[]);
-        input(&mut s, &mut air, &msg1, false);
+        let air = message_1(&mut s, 0x77, false);
         assert_eq!(s.keys, KeyState::Msg3);
         (s, air)
     }
 
+    /// `s` having scanned `AP` (`AP_RSN`), its message 1 of nonce
+    /// `anonce`, `sealed` if the stick opened it.
+    fn message_1(s: &mut Station, anonce: u8, sealed: bool) -> Air {
+        s.bss = Offer::from_elements(AP, &AP_RSN);
+        s.bss_known = true;
+        let mut air = Air::default();
+        let msg1 = eapol_key(s, 0x0088, 1, &[anonce; 32], &[]);
+        input(s, &mut air, &msg1, sealed);
+        air
+    }
+
     const MSG3: u16 = 0x0008 | 0x0040 | 0x0080 | 0x0100 | 0x0200 | 0x1000;
+
+    /// Message 3 of the handshake `in_handshake` began, replay counter
+    /// `counter`, key data `data`, handed to the station.
+    fn message_3(s: &mut Station, air: &mut Air, counter: u64, data: &[u8]) {
+        let f = eapol_key(s, MSG3, counter, &[0x77; 32], data);
+        input(s, air, &f, false);
+    }
+
+    /// Message 3 with `rsn_with_sae`, which the station does not answer:
+    /// it stops there.
+    fn message_3_offering_wpa3_ends_the_attempt(s: &mut Station, air: &mut Air) {
+        air.sent.clear();
+        message_3(s, air, 2, &with_gtk(&rsn_with_sae()));
+        assert!(air.sent.is_empty(), "answered");
+        assert_eq!(s.state, State::Idle);
+    }
+
+    /// `AP_RSN` as the genuine element of a network that offers SAE as
+    /// well (and protection), which a forged beacon would hide.
+    fn rsn_with_sae() -> Vec<u8> {
+        let mut rsn = AP_RSN.to_vec();
+        rsn[1] = 24;
+        rsn[14] = 2;
+        rsn.splice(20..20, [0x00, 0x0F, 0xAC, 8]);
+        rsn[24] = 0x80;
+        rsn
+    }
 
     /// Message 3 without a group key: message 4 went first, the keys
     /// were taken as in place, and the key data was looked at after.
@@ -3503,17 +3524,12 @@ mod tests {
     fn message_3_without_a_group_key_is_not_answered() {
         let (mut s, mut air) = in_handshake();
         air.sent.clear();
-        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &AP_RSN);
-        input(&mut s, &mut air, &f, false);
+        message_3(&mut s, &mut air, 2, &AP_RSN);
         assert!(air.sent.is_empty(), "answered");
         assert_eq!(s.keys, KeyState::Msg3);
         assert_eq!(s.state, State::Eapol);
         // With it, the same message goes through.
-        let mut data = AP_RSN.to_vec();
-        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
-        data.extend_from_slice(&[0x47; 16]);
-        let f = eapol_key(&s, MSG3, 3, &[0x77; 32], &data);
-        input(&mut s, &mut air, &f, false);
+        message_3(&mut s, &mut air, 3, &with_gtk(&AP_RSN));
         assert_eq!(air.sent.len(), 1);
         assert_eq!(s.state, State::Run);
         assert!(air.keys.contains(&(1, std::vec![0x47; 16])));
@@ -3526,20 +3542,7 @@ mod tests {
     #[test]
     fn message_3_with_another_element_ends_the_attempt() {
         let (mut s, mut air) = in_handshake();
-        air.sent.clear();
-        // The genuine element offers SAE as well (and protection).
-        let mut rsn = AP_RSN.to_vec();
-        rsn[1] = 24;
-        rsn[14] = 2;
-        rsn.splice(20..20, [0x00, 0x0F, 0xAC, 8]);
-        rsn[24] = 0x80;
-        let mut data = rsn.clone();
-        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
-        data.extend_from_slice(&[0x47; 16]);
-        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
-        input(&mut s, &mut air, &f, false);
-        assert!(air.sent.is_empty(), "answered");
-        assert_eq!(s.state, State::Idle);
+        message_3_offering_wpa3_ends_the_attempt(&mut s, &mut air);
         let learned = s.learned.unwrap();
         assert_eq!(learned.bssid, AP);
         assert!(learned.rsn.is_some_and(|(_, _, akm, _)| akm & 1 << 8 != 0));
@@ -3555,11 +3558,7 @@ mod tests {
         let (mut s, mut air) = in_handshake();
         s.bss_known = false;
         air.sent.clear();
-        let mut data = AP_RSN.to_vec();
-        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
-        data.extend_from_slice(&[0x47; 16]);
-        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
-        input(&mut s, &mut air, &f, false);
+        message_3(&mut s, &mut air, 2, &with_gtk(&AP_RSN));
         assert_eq!(air.sent.len(), 1, "message 4");
         assert_eq!(s.state, State::Run);
     }
@@ -3571,19 +3570,7 @@ mod tests {
         let (mut s, mut air) = in_handshake();
         s.bss_known = false;
         s.password_len = 8;
-        air.sent.clear();
-        let mut rsn = AP_RSN.to_vec();
-        rsn[1] = 24;
-        rsn[14] = 2;
-        rsn.splice(20..20, [0x00, 0x0F, 0xAC, 8]);
-        rsn[24] = 0x80;
-        let mut data = rsn.clone();
-        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
-        data.extend_from_slice(&[0x47; 16]);
-        let f = eapol_key(&s, MSG3, 2, &[0x77; 32], &data);
-        input(&mut s, &mut air, &f, false);
-        assert!(air.sent.is_empty(), "answered");
-        assert_eq!(s.state, State::Idle);
+        message_3_offering_wpa3_ends_the_attempt(&mut s, &mut air);
         assert!(s.learned.is_some_and(|o| o.rsn.is_some()));
     }
 
@@ -3606,8 +3593,7 @@ mod tests {
     fn nothing_but_the_handshake_goes_in_clear() {
         let (mut s, mut air) = in_handshake();
         air.sent.clear();
-        let ip = [0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00, 0x45, 0, 0, 20];
-        assert!(!s.send(&mut air, &ip, &BROADCAST, false));
+        assert!(!s.send(&mut air, &IP, &BROADCAST, false));
         assert!(air.sent.is_empty());
         // The null frame carries nothing: it may.
         assert!(s.send(&mut air, &[], &AP, false));
@@ -3643,11 +3629,9 @@ mod tests {
             le16(&air.sent[0], 24) == 3
         };
         let mut s = Station::new();
-        let mut rsn = std::vec![1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4];
-        rsn.extend_from_slice(&[1, 0, 0x00, 0x0F, 0xAC, 8, 0xC0, 0]);
         s.offers[0] = Offer {
             bssid: AP,
-            rsn: suites(&rsn, [0x00, 0x0F, 0xAC]),
+            rsn: rsn_suites(&[1, 0, 0x00, 0x0F, 0xAC, 8, 0xC0, 0]),
             ..Offer::default()
         };
         let mut air = Air::default();
@@ -3676,17 +3660,10 @@ mod tests {
     fn a_rekey_installs_its_key_once_message_4_has_left() {
         let mut s = running(WPA2_TKIP);
         s.ptk = [0x5C; 64];
-        s.bss = Offer::from_elements(AP, &AP_RSN);
-        s.bss_known = true;
-        let mut air = Air::default();
-        let msg1 = eapol_key(&s, 0x0088, 1, &[0x66; 32], &[]);
-        input(&mut s, &mut air, &msg1, true);
+        let mut air = message_1(&mut s, 0x66, true);
         let mut signer = s.clone();
         signer.ptk = s.next_ptk.unwrap();
-        let mut data = AP_RSN.to_vec();
-        data.extend_from_slice(&[0xDD, 22, 0x00, 0x0F, 0xAC, 1, 1, 0]);
-        data.extend_from_slice(&[0x47; 16]);
-        let msg3 = eapol_key(&signer, MSG3, 2, &[0x66; 32], &data);
+        let msg3 = eapol_key(&signer, MSG3, 2, &[0x66; 32], &with_gtk(&AP_RSN));
         air.calls.clear();
         input(&mut s, &mut air, &msg3, true);
         assert_eq!(air.calls.first(), Some(&'t'), "{:?}", air.calls);
@@ -3702,11 +3679,7 @@ mod tests {
         let mut air = Air::default();
         s.set_mode(&mut air, true, b"Nabaztag", 4);
         air.sent.clear();
-        let mut f = std::vec![0xB0, 0, 0, 0];
-        f.extend_from_slice(&OWN);
-        f.extend_from_slice(&AP);
-        f.extend_from_slice(&OWN);
-        f.extend_from_slice(&[0, 0, 0, 0, 0xFF, 0xFF, 0, 0]);
+        let f = frame([0xB0, 0], &OWN, &AP, &OWN, &[0, 0, 0xFF, 0xFF, 0, 0]);
         input(&mut s, &mut air, &f, false);
         assert_eq!(air.sent.len(), 1);
         assert_eq!(air.sent[0][26..30], [0, 0, 14, 0]);
