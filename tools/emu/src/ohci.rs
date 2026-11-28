@@ -61,6 +61,13 @@ const CC_DATA_UNDERRUN: u32 = 9;
 const RESET_FRAMES: u32 = 10;
 /// Transfer descriptors retired per frame at most, all lists together.
 const TDS_PER_FRAME: u32 = 16;
+/// Bytes of a full-speed frame (12 Mb/s for 1 ms) the transactions
+/// share, and what each costs beyond its data: tokens, handshake, CRC,
+/// sync and gaps. USB 2.0, 5.8.4 and table 5-10: nineteen bulk
+/// transactions of 64 bytes at most in a frame (1216 bytes of data),
+/// 71 of 8 bytes.
+const FRAME_BYTES: usize = 1500;
+const TRANSACTION_OVERHEAD: usize = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Xfer {
@@ -120,6 +127,8 @@ pub struct Ohci {
     /// has, an IN packet the host takes for one it has. Both are
     /// acknowledged all the same.
     pub toggle_drops: u64,
+    /// What is left of the current frame's bus time, in bytes.
+    bus_left: usize,
 }
 
 struct Ram<'a>(&'a mut [u8]);
@@ -163,6 +172,7 @@ impl Ohci {
             latched: false,
             toggles: [[false; 2]; 16],
             toggle_drops: 0,
+            bus_left: 0,
         }
     }
 
@@ -360,6 +370,7 @@ impl Ohci {
         }
 
         let mut budget = TDS_PER_FRAME;
+        self.bus_left = FRAME_BYTES;
         let control = self.r(HC_CONTROL);
         // The control list first, then the bulk list, from one budget.
         for (enable, head) in [(CTRL_CLE, HC_CONTROL_HEAD_ED), (CTRL_BLE, HC_BULK_HEAD_ED)] {
@@ -477,6 +488,14 @@ impl Ohci {
             }
         };
 
+        // Bytes that went through before a packet failed: the buffer
+        // pointer is left after them (Linux's `td_done` counts them, from
+        // it, as the transfer's actual length, error or not).
+        let mut moved_on_error = 0;
+        // The bus time left in this frame: a transaction that would not
+        // fit waits for the next frame, as one the device answered NAK.
+        let mut bus = self.bus_left;
+        let fits = |bus: usize, n: usize| bus >= n + TRANSACTION_OVERHEAD;
         let Some(dev) = self.device.as_mut() else {
             return Some(false);
         };
@@ -484,7 +503,9 @@ impl Ohci {
             None
         } else {
             Some(match pid {
+                0 if !fits(bus, 8) => Xfer::Nak,
                 0 => {
+                    bus -= 8 + TRANSACTION_OVERHEAD;
                     let m = ram.range(cbp, 8)?;
                     let mut pkt = [0u8; 8];
                     pkt.copy_from_slice(m);
@@ -522,12 +543,17 @@ impl Ohci {
                         // for a retry of the last it has, acknowledges it,
                         // and throws it away.
                         let fresh = !bulk || toggle == device_toggles[0];
-                        let x = if fresh {
+                        let x = if !fits(bus, packet.len()) {
+                            Xfer::Nak
+                        } else if fresh {
                             dev.data_out(ep, packet)
                         } else {
                             drops += 1;
                             Xfer::Done(packet.len())
                         };
+                        if x != Xfer::Nak {
+                            bus = bus.saturating_sub(packet.len() + TRANSACTION_OVERHEAD);
+                        }
                         match x {
                             Xfer::Done(_) => {
                                 sent += packet.len();
@@ -543,6 +569,7 @@ impl Ohci {
                                 break;
                             }
                             other => {
+                                moved_on_error = sent;
                                 result = Some(other);
                                 break;
                             }
@@ -556,7 +583,17 @@ impl Ohci {
                     let mut got = 0;
                     let mut packet = vec![0u8; mps];
                     loop {
-                        match dev.data_in(ep, &mut packet) {
+                        // Room is kept for a whole packet: the device may
+                        // send one.
+                        let x = if fits(bus, mps) {
+                            dev.data_in(ep, &mut packet)
+                        } else {
+                            Xfer::Nak
+                        };
+                        if let Xfer::Done(n) = x {
+                            bus -= n.min(mps) + TRANSACTION_OVERHEAD;
+                        }
+                        match x {
                             Xfer::Done(n) => {
                                 // The device sent it with its toggle, and
                                 // goes on to the next once acknowledged;
@@ -588,12 +625,16 @@ impl Ohci {
                                 partly = Some(got);
                                 break Xfer::Nak;
                             }
-                            other => break other,
+                            other => {
+                                moved_on_error = got;
+                                break other;
+                            }
                         }
                     }
                 }
             })
         };
+        self.bus_left = bus;
         if bulk {
             self.toggles[ep as usize] = device_toggles;
         }
@@ -611,7 +652,7 @@ impl Ohci {
         let (cc, moved) = match outcome {
             None => (CC_NOT_RESPONDING, 0),
             Some(Xfer::Nak) => return Some(false),
-            Some(Xfer::Stall) => (CC_STALL, 0),
+            Some(Xfer::Stall) => (CC_STALL, moved_on_error),
             Some(Xfer::Done(n)) if n > len => (CC_DATA_OVERRUN, len),
             Some(Xfer::Done(n)) if n < len && td_ctl & (1 << 18) == 0 => (CC_DATA_UNDERRUN, n),
             Some(Xfer::Done(n)) => (CC_NO_ERROR, n),
@@ -710,5 +751,94 @@ impl ControlPipe {
             self.data.extend_from_slice(data);
         }
         Xfer::Done(data.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device at address 1 whose bulk endpoint in always has full
+    /// packets to give, and stalls the one numbered `stall_at`.
+    struct Streaming {
+        sent: usize,
+        stall_at: Option<usize>,
+    }
+
+    impl UsbDevice for Streaming {
+        fn bus_reset(&mut self) {}
+        fn address(&self) -> u8 {
+            1
+        }
+        fn setup(&mut self, _: [u8; 8]) -> Xfer {
+            Xfer::Stall
+        }
+        fn data_in(&mut self, _: u8, buf: &mut [u8]) -> Xfer {
+            self.sent += 1;
+            if self.stall_at == Some(self.sent - 1) {
+                return Xfer::Stall;
+            }
+            buf.fill(self.sent as u8);
+            Xfer::Done(buf.len())
+        }
+        fn data_out(&mut self, _: u8, _: &[u8]) -> Xfer {
+            Xfer::Stall
+        }
+    }
+
+    const ED: u32 = RAM_BASE + 0x100;
+    const TD: u32 = RAM_BASE + 0x110;
+    const SPARE: u32 = RAM_BASE + 0x120;
+    const BUFFER: u32 = RAM_BASE + 0x200;
+
+    /// The controller running, the device on its port, one receive
+    /// descriptor of `len` bytes on the bulk endpoint in.
+    fn streaming(len: u32, stall_at: Option<usize>) -> (Ohci, Vec<u8>) {
+        let mut hc = Ohci::new();
+        hc.device = Some(Box::new(Streaming { sent: 0, stall_at }));
+        hc.port = PS_PPS | PS_CCS | PS_PES;
+        let mut ram = vec![0u8; RAM_SIZE];
+        let mut r = Ram(&mut ram);
+        r.wr32(ED, 1 | 1 << 7 | 2 << 11 | 64 << 16).unwrap();
+        r.wr32(ED + 4, SPARE).unwrap();
+        r.wr32(ED + 8, TD).unwrap();
+        r.wr32(TD, 1 << 18 | 2 << 19 | 0xF << 28).unwrap();
+        r.wr32(TD + 4, BUFFER).unwrap();
+        r.wr32(TD + 8, SPARE).unwrap();
+        r.wr32(TD + 12, BUFFER + len - 1).unwrap();
+        hc.write(HC_HCCA, RAM_BASE, !0);
+        hc.write(HC_BULK_HEAD_ED, ED, !0);
+        hc.write(HC_CONTROL, CTRL_BLE | USB_OPER, !0);
+        (hc, ram)
+    }
+
+    fn word(ram: &mut [u8], at: u32) -> u32 {
+        Ram(ram).rd32(at).unwrap()
+    }
+
+    /// A full-speed frame carries nineteen bulk packets of 64 bytes at
+    /// most: a transfer of more waits for the next frame for the rest.
+    #[test]
+    fn a_frame_carries_nineteen_full_packets_at_most() {
+        let (mut hc, mut ram) = streaming(40 * 64, None);
+        hc.frame(&mut ram);
+        assert_eq!(word(&mut ram, TD) >> 28, 0xF, "not retired yet");
+        assert_eq!(word(&mut ram, TD + 4), BUFFER + 19 * 64);
+        hc.frame(&mut ram);
+        assert_eq!(word(&mut ram, TD + 4), BUFFER + 38 * 64);
+        hc.frame(&mut ram);
+        assert_eq!(word(&mut ram, TD) >> 28, CC_NO_ERROR);
+        assert_eq!(word(&mut ram, TD + 4), 0, "all of it");
+    }
+
+    /// A packet that fails retires its descriptor with the buffer
+    /// pointer after the packets that went through.
+    #[test]
+    fn a_failed_packet_leaves_the_buffer_pointer_after_those_that_went() {
+        let (mut hc, mut ram) = streaming(8 * 64, Some(3));
+        hc.frame(&mut ram);
+        assert_eq!(word(&mut ram, TD) >> 28, CC_STALL);
+        assert_eq!(word(&mut ram, TD + 4), BUFFER + 3 * 64);
+        assert_eq!(ram[0x200 + 3 * 64 - 1], 3, "the third packet is in");
     }
 }
