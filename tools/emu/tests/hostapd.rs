@@ -6,6 +6,8 @@
 //! hostapd, dnsmasq, a web server) and runs this test once per kind of
 //! network; without `NABEMU_HOSTAPD_RADIO` it is skipped.
 
+mod common;
+
 #[cfg(target_os = "linux")]
 mod hwsim {
     use std::io;
@@ -228,9 +230,9 @@ mod hwsim {
 #[cfg(target_os = "linux")]
 #[test]
 fn lapin_against_hostapd() {
+    use nabemu::DEFAULT_MAC;
     use nabemu::config::{Config, Wifi};
     use nabemu::rt2573::RxFrame;
-    use nabemu::{DEFAULT_MAC, Machine};
 
     let Ok(radio) = std::env::var("NABEMU_HOSTAPD_RADIO") else {
         eprintln!("skipped: no NABEMU_HOSTAPD_RADIO (scripts/hostapd-interop.sh)");
@@ -243,16 +245,12 @@ fn lapin_against_hostapd() {
     let mut radio: [u8; 6] = radio.try_into().unwrap();
     let wifi = match std::env::var("NABEMU_HOSTAPD_WIFI").as_deref() {
         Ok("open") => Wifi::Open,
-        Ok("wpa") => Wifi::Wpa {
-            passphrase: "carotte-violette".into(),
-        },
-        _ => Wifi::Wpa2 {
-            passphrase: "carotte-violette".into(),
-        },
+        Ok("wpa") => common::wpa().0,
+        _ => common::wpa2().0,
     };
     let expect = std::env::var("NABEMU_HOSTAPD_EXPECT").unwrap_or_else(|_| "4242".into());
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
-    let mut config = Config::new("Terrier", wifi);
+    let mut m = common::under_test();
+    let mut config = Config::new(common::SSID, wifi);
     config.server = "192.168.50.1/vl".into();
     config.install(&mut m.soc.flash);
     let mut hw = hwsim::Hwsim::open().expect("mac80211_hwsim over generic netlink");
@@ -263,7 +261,7 @@ fn lapin_against_hostapd() {
     let mut sent_by_rabbit = 0;
     let mut heard_by_rabbit = 0;
     while m.soc.millis() < limit && !m.console().contains(&expect) {
-        m.run_until_ms(m.soc.millis() + 1);
+        common::wait(&mut m, 1);
         // The rabbit's frames, to hostapd's radio when on its channel.
         let out: Vec<_> = m.radio.borrow_mut().tx.drain(..).collect();
         for f in out {

@@ -1,19 +1,17 @@
 //! The released firmware driving the board: leds, button, setup mode.
 
+mod common;
+
+use common::{AMBER, under_test};
 use nabemu::board::{LED_BOTTOM, LED_NOSE};
 use nabemu::{DEFAULT_MAC, Machine};
 
-fn released() -> Machine {
-    Machine::from_file(&nabemu::testing::image()).0
-}
-
-const AMBER: [u8; 3] = [126, 16, 0];
 const BLUE: [u8; 3] = [0, 0, 126];
 const WHITE: [u8; 3] = [126, 126, 126];
 
 #[test]
 fn leds_are_amber_while_it_looks_for_a_network() {
-    let mut m = released();
+    let mut m = under_test();
     m.run_until_ms(3000);
     assert_eq!(m.soc.board.leds, [AMBER; 5]);
     assert!(m.soc.board.led_updates > 0);
@@ -24,7 +22,7 @@ fn leds_are_amber_while_it_looks_for_a_network() {
 /// last byte of its address.
 #[test]
 fn button_at_power_on_starts_setup_mode() {
-    let mut m = released();
+    let mut m = under_test();
     m.soc.board.button = true;
     m.run_until_ms(2000);
     assert_eq!(m.soc.board.leds[LED_NOSE], BLUE);
@@ -66,7 +64,7 @@ fn button_at_power_on_starts_setup_mode() {
 /// test instead: everything white.
 #[test]
 fn button_held_seven_seconds_starts_the_factory_test() {
-    let mut m = released();
+    let mut m = under_test();
     m.soc.board.button = true;
     m.run_until_ms(9000);
     assert_eq!(m.soc.board.leds, [WHITE; 5]);

@@ -4,10 +4,9 @@
 //! the same bytes as r3 on the same processor. Skipped when lapin is
 //! not built.
 
-use nabemu::Machine;
-use nabemu::air::{AccessPoint, Security};
-use nabemu::config::{Config, Wifi};
-use nabemu::lan::{Lan, Response};
+mod common;
+
+use common::{find, serving, until_every};
 use nabemu::metal;
 
 const ADP2WAV: u8 = 138;
@@ -16,29 +15,14 @@ const ALAW2WAV: u8 = 140;
 const WAV2ALAW: u8 = 141;
 
 fn run(image: &[u8], bytecode: &[u8]) -> Vec<u8> {
-    let served = metal::boot_response(bytecode);
-    let mut m = Machine::from_file(image).0;
-    Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::Open,
-    ));
-    let mut lan = Lan::new();
-    lan.handler = Box::new(move |_| Response::ok(served.clone()));
-    m.lan = Some(lan);
-    while find(&m.soc.uart_tx, b"8880").is_none() && m.soc.millis() < 60_000 {
-        m.run_until_ms(m.soc.millis() + 50);
-    }
+    let mut m = serving(image, bytecode);
+    until_every(&mut m, 50, 60_000, "the end of the output", |m| {
+        find(&m.soc.uart_tx, b"8880").is_some()
+    });
     let out = &m.soc.uart_tx;
-    let start = find(out, b"7770").unwrap_or_else(|| panic!("no output:\n{}", m.console()));
-    let end = find(&out[start..], b"8880").expect("no end") + start;
+    let start = find(out, b"7770").expect("no output");
+    let end = find(&out[start..], b"8880").unwrap() + start;
     out[start..end].to_vec()
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Each converter from offsets of every parity: `dst index, src start`.
@@ -91,14 +75,9 @@ const STRCPY: u8 = 64;
 
 #[test]
 fn the_audio_converters_match_r3_from_odd_offsets() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let Ok(lapin) = std::fs::read(format!("{root}/../../lapin/target/lapin-full.bin")) else {
-        eprintln!("skipped: lapin is not built");
-        return;
-    };
-    let r3 = std::fs::read(format!("{root}/../../artifacts/Nab-wpa23-gtk-r3.sim")).unwrap();
+    let Some(lapin) = common::lapin() else { return };
     let bc = program();
-    let (c, rust) = (run(&r3, &bc), run(&lapin, &bc));
+    let (c, rust) = (run(&common::r3(), &bc), run(&lapin, &bc));
     assert!(c.len() > 5000, "{} bytes", c.len());
     if c != rust {
         let at = c

@@ -2,48 +2,29 @@
 //! stick that stops answering, a hostile visitor on the rescue network,
 //! an image cut short. lapin only; skipped when it is not built.
 
-use nabemu::Machine;
-use nabemu::air::{AccessPoint, Security};
-use nabemu::config::{Config, Wifi};
+mod common;
+
+use common::{RESCUE, lapin, ms, on_network, open, serving, until, wait};
 use nabemu::metal;
 use nabemu::soc::ResetCause;
-use nabemu::{Event, lan::Lan, lan::Response};
+use nabemu::{Event, Machine};
 
-const RESCUE: usize = 20 * 1024;
-
-fn image() -> Option<Vec<u8>> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../lapin/target/lapin-full.bin"
-    );
-    std::fs::read(path).ok().or_else(|| {
-        eprintln!("skipped: lapin is not built");
-        None
-    })
-}
-
-fn until(m: &mut Machine, limit_ms: u64, what: &str, done: impl Fn(&Machine) -> bool) {
-    let limit = m.soc.millis() + limit_ms;
-    while !done(m) {
-        assert!(
-            m.soc.millis() < limit,
-            "{what}: not within {limit_ms} ms\n{}",
-            m.console()
-        );
-        m.run_until_ms(m.soc.millis() + 20);
-    }
-}
-
+/// A rabbit on the open network, no server behind it.
 fn on_open_network(image: &[u8]) -> Machine {
-    let mut m = Machine::from_file(image).0;
-    Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::Open,
-    ));
-    m
+    on_network(image, open())
+}
+
+fn stick_up(m: &mut Machine) {
+    until(m, 30_000, "the stick up", |m| m.console().contains("wifi "));
+}
+
+/// A whole image with a rescue core other than the one in place: a
+/// byte changed in its padding (the trailer's CRC no longer holds, and
+/// it is not the core in place).
+fn with_another_core(image: &[u8]) -> Vec<u8> {
+    let mut other = image.to_vec();
+    other[RESCUE - 100] ^= 0x55;
+    other
 }
 
 /// The stick gone from under a running rabbit: its control transfers
@@ -52,17 +33,15 @@ fn on_open_network(image: &[u8]) -> Machine {
 /// fed the watchdog for ever).
 #[test]
 fn a_stick_that_stops_answering_never_freezes_the_rabbit() {
-    let Some(image) = image() else { return };
+    let Some(image) = lapin() else { return };
     let mut m = on_open_network(&image);
-    until(&mut m, 30_000, "the stick up", |m| {
-        m.console().contains("wifi ")
-    });
-    m.run_until_ms(m.soc.millis() + 3000);
+    stick_up(&mut m);
+    wait(&mut m, 3000);
     m.soc.ohci.device = None;
     for second in 0..20 {
         let mut open = false;
         for _ in 0..100 {
-            m.run_until_ms(m.soc.millis() + 10);
+            wait(&mut m, 10);
             open |= m.cpu.cpsr & 0x80 == 0;
         }
         assert!(
@@ -76,13 +55,9 @@ fn a_stick_that_stops_answering_never_freezes_the_rabbit() {
 /// nothing erased (it used to rewrite the whole flash from sector 0).
 #[test]
 fn an_image_cut_short_is_refused_with_nothing_erased() {
-    let Some(image) = image() else { return };
+    let Some(image) = lapin() else { return };
     for cut in [8192, RESCUE, RESCUE + 4096] {
-        let mut m = on_open_network(&image);
-        let mut lan = Lan::new();
-        let flasher = metal::boot_response(&metal::flash_firmware(&image[..cut]));
-        lan.handler = Box::new(move |_| Response::ok(flasher.clone()));
-        m.lan = Some(lan);
+        let mut m = serving(&image, &metal::flash_firmware(&image[..cut]));
         let before = m.soc.flash.clone();
         until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
         assert_eq!(
@@ -99,16 +74,9 @@ fn an_image_cut_short_is_refused_with_nothing_erased() {
 /// trailer damaged: refused too.
 #[test]
 fn a_new_rescue_core_that_is_damaged_is_refused() {
-    let Some(image) = image() else { return };
-    let mut other = image.clone();
-    // Another core: a byte changed in its padding (the trailer's CRC no
-    // longer holds, and it is not the core in place).
-    other[RESCUE - 100] ^= 0x55;
-    let mut m = on_open_network(&image);
-    let mut lan = Lan::new();
-    let flasher = metal::boot_response(&metal::flash_firmware(&other));
-    lan.handler = Box::new(move |_| Response::ok(flasher.clone()));
-    m.lan = Some(lan);
+    let Some(image) = lapin() else { return };
+    let other = with_another_core(&image);
+    let mut m = serving(&image, &metal::flash_firmware(&other));
     until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
     assert_eq!(m.soc.flash_erases, 0, "something erased");
 }
@@ -117,16 +85,11 @@ fn a_new_rescue_core_that_is_damaged_is_refused() {
 /// rescue core is allowed in when it is whole).
 #[test]
 fn a_new_rescue_core_that_is_whole_is_written() {
-    let Some(image) = image() else { return };
-    let mut other = image.clone();
-    other[RESCUE - 100] ^= 0x55;
+    let Some(image) = lapin() else { return };
+    let mut other = with_another_core(&image);
     let crc = crc32(&other[..RESCUE - 8]);
     other[RESCUE - 4..RESCUE].copy_from_slice(&crc.to_le_bytes());
-    let mut m = on_open_network(&image);
-    let mut lan = Lan::new();
-    let flasher = metal::boot_response(&metal::flash_firmware(&other));
-    lan.handler = Box::new(move |_| Response::ok(flasher.clone()));
-    m.lan = Some(lan);
+    let mut m = serving(&image, &metal::flash_firmware(&other));
     until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
     assert!(
         m.soc.flash[..other.len()] == other[..],
@@ -155,25 +118,17 @@ fn crc32(data: &[u8]) -> u32 {
 
 mod rescue_network {
     use super::*;
+    use common::{
+        PHONE, frame, page, phone, phone_on_the_rescue_network, rescue_network_up,
+        without_application,
+    };
     use nabemu::rt2573::RxFrame;
-    use nabemu::visitor::Visitor;
-
-    const PHONE: [u8; 6] = [2, 0, 0, 0, 0, 0xB2];
-
-    fn phone(m: &Machine) -> &Visitor {
-        m.visitor.as_ref().unwrap()
-    }
 
     /// A rabbit whose application is gone, on its rescue network, a
     /// phone on it with an address.
     fn rescued(image: &[u8]) -> Machine {
-        let mut m = Machine::from_file(image).0;
-        m.soc.flash[RESCUE..RESCUE + 4096].fill(0xFF);
-        until(&mut m, 20_000, "the rescue network", |m| {
-            m.console().contains("secours: network up")
-        });
-        m.visitor = Some(Visitor::new(PHONE, "Nabaztag-secours"));
-        until(&mut m, 60_000, "an address", |m| phone(m).address.is_some());
+        let mut m = without_application(image);
+        phone_on_the_rescue_network(&mut m);
         m
     }
 
@@ -182,13 +137,9 @@ mod rescue_network {
     /// beacon; it had none).
     #[test]
     fn the_rescue_beacon_carries_rates_and_a_tim() {
-        let Some(image) = image() else { return };
-        let mut m = Machine::from_file(&image).0;
-        m.soc.flash[RESCUE..RESCUE + 4096].fill(0xFF);
-        until(&mut m, 20_000, "the rescue network", |m| {
-            m.console().contains("secours: network up")
-        });
-        m.run_until_ms(m.soc.millis() + 500);
+        let Some(image) = lapin() else { return };
+        let mut m = without_application(&image);
+        wait(&mut m, 500);
         let radio = m.radio.borrow();
         let beacon = radio
             .tx
@@ -212,14 +163,11 @@ mod rescue_network {
     /// it used to panic the rescue core into a restart.
     #[test]
     fn a_wrapping_content_length_is_refused() {
-        let Some(image) = image() else { return };
+        let Some(image) = lapin() else { return };
         let mut m = rescued(&image);
-        m.visitor
-            .as_mut()
-            .unwrap()
-            .post("/flash HTTP/1.0\r\nContent-Length: 4294967295\r\nX:", b"");
-        until(&mut m, 30_000, "the answer", |m| !phone(m).pages.is_empty());
-        let page = phone(&m).pages[0].text();
+        let page = page(&mut m, 30_000, |v| {
+            v.post("/flash HTTP/1.0\r\nContent-Length: 4294967295\r\nX:", b"")
+        });
         assert!(page.contains("400"), "{page}");
         assert_eq!(m.events, [], "{}", m.console());
     }
@@ -227,24 +175,22 @@ mod rescue_network {
     /// Larger than the rescue core can hold: refused at once.
     #[test]
     fn an_upload_too_big_is_refused_at_once() {
-        let Some(image) = image() else { return };
+        let Some(image) = lapin() else { return };
         let mut m = rescued(&image);
-        m.visitor
-            .as_mut()
-            .unwrap()
-            .post("/flash HTTP/1.0\r\nContent-Length: 200000\r\nX:", b"");
-        until(&mut m, 30_000, "the answer", |m| !phone(m).pages.is_empty());
-        assert!(phone(&m).pages[0].text().contains("400"));
+        let page = page(&mut m, 30_000, |v| {
+            v.post("/flash HTTP/1.0\r\nContent-Length: 200000\r\nX:", b"")
+        });
+        assert!(page.contains("400"), "{page}");
     }
 
     /// A SYN from another port of the same phone in the middle of an
     /// upload (a browser's spare connection) leaves the upload alone.
     #[test]
     fn a_second_connection_does_not_drop_an_upload() {
-        let Some(image) = image() else { return };
+        let Some(image) = lapin() else { return };
         let mut m = rescued(&image);
         m.visitor.as_mut().unwrap().post("/flash", &image);
-        m.run_until_ms(m.soc.millis() + 200);
+        wait(&mut m, 200);
         assert!(phone(&m).pages.is_empty(), "the upload is already over");
         let ip = phone(&m).address.unwrap();
         let bssid = phone(&m).network.as_ref().unwrap().1;
@@ -261,12 +207,13 @@ mod rescue_network {
 
     /// A TCP SYN to port 80 from `port`, as an 802.11 data frame.
     fn syn(bssid: [u8; 6], ip: [u8; 4], port: u16) -> Vec<u8> {
-        let mut f = vec![0x08, 0x01, 0, 0];
-        f.extend(bssid);
-        f.extend(PHONE);
-        f.extend(bssid);
-        f.extend([0x10, 0x00]);
-        f.extend([0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00]);
+        let mut f = frame(
+            [0x08, 0x01],
+            bssid,
+            PHONE,
+            bssid,
+            &[0x10, 0x00, 0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00],
+        );
         let mut tcp = vec![0u8; 20];
         tcp[0..2].copy_from_slice(&port.to_be_bytes());
         tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
@@ -306,7 +253,7 @@ mod rescue_network {
     /// later it is back on its application.
     #[test]
     fn the_button_asks_for_the_rescue_core_and_a_vanished_phone_does_not_keep_it() {
-        let Some(image) = image() else { return };
+        let Some(image) = lapin() else { return };
         let mut m = on_open_network(&image);
         m.soc.board.button = true;
         until(&mut m, 40_000, "the rescue core asked for", |m| {
@@ -314,13 +261,9 @@ mod rescue_network {
         });
         m.soc.board.button = false;
         assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
-        until(&mut m, 20_000, "the rescue network", |m| {
-            m.console().contains("secours: network up")
-        });
-        m.visitor = Some(Visitor::new(PHONE, "Nabaztag-secours"));
-        until(&mut m, 60_000, "an address", |m| phone(m).address.is_some());
-        m.visitor.as_mut().unwrap().get("/");
-        until(&mut m, 30_000, "the page", |m| !phone(m).pages.is_empty());
+        rescue_network_up(&mut m);
+        phone_on_the_rescue_network(&mut m);
+        page(&mut m, 30_000, |v| v.get("/"));
         // Gone, without a deauthentication.
         m.visitor = None;
         until(&mut m, 11 * 60_000, "back to the application", |m| {
@@ -340,16 +283,14 @@ mod rescue_network {
 /// the rabbit mute for good.
 #[test]
 fn a_stick_that_stops_sending_is_got_going_again() {
-    let Some(image) = image() else { return };
+    let Some(image) = lapin() else { return };
     let mut m = on_open_network(&image);
-    until(&mut m, 30_000, "the stick up", |m| {
-        m.console().contains("wifi ")
-    });
-    m.run_until_ms(m.soc.millis() + 5000);
+    stick_up(&mut m);
+    wait(&mut m, 5000);
 
     // A while.
     m.radio.borrow_mut().tx_stuck = true;
-    m.run_until_ms(m.soc.millis() + 3000);
+    wait(&mut m, 3000);
     m.radio.borrow_mut().tx_stuck = false;
     let sent = m.radio.borrow().tx.len();
     until(&mut m, 20_000, "a frame sent again", |m| {
@@ -368,15 +309,9 @@ fn a_stick_that_stops_sending_is_got_going_again() {
 /// goes through, as they are copied afresh from the flash first.
 #[test]
 fn flash_routines_overwritten_in_ram_still_write_the_update() {
-    let Some(image) = image() else { return };
-    let mut m = on_open_network(&image);
-    let mut lan = Lan::new();
-    let flasher = metal::boot_response(&metal::flash_firmware(&image));
-    lan.handler = Box::new(move |_| Response::ok(flasher.clone()));
-    m.lan = Some(lan);
-    until(&mut m, 30_000, "the stick up", |m| {
-        m.console().contains("wifi ")
-    });
+    let Some(image) = lapin() else { return };
+    let mut m = serving(&image, &metal::flash_firmware(&image));
+    stick_up(&mut m);
     // Both routines, from the first word of the RAM after the slots.
     m.soc.iram[0x10..0x150].fill(0xA5);
     until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
@@ -395,26 +330,22 @@ fn flash_routines_overwritten_in_ram_still_write_the_update() {
 /// and over, the watchdog starved by a thousand tries of each).
 #[test]
 fn a_jammed_i2c_bus_never_holds_interrupts_back_long() {
-    let Some(image) = image() else { return };
-    let mut m = on_open_network(&image);
+    let Some(image) = lapin() else { return };
     // A bytecode that asks the reader for a tag, again and again.
     let mut f = metal::FUNCTION_HEADER.to_vec();
     f.extend([metal::OP_RFID_GET, metal::OP_DROP, 28, 0, 0]);
-    let poll = metal::boot_response(&metal::bytecode(&[], &f));
-    let mut lan = Lan::new();
-    lan.handler = Box::new(move |_| Response::ok(poll.clone()));
-    m.lan = Some(lan);
+    let mut m = serving(&image, &metal::bytecode(&[], &f));
     until(&mut m, 60_000, "the polling bytecode", |m| {
         !m.lan.as_ref().unwrap().requests.is_empty()
     });
-    m.run_until_ms(m.soc.millis() + 2000);
+    wait(&mut m, 2000);
     m.masked_longest = 0;
     let exchanges = m.soc.board.rfid.exchanges;
     m.soc.i2c_jammed = true;
-    m.run_until_ms(m.soc.millis() + 20_000);
+    wait(&mut m, 20_000);
     assert!(exchanges > 0, "the reader was never asked");
     assert_eq!(m.events, []);
-    let ms = m.masked_longest * 1000 / nabemu::soc::CLOCK_HZ;
+    let ms = ms(m.masked_longest);
     eprintln!("interrupts held back {ms} ms at most");
     assert!(ms < 20, "interrupts held back {ms} ms");
 }

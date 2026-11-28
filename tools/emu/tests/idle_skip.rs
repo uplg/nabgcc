@@ -3,10 +3,8 @@
 //! the same with it as without: the same bytes on its serial port, the
 //! same frames on the air, the same restarts, the same requests.
 
-use nabemu::Machine;
-use nabemu::air::{AccessPoint, Security};
-use nabemu::config::{Config, Wifi};
-use nabemu::lan::{Lan, Response};
+mod common;
+
 use nabemu::metal;
 
 struct Seen {
@@ -17,19 +15,8 @@ struct Seen {
 }
 
 fn run(image: &[u8], skip: bool) -> (Seen, u64) {
-    let mut m = Machine::from_file(image).0;
+    let mut m = common::serving(image, &metal::print_number(4242));
     m.skip_idle = skip;
-    Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::Open,
-    ));
-    let mut lan = Lan::new();
-    let served = metal::boot_response(&metal::print_number(4242));
-    lan.handler = Box::new(move |_| Response::ok(served.clone()));
-    m.lan = Some(lan);
     m.run_until_ms(25_000);
     let seen = Seen {
         console: m.soc.uart_tx.clone(),
@@ -40,13 +27,9 @@ fn run(image: &[u8], skip: bool) -> (Seen, u64) {
     (seen, m.skipped)
 }
 
-fn same_with_and_without(path: &str) {
-    let Ok(image) = std::fs::read(path) else {
-        eprintln!("skipped: {path} not there");
-        return;
-    };
-    let ((a, _), (b, skipped)) = (run(&image, false), run(&image, true));
-    eprintln!("{path}: {skipped} cycles skipped");
+fn same_with_and_without(name: &str, image: &[u8]) {
+    let ((a, _), (b, skipped)) = (run(image, false), run(image, true));
+    eprintln!("{name}: {skipped} cycles skipped");
     assert!(skipped > 0, "nothing skipped: the test lost its point");
     assert_eq!(
         String::from_utf8_lossy(&a.console),
@@ -60,16 +43,11 @@ fn same_with_and_without(path: &str) {
 
 #[test]
 fn r3_sees_the_same() {
-    same_with_and_without(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    ));
+    same_with_and_without("r3", &common::r3());
 }
 
 #[test]
 fn lapin_sees_the_same() {
-    same_with_and_without(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../lapin/target/lapin-full.bin"
-    ));
+    let Some(lapin) = common::lapin() else { return };
+    same_with_and_without("lapin", &lapin);
 }

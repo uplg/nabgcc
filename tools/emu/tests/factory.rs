@@ -5,50 +5,23 @@
 //! Button held more than seven seconds at power-on starts it; every
 //! click moves to the next step, which begins two seconds later.
 
+mod common;
+
+use common::{GREEN, PCM_8K, UID, assert_the_note, find, note, press, until, wait};
 use nabemu::Machine;
 use nabemu::board::{LED_LEFT, LED_RIGHT};
 use nabemu::rfid::Tag;
 use nabemu::vs1003::{Format, adpcm_decode};
 
-const GREEN: [u8; 3] = [0, 126, 0];
-
 fn in_factory_test() -> Machine {
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
-    m.soc.board.button = true;
-    m.run_until_ms(8000);
-    m.soc.board.button = false;
-    m.run_until_ms(8500);
-    m
-}
-
-fn wait(m: &mut Machine, ms: u64) {
-    m.run_until_ms(m.soc.millis() + ms);
-}
-
-fn click(m: &mut Machine) {
-    m.soc.board.button = true;
-    wait(m, 200);
-    m.soc.board.button = false;
-    wait(m, 300);
+    common::in_factory_test(&nabemu::testing::image())
 }
 
 /// Click until the test reaches the given step (the first click after
 /// entering leads to step 2).
 fn go_to_step(m: &mut Machine, step: u32) {
     for _ in 1..step {
-        click(m);
-    }
-}
-
-fn run_until(m: &mut Machine, limit_ms: u64, what: &str, done: impl Fn(&Machine) -> bool) {
-    let limit = m.soc.millis() + limit_ms;
-    while !done(m) {
-        assert!(
-            m.soc.millis() < limit,
-            "{what}: not within {limit_ms} ms\n{}",
-            m.console()
-        );
-        wait(m, 20);
+        press(m, 200, 300);
     }
 }
 
@@ -67,7 +40,7 @@ fn step_2_swings_the_ears_in_opposite_directions() {
 fn step_3_counts_seventeen_teeth_per_turn_on_each_ear() {
     let mut m = in_factory_test();
     go_to_step(&mut m, 3);
-    run_until(&mut m, 20_000, "both ears measured", |m| {
+    until(&mut m, 20_000, "both ears measured", |m| {
         let c = m.console();
         c.contains("refpos0 17") && c.contains("refpos1 17")
     });
@@ -89,11 +62,7 @@ fn step_4_turns_green_when_a_tag_is_shown() {
         [[0, 0, 0]; 5],
         "nothing in front of the nose"
     );
-    m.soc
-        .board
-        .rfid
-        .tags
-        .push(Tag::new([0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F]));
+    m.soc.board.rfid.tags.push(Tag::new(UID));
     wait(&mut m, 1000);
     assert_eq!(m.soc.board.leds, [GREEN; 5]);
     assert!(m.console().contains("RFID : "));
@@ -111,15 +80,7 @@ fn step_5_plays_a_tone() {
     wait(&mut m, 4000);
     let codec = &m.soc.board.codec;
     let track = codec.current.as_ref().expect("something is playing");
-    assert_eq!(
-        track.format,
-        Format::Wav {
-            sample_rate: 8000,
-            channels: 1,
-            bits: 16,
-            adpcm: false
-        }
-    );
+    assert_eq!(track.format, PCM_8K);
     assert!(m.soc.board.amplifier, "the loudspeaker amplifier is on");
     // It is fed at the pace it plays: 16000 bytes a second, give or
     // take the buffer.
@@ -146,8 +107,6 @@ fn step_6_records_while_the_button_is_held_and_plays_it_back() {
     wait(&mut m, 2500);
 
     // Whistle a 500 Hz note at the microphone while holding the button.
-    let note =
-        |i: usize| (12000.0 * (i as f64 * 500.0 * std::f64::consts::TAU / 8000.0).sin()) as i16;
     m.soc.board.codec.microphone.extend((0..16000).map(note));
     m.soc.board.button = true;
     wait(&mut m, 2000);
@@ -179,29 +138,9 @@ fn step_6_records_while_the_button_is_held_and_plays_it_back() {
             adpcm: true
         }
     );
-    // What comes back is what went in: a 500 Hz note, sixteen samples
-    // to a period, so each sample is the opposite of the one 8 before.
-    let data = playback
-        .data
-        .windows(4)
-        .position(|w| w == b"data")
-        .expect("a data chunk")
-        + 8;
+    // What comes back is what went in: the note.
+    let data = find(&playback.data, b"data").expect("a data chunk") + 8;
     let heard = adpcm_decode(&playback.data[data..]);
     assert!(heard.len() > 4000, "{} samples played back", heard.len());
-    let loud = heard.iter().filter(|s| s.abs() > 6000).count();
-    assert!(
-        loud > heard.len() / 4,
-        "the note is there: {loud} loud samples of {}",
-        heard.len()
-    );
-    let opposite = heard
-        .windows(9)
-        .filter(|w| (w[0] as i32 + w[8] as i32).abs() < 3000)
-        .count();
-    assert!(
-        opposite > heard.len() * 3 / 4,
-        "{opposite} of {} samples keep the period",
-        heard.len()
-    );
+    assert_the_note(&heard);
 }

@@ -3,13 +3,14 @@
 //! management frames. No rabbit here: r3 has no WPA3; this is the
 //! behaviour its successor has to reach.
 
+mod common;
+
+use common::{BSSID, PASSPHRASE as PASSWORD, SSID, frame, terrier};
 use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
 use nabemu::rt2573::{Radio, RxFrame, TxFrame};
 use nabemu::supplicant::{Method, Notice, State, Supplicant};
 
-const BSSID: [u8; 6] = [0x02, 0, 0, 0, 0, 0xA1];
 const STA: [u8; 6] = [0x02, 0, 0, 0, 0, 0xC3];
-const PASSWORD: &str = "carotte-violette";
 
 struct World {
     radio: Radio,
@@ -20,7 +21,7 @@ struct World {
 
 impl World {
     fn new(wpa3: Wpa3, password: &str) -> World {
-        let mut ap = AccessPoint::new("Terrier", BSSID, 6, Security::wpa2(PASSWORD));
+        let mut ap = terrier(Security::wpa2(PASSWORD));
         ap.wpa3 = wpa3;
         let radio = Radio {
             channel: 6,
@@ -29,7 +30,7 @@ impl World {
         World {
             radio,
             ap,
-            sta: Supplicant::new(STA, "Terrier", password),
+            sta: Supplicant::new(STA, SSID, password),
             now: 0,
         }
     }
@@ -48,6 +49,22 @@ impl World {
         self.sta.connect(&mut self.radio, BSSID, 6);
         self.run(50);
     }
+
+    /// A frame on the air from the station's side, for the access point.
+    fn station_sends(&mut self, data: Vec<u8>) {
+        self.radio.tx.push_back(TxFrame { data, channel: 6 });
+    }
+}
+
+/// An association request in clear, for the station, that claims
+/// WPA3's keys (SAE, management frames protected).
+fn wpa3_association() -> Vec<u8> {
+    let mut body = vec![0x10, 0, 0x31, 0x04, 10, 0, 0, 7];
+    body.extend_from_slice(SSID.as_bytes());
+    body.extend_from_slice(&[
+        48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 8, 0xC0, 0,
+    ]);
+    frame([0x00, 0], BSSID, STA, BSSID, &body)
 }
 
 fn ethernet(dst: [u8; 6], src: [u8; 6], payload: &[u8]) -> Vec<u8> {
@@ -180,28 +197,14 @@ fn a_station_that_will_not_protect_management_frames_is_refused() {
 fn skipping_the_password_exchange_does_not_get_in() {
     // Open authentication, then an association claiming WPA3 keys.
     let mut w = World::new(Wpa3::Transition, PASSWORD);
-    let mut auth = vec![0xB0, 0, 0, 0];
-    auth.extend_from_slice(&BSSID);
-    auth.extend_from_slice(&STA);
-    auth.extend_from_slice(&BSSID);
-    auth.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0]);
-    w.radio.tx.push_back(TxFrame {
-        data: auth,
-        channel: 6,
-    });
-    let mut assoc = vec![0x00, 0, 0, 0];
-    assoc.extend_from_slice(&BSSID);
-    assoc.extend_from_slice(&STA);
-    assoc.extend_from_slice(&BSSID);
-    assoc.extend_from_slice(&[0x10, 0, 0x31, 0x04, 10, 0, 0, 7]);
-    assoc.extend_from_slice(b"Terrier");
-    assoc.extend_from_slice(&[
-        48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 8, 0xC0, 0,
-    ]);
-    w.radio.tx.push_back(TxFrame {
-        data: assoc,
-        channel: 6,
-    });
+    w.station_sends(frame(
+        [0xB0, 0],
+        BSSID,
+        STA,
+        BSSID,
+        &[0, 0, 0, 0, 1, 0, 0, 0],
+    ));
+    w.station_sends(wpa3_association());
     w.run(10);
     // As hostapd's `check_assoc_ies`: open authentication with SAE's key
     // management needs a cached exchange, status 53 (invalid PMKID).
@@ -222,22 +225,10 @@ fn forged_deauthentications_are_ignored_by_both_ends() {
     assert!(w.sta.is_connected());
 
     // Somebody else pretends to be the access point...
-    let mut forged = vec![0xC0, 0, 0, 0];
-    forged.extend_from_slice(&STA);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0, 7, 0]);
+    let forged = frame([0xC0, 0], STA, BSSID, BSSID, &[0, 0, 7, 0]);
     w.radio.rx.push_back(RxFrame::new(forged));
     // ...and to be the station.
-    let mut forged = vec![0xC0, 0, 0, 0];
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&STA);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0, 3, 0]);
-    w.radio.tx.push_back(TxFrame {
-        data: forged,
-        channel: 6,
-    });
+    w.station_sends(frame([0xC0, 0], BSSID, STA, BSSID, &[0, 0, 3, 0]));
     w.run(5);
 
     assert!(w.sta.is_connected());
@@ -429,19 +420,7 @@ fn a_station_still_there_keeps_its_association_against_an_impostor() {
     let mut w = World::new(Wpa3::Only, PASSWORD);
     w.join();
     // Somebody else, with the station's address, associates in clear.
-    let mut assoc = vec![0x00, 0, 0, 0];
-    assoc.extend_from_slice(&BSSID);
-    assoc.extend_from_slice(&STA);
-    assoc.extend_from_slice(&BSSID);
-    assoc.extend_from_slice(&[0x10, 0, 0x31, 0x04, 10, 0, 0, 7]);
-    assoc.extend_from_slice(b"Terrier");
-    assoc.extend_from_slice(&[
-        48, 20, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 4, 1, 0, 0, 0x0F, 0xAC, 8, 0xC0, 0,
-    ]);
-    w.radio.tx.push_back(TxFrame {
-        data: assoc,
-        channel: 6,
-    });
+    w.station_sends(wpa3_association());
     w.run(10);
     // Refused for now; the real station answers the query with its keys.
     assert!(w.ap.events.contains(&ApEvent::AssocRejected {
@@ -463,15 +442,13 @@ fn a_station_still_there_keeps_its_association_against_an_impostor() {
 fn robust_action_frames_in_clear_are_dropped() {
     let mut w = World::new(Wpa3::Only, PASSWORD);
     w.join();
-    let mut query = vec![0xD0, 0, 0, 0];
-    query.extend_from_slice(&BSSID);
-    query.extend_from_slice(&STA);
-    query.extend_from_slice(&BSSID);
-    query.extend_from_slice(&[0, 0, 8, 0, 0x12, 0x34]);
-    w.radio.tx.push_back(TxFrame {
-        data: query,
-        channel: 6,
-    });
+    w.station_sends(frame(
+        [0xD0, 0],
+        BSSID,
+        STA,
+        BSSID,
+        &[0, 0, 8, 0, 0x12, 0x34],
+    ));
     w.run(5);
     assert!(
         w.ap.events
@@ -484,11 +461,7 @@ fn a_shut_down_is_believed_only_with_its_integrity_code() {
     let mut w = World::new(Wpa3::Only, PASSWORD);
     w.join();
     // A forged deauthentication to everyone, no management MIC element.
-    let mut forged = vec![0xC0, 0, 0, 0];
-    forged.extend_from_slice(&[0xFF; 6]);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&BSSID);
-    forged.extend_from_slice(&[0, 0, 3, 0]);
+    let forged = frame([0xC0, 0], [0xFF; 6], BSSID, BSSID, &[0, 0, 3, 0]);
     w.radio.rx.push_back(RxFrame::new(forged));
     w.run(2);
     assert!(w.sta.is_connected());

@@ -3,19 +3,9 @@
 //! build is found (`NABEMU_GARENNE`, or `../clapier` beside this
 //! repository) and is skipped otherwise.
 
-use nabemu::Machine;
-use nabemu::air::{AccessPoint, Security};
-use nabemu::config::{Config, Wifi};
-use nabemu::lan::{Lan, Response};
+mod common;
 
-fn garenne() -> Option<Vec<u8>> {
-    let default = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../clapier/garenne/build/garenne.bin"
-    );
-    let path = std::env::var("NABEMU_GARENNE").unwrap_or_else(|_| default.into());
-    std::fs::read(path).ok()
-}
+use common::{garenne, garenne_log, on_network, serve, wpa2};
 
 #[test]
 fn garenne_wakes_up_and_reports_every_two_seconds() {
@@ -23,34 +13,12 @@ fn garenne_wakes_up_and_reports_every_two_seconds() {
         eprintln!("skipped: no garenne build around");
         return;
     };
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
-    Config::new(
-        "Terrier",
-        Wifi::Wpa2 {
-            passphrase: "carotte-violette".into(),
-        },
-    )
-    .install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::wpa2("carotte-violette"),
-    ));
-    let mut lan = Lan::new();
-    lan.handler = Box::new(move |_| Response::ok(bytecode.clone()));
-    m.lan = Some(lan);
+    let mut m = on_network(&nabemu::testing::image(), wpa2());
+    serve(&mut m, bytecode);
     m.run_until_ms(45_000);
 
     assert_eq!(m.events, [], "no reset");
-    let lan = m.lan.as_ref().unwrap();
-    // Garenne broadcasts its log lines on UDP port 9999.
-    let log: Vec<String> = lan
-        .datagrams
-        .iter()
-        .filter(|d| d.to_port == 9999)
-        .map(|d| String::from_utf8_lossy(&d.payload).into_owned())
-        .collect();
+    let log = garenne_log(&m);
     assert!(
         log.iter()
             .any(|l| l.contains("awake") && l.contains("ip=192.168.1.100")),

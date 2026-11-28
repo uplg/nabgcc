@@ -1,35 +1,30 @@
 //! The released firmware reading tags held in front of the rabbit.
 
+mod common;
+
+use common::{UID, find, until_every, wait};
 use nabemu::rfid::Tag;
 use nabemu::{Machine, metal};
 
-const UID: [u8; 8] = [0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F];
-
 /// Boot a one-function program and return what it printed.
 fn run(function: &[u8], strings: &[&[u8]], tags: Vec<Tag>) -> (Machine, Vec<u8>) {
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
+    let mut m = common::under_test();
     m.soc.board.rfid.tags = tags;
     let mut code = metal::FUNCTION_HEADER.to_vec();
     code.extend_from_slice(function);
     code.push(metal::OP_RET);
     m.serve(&metal::bytecode(strings, &code));
-    while !m.console().contains("BOOT DONE") {
-        assert!(m.soc.millis() < 40_000, "{}", m.console());
-        m.run_until_ms(m.soc.millis() + 50);
-    }
-    m.run_until_ms(m.soc.millis() + 3000);
-    let mark = m
-        .soc
-        .uart_tx
-        .windows(9)
-        .position(|w| w == b"BOOT DONE")
-        .unwrap();
+    until_every(&mut m, 50, 40_000, "the boot bytecode done", |m| {
+        m.console().contains("BOOT DONE")
+    });
+    wait(&mut m, 3000);
+    let mark = find(&m.soc.uart_tx, b"BOOT DONE").unwrap();
     let printed = m.soc.uart_tx[mark..].to_vec();
     (m, printed)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
+    find(haystack, needle).is_some()
 }
 
 #[test]

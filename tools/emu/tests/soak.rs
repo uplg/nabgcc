@@ -3,29 +3,28 @@
 //! takes the time of a real rabbit's first minutes, so its length is
 //! `NABEMU_SOAK_MINUTES` (default 3). Skipped without a garenne build.
 
-use nabemu::Machine;
-use nabemu::air::{AccessPoint, ApEvent, Security};
-use nabemu::config::{Config, Wifi};
+mod common;
+
+use common::{
+    PROGRAM_FLOOR, SYSTEM, WATCHDOG_BUDGET_MS, authorized, garenne, garenne_log as log, ms,
+    on_network, serve, terrier, wait, wpa2,
+};
+use nabemu::air::{ApEvent, Wpa3};
+use nabemu::config::Config;
 use nabemu::lan::{Lan, Response};
 
-fn garenne() -> Option<Vec<u8>> {
-    let default = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../clapier/garenne/build/garenne.bin"
-    );
-    let path = std::env::var("NABEMU_GARENNE").unwrap_or_else(|_| default.into());
-    std::fs::read(path).ok()
+/// How long to run: `NABEMU_SOAK_MINUTES`, 3 by default.
+fn minutes() -> u64 {
+    std::env::var("NABEMU_SOAK_MINUTES")
+        .ok()
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(3)
 }
 
-fn log(m: &Machine) -> Vec<String> {
-    m.lan
-        .as_ref()
-        .unwrap()
-        .datagrams
-        .iter()
-        .filter(|d| d.to_port == 9999)
-        .map(|d| String::from_utf8_lossy(&d.payload).into_owned())
-        .collect()
+/// Garenne's pulses among its log lines: one every two seconds while
+/// its link is up.
+fn pulses(log: &[String]) -> usize {
+    log.iter().filter(|l| l.contains("link=4")).count()
 }
 
 #[test]
@@ -34,31 +33,16 @@ fn garenne_runs_for_minutes_through_group_key_renewals() {
         eprintln!("skipped: no garenne build around");
         return;
     };
-    let minutes: u64 = std::env::var("NABEMU_SOAK_MINUTES")
-        .ok()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(3);
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
-    let wifi = Wifi::Wpa2 {
-        passphrase: "carotte-violette".into(),
-    };
-    Config::new("Terrier", wifi).install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        Security::wpa2("carotte-violette"),
-    ));
-    let mut lan = Lan::new();
-    lan.handler = Box::new(move |_| Response::ok(bytecode.clone()));
-    m.lan = Some(lan);
+    let minutes = minutes();
+    let mut m = on_network(&nabemu::testing::image(), wpa2());
+    serve(&mut m, bytecode);
 
     let end = minutes * 60_000;
     let mut next_rekey = 60_000;
     let mut awake = None;
     let mut before_last_minute = 0;
     while m.soc.millis() < end {
-        m.run_until_ms(m.soc.millis() + 1000);
+        wait(&mut m, 1000);
         if awake.is_none() && log(&m).iter().any(|l| l.contains("awake")) {
             awake = Some(m.soc.millis());
         }
@@ -85,12 +69,9 @@ fn garenne_runs_for_minutes_through_group_key_renewals() {
     assert_eq!(m.events, [], "no reset");
     assert!(awake.is_some(), "{log:#?}");
     // Pulses all along, through the last minute.
-    let late = log[before_last_minute..]
-        .iter()
-        .filter(|l| l.contains("link=4"))
-        .count();
+    let late = pulses(&log[before_last_minute..]);
     assert!(late >= 20, "{late} pulses in the last minute");
-    assert!(m.air[0].is_authorized(nabemu::DEFAULT_MAC));
+    assert!(authorized(&m));
     assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
 }
 
@@ -120,28 +101,15 @@ fn garenne_lives_through_everything() {
         eprintln!("skipped: no garenne build around");
         return;
     };
-    let minutes: u64 = std::env::var("NABEMU_SOAK_MINUTES")
-        .ok()
-        .and_then(|m| m.parse().ok())
-        .unwrap_or(3);
-    let mut m = Machine::from_file(&nabemu::testing::image()).0;
-    let mut config = Config::new(
-        "Terrier",
-        Wifi::Wpa2 {
-            passphrase: "carotte-violette".into(),
-        },
-    );
+    let minutes = minutes();
+    let mut m = common::under_test();
+    let mut config = Config::new(common::SSID, wpa2().0);
     // Garenne's server is the one the settings name.
     config.server = "192.168.1.1/vl".into();
     config.install(&mut m.soc.flash);
     let ap = || {
-        let mut ap = AccessPoint::new(
-            "Terrier",
-            [2, 0, 0, 0, 0, 0xA1],
-            6,
-            Security::wpa2("carotte-violette"),
-        );
-        ap.wpa3 = nabemu::air::Wpa3::Transition;
+        let mut ap = terrier(wpa2().1);
+        ap.wpa3 = Wpa3::Transition;
         ap
     };
     m.air.push(ap());
@@ -165,7 +133,7 @@ fn garenne_lives_through_everything() {
     let mut unfed_before = 0;
     while m.soc.millis() < end {
         unfed_before = unfed_before.max(m.soc.watchdog_unfed());
-        m.run_until_ms(m.soc.millis() + 1000);
+        wait(&mut m, 1000);
         if m.events.len() > resets_seen {
             resets_seen = m.events.len();
             let console = m.console();
@@ -182,7 +150,7 @@ fn garenne_lives_through_everything() {
                 "RESET {:?} at {} ms, watchdog unfed up to {} ms before; log tail {:?}\nconsole tail:\n{}",
                 m.events.last(),
                 m.soc.millis(),
-                unfed_before * 1000 / nabemu::soc::CLOCK_HZ,
+                ms(unfed_before),
                 &lg[lg.len().saturating_sub(5)..],
                 tail.join("\n")
             );
@@ -200,7 +168,7 @@ fn garenne_lives_through_everything() {
         if t >= 900_000 && t % 900_000 < 1000 {
             // The access point restarts: everyone dropped, keys forgotten.
             m.air[0].kick(&mut m.radio.borrow_mut(), nabemu::DEFAULT_MAC, 3);
-            m.run_until_ms(m.soc.millis() + 100);
+            wait(&mut m, 100);
             m.radio.borrow_mut().tx.clear();
             m.air[0] = ap();
             restarts += 1;
@@ -242,17 +210,14 @@ fn garenne_lives_through_everything() {
         log.len()
     );
     assert_eq!(m.events, [], "no reset");
-    let late = log[before_last_minute..]
-        .iter()
-        .filter(|l| l.contains("link=4"))
-        .count();
+    let late = pulses(&log[before_last_minute..]);
     assert!(
         late >= 20,
         "{late} pulses in the last minute: {:?}",
         &log[before_last_minute..]
     );
     assert_eq!(played, plays, "sounds asked and played: {log:#?}");
-    let unfed = m.soc.watchdog_longest * 1000 / nabemu::soc::CLOCK_HZ;
-    assert!(unfed <= 1045, "watchdog unfed {unfed} ms");
-    assert!(m.stack_low[0x1F] >= 0x1000_4000 - 0x400 - 12 * 1024);
+    let unfed = ms(m.soc.watchdog_longest);
+    assert!(unfed <= WATCHDOG_BUDGET_MS, "watchdog unfed {unfed} ms");
+    assert!(m.stack_low[SYSTEM] >= PROGRAM_FLOOR);
 }

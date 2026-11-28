@@ -2,27 +2,16 @@
 //! a nightly toolchain to build, so the test runs when the image is
 //! there (`lapin/build.sh`) and is skipped otherwise.
 
-use nabemu::Machine;
+mod common;
 
-fn image(name: &str) -> Option<Vec<u8>> {
-    // The whole image: the rescue core, then the program as an
-    // application after it (lapin/build.sh).
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../lapin/target/");
-    let image = std::fs::read(format!("{dir}{name}-full.bin")).ok();
-    if image.is_none() {
-        eprintln!("skipped: lapin is not built");
-    }
-    image
-}
-
-const AMBER: [u8; 3] = [126, 16, 0];
-
+use common::{AMBER, GREEN, PCM_8K, UID, lapin, lapin_target, machine, note, until_every, wait};
 /// The board comes up, finds its stick, and hands over to the boot
 /// bytecode, which keeps the watchdog fed and looks for a network.
 #[test]
 fn the_firmware_boots_its_bytecode_and_stays_up() {
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
+    let Some(mut m) = lapin().as_deref().map(machine) else {
+        return;
+    };
     m.run_until_ms(10_500);
     assert_eq!(m.events, [], "no reset in ten seconds");
     assert!(m.soc.bus_faults.is_empty(), "{:x?}", m.soc.bus_faults);
@@ -45,19 +34,18 @@ fn the_firmware_boots_its_bytecode_and_stays_up() {
     assert!(m.radio.borrow().firmware_loaded);
     // The receiver goes off while the radio changes channel: back on
     // within moments.
-    let at = m.soc.millis();
-    while !m.radio.borrow().rx_enabled {
-        assert!(m.soc.millis() < at + 200, "the receiver stays off");
-        m.run_until_ms(m.soc.millis() + 1);
-    }
+    until_every(&mut m, 1, 200, "the receiver back on", |m| {
+        m.radio.borrow().rx_enabled
+    });
 }
 
 /// Without its Wi-Fi stick the firmware says so and carries on: the
 /// bytecode runs, the network stays broken.
 #[test]
 fn a_missing_wifi_stick_is_reported() {
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
+    let Some(mut m) = lapin().as_deref().map(machine) else {
+        return;
+    };
     m.soc.ohci.device = None;
     m.run_until_ms(10_000);
     let console = m.console();
@@ -71,8 +59,9 @@ fn a_missing_wifi_stick_is_reported() {
 /// is written to its radio.
 #[test]
 fn a_stick_with_a_radio_it_cannot_tune_is_refused() {
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
+    let Some(mut m) = lapin().as_deref().map(machine) else {
+        return;
+    };
     m.radio.borrow_mut().rf_chip = 3;
     m.run_until_ms(6000);
     assert!(
@@ -90,8 +79,9 @@ fn a_stick_with_the_rt2527_radio_joins_too() {
     use nabemu::air::{AccessPoint, ApEvent, Security};
     use nabemu::config::{Config, Wifi};
 
-    let Some(image) = image("lapin") else { return };
-    let mut m = Machine::from_file(&image).0;
+    let Some(mut m) = lapin().as_deref().map(machine) else {
+        return;
+    };
     m.radio.borrow_mut().rf_chip = 4;
     Config::new("Garenne", Wifi::Open).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(
@@ -115,13 +105,15 @@ fn a_stick_with_the_rt2527_radio_joins_too() {
 /// marker before each step.
 #[test]
 fn the_wpa3_exchange_is_right_and_fast_enough_on_the_arm7() {
-    let Some(image) = image("bench") else { return };
-    let mut m = Machine::from_file(&image).0;
+    let Some(image) = lapin_target("bench-full.bin") else {
+        return;
+    };
+    let mut m = machine(&image);
     let mut marks: Vec<(String, f64)> = Vec::new();
     let mut seen = 0;
     while !m.console().ends_with("end\n") {
         assert!(m.soc.millis() < 60_000, "never finished:\n{}", m.console());
-        m.run_until_ms(m.soc.millis() + 1);
+        wait(&mut m, 1);
         let console = m.console();
         while let Some(end) = console[seen..].find('\n') {
             marks.push((console[seen..seen + end].to_string(), m.soc.millis() as f64));
@@ -162,8 +154,9 @@ fn the_wpa3_exchange_is_right_and_fast_enough_on_the_arm7() {
 
 #[test]
 fn the_image_leaves_room_in_the_flash() {
-    let Some(image) = image("lapin") else { return };
-    let m = Machine::from_file(&image).0;
+    let Some(m) = lapin().as_deref().map(machine) else {
+        return;
+    };
     let used = m.soc.flash[..0x1F000]
         .iter()
         .rposition(|b| *b != 0xFF)
@@ -179,20 +172,18 @@ fn every_driver_does_its_job() {
     use nabemu::rfid::Tag;
     use nabemu::vs1003::{Format, adpcm_decode};
 
-    let Some(image) = image("selftest") else {
+    let Some(image) = lapin_target("selftest-full.bin") else {
         return;
     };
-    let mut m = Machine::from_file(&image).0;
-    let mut tag = Tag::new([0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F]);
+    let mut m = machine(&image);
+    let mut tag = Tag::new(UID);
     tag.blocks[8] = *b"miam";
     m.soc.board.rfid.tags.push(tag);
     // Something to listen to: a 500 Hz note, as long as it takes.
-    let note =
-        |i: usize| (12000.0 * (i as f64 * 500.0 * std::f64::consts::TAU / 8000.0).sin()) as i16;
     let mut sung = 0;
     while !m.console().ends_with("end\n") {
         assert!(m.soc.millis() < 60_000, "never finished:\n{}", m.console());
-        m.run_until_ms(m.soc.millis() + 10);
+        wait(&mut m, 10);
         let microphone = &mut m.soc.board.codec.microphone;
         while microphone.len() < 800 {
             microphone.push_back(note(sung));
@@ -225,22 +216,14 @@ fn every_driver_does_its_job() {
     assert!(m.soc.flash[0x1F008..].iter().all(|b| *b == 0xFF));
     assert_eq!(m.soc.flash_erases, 1);
     assert_eq!(m.soc.flash_reads_while_busy, 0, "the routine ran from RAM");
-    let fresh = Machine::from_file(&image).0;
+    let fresh = machine(&image);
     assert_eq!(m.soc.flash[..0x1F000], fresh.soc.flash[..0x1F000]);
 
     // Loudspeaker: a second of 8 kHz sound, fed at the pace it plays.
     let tracks = m.soc.board.codec.all_tracks();
     let tone = tracks
         .iter()
-        .find(|t| {
-            t.format
-                == Format::Wav {
-                    sample_rate: 8000,
-                    channels: 1,
-                    bits: 16,
-                    adpcm: false,
-                }
-        })
+        .find(|t| t.format == PCM_8K)
         .expect("the tone");
     assert_eq!(tone.data.len(), 48 + 16000);
     let played = console.find("tone played").unwrap();
@@ -257,76 +240,32 @@ fn every_driver_does_its_job() {
         .expect("the playback");
     let heard = adpcm_decode(&back.data[48..]);
     assert_eq!(heard.len(), 15 * 505);
-    let opposite = heard
-        .windows(9)
-        .filter(|w| (w[0] as i32 + w[8] as i32).abs() < 3000)
-        .count();
-    assert!(
-        opposite > heard.len() * 3 / 4,
-        "{opposite} of {} samples keep the period",
-        heard.len()
-    );
-    assert!(heard.iter().filter(|s| s.abs() > 6000).count() > heard.len() / 4);
+    common::assert_the_note(&heard);
 
-    assert_eq!(m.soc.board.leds, [[0, 126, 0]; 5], "green at the end");
+    assert_eq!(m.soc.board.leds, [GREEN; 5], "green at the end");
 }
 
 /// WPA3 on the rabbit's own processor: the password exchange, its
 /// timing against the watchdog, and the restart that finds the access
 /// point still holding the old association.
 mod wpa3 {
-    use super::image;
-    use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
-    use nabemu::config::{Config, Wifi};
+    use super::common::{
+        authorized, handshakes, ip_on_the_wire, lapin, on_wpa3_network, until_by, until_every,
+    };
+    use nabemu::air::ApEvent;
     use nabemu::{DEFAULT_MAC, Machine};
 
-    const PASSPHRASE: &str = "carotte-violette";
-
     fn rabbit() -> Option<Machine> {
-        let image = image("lapin")?;
-        let mut m = Machine::from_file(&image).0;
-        Config::new(
-            "Terrier",
-            Wifi::Wpa2 {
-                passphrase: PASSPHRASE.into(),
-            },
-        )
-        .install(&mut m.soc.flash);
-        let mut ap = AccessPoint::new(
-            "Terrier",
-            [2, 0, 0, 0, 0, 0xA1],
-            6,
-            Security::wpa2(PASSPHRASE),
-        );
-        ap.wpa3 = Wpa3::Only;
-        m.air.push(ap);
-        Some(m)
-    }
-
-    fn until(m: &mut Machine, limit: u64, done: impl Fn(&Machine) -> bool) -> u64 {
-        while !done(m) {
-            assert!(
-                m.soc.millis() < limit,
-                "not by {limit} ms: {:?}\n{}",
-                m.air[0].events,
-                m.console()
-            );
-            m.run_until_ms(m.soc.millis() + 5);
-        }
-        m.soc.millis()
-    }
-
-    fn authorized(m: &Machine) -> bool {
-        m.air[0].is_authorized(DEFAULT_MAC)
+        Some(on_wpa3_network(&lapin()?))
     }
 
     #[test]
     fn joins_and_its_watchdog_never_bites() {
         let Some(mut m) = rabbit() else { return };
-        let asked = until(&mut m, 30_000, |m| {
+        let asked = until_every(&mut m, 5, 30_000, "the scan", |m| {
             !m.radio.borrow().tx.is_empty() && m.console().contains("## SCAN")
         });
-        let done = until(&mut m, 30_000, authorized);
+        let done = until_every(&mut m, 5, 30_000, "authorized", authorized);
         eprintln!("authorized {} ms after the scan ended", done - asked);
         assert!(done - asked < 3000, "{} ms", done - asked);
         m.run_until_ms(done + 5000);
@@ -340,18 +279,11 @@ mod wpa3 {
     #[test]
     fn comes_back_without_a_second_password_exchange() {
         let Some(mut m) = rabbit() else { return };
-        let first = until(&mut m, 30_000, authorized);
+        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
         m.run_until_ms(first + 1000);
         m.air[0].kick(&mut m.radio.borrow_mut(), DEFAULT_MAC, 3);
         let kicked = m.soc.millis();
-        let back = until(&mut m, kicked + 30_000, |m| {
-            m.air[0]
-                .events
-                .iter()
-                .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
-                .count()
-                == 2
-        });
+        let back = until_every(&mut m, 5, 30_000, "back", |m| handshakes(m) == 2);
         let events = &m.air[0].events;
         assert!(
             events.contains(&ApEvent::PmksaCacheUsed { sta: DEFAULT_MAC }),
@@ -371,17 +303,10 @@ mod wpa3 {
     #[test]
     fn after_a_power_cut_it_waits_out_the_old_association() {
         let Some(mut m) = rabbit() else { return };
-        let first = until(&mut m, 30_000, authorized);
+        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
         m.run_until_ms(first + 1000);
         m.power_cycle();
-        let again = until(&mut m, first + 40_000, |m| {
-            m.air[0]
-                .events
-                .iter()
-                .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
-                .count()
-                == 2
-        });
+        let again = until_by(&mut m, first + 40_000, 5, "back", |m| handshakes(m) == 2);
         assert!(authorized(&m));
         let events = &m.air[0].events;
         assert!(
@@ -397,7 +322,7 @@ mod wpa3 {
         );
         eprintln!("back {} ms after the power came back", again - first - 1000);
         m.run_until_ms(again + 3000);
-        assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
+        assert!(ip_on_the_wire(&m));
     }
 }
 
@@ -407,12 +332,10 @@ mod wpa3 {
 /// recursive way (21 891 calls).
 #[test]
 fn the_interpreter_outruns_the_c_one() {
-    use nabemu::air::{AccessPoint, Security};
-    use nabemu::config::{Config, Wifi};
-    use nabemu::lan::{Lan, Response};
+    use common::{serving, time_printed};
     use nabemu::metal;
 
-    let Some(lapin) = image("lapin") else { return };
+    let Some(lapin) = lapin() else { return };
     let mut f = metal::FUNCTION_HEADER.to_vec();
     f.push(53); // time_ms
     f.extend(metal::int(100_000));
@@ -441,34 +364,13 @@ fn the_interpreter_outruns_the_c_one() {
     fb.extend(0u32.to_le_bytes());
     fb.extend(second.to_le_bytes());
 
-    let r3 = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../artifacts/Nab-wpa23-gtk-r3.sim"
-    ))
-    .unwrap();
+    let r3 = common::r3();
     let time = |image: &[u8], bytecode: &[u8]| {
-        let served = metal::boot_response(bytecode);
-        let mut m = Machine::from_file(image).0;
-        Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
-        m.air.push(AccessPoint::new(
-            "Terrier",
-            [2, 0, 0, 0, 0, 0xA1],
-            6,
-            Security::Open,
-        ));
-        let mut lan = Lan::new();
-        lan.handler = Box::new(move |_| Response::ok(served.clone()));
-        m.lan = Some(lan);
-        let printed = |m: &Machine| {
-            m.console()
-                .lines()
-                .filter_map(|l| l.strip_prefix('-')?.parse::<u64>().ok())
-                .next_back()
-        };
-        while printed(&m).is_none() && m.soc.millis() < 60_000 {
-            m.run_until_ms(m.soc.millis() + 50);
-        }
-        printed(&m).unwrap_or_else(|| panic!("no time printed:\n{}", m.console()))
+        let mut m = serving(image, bytecode);
+        until_every(&mut m, 50, 60_000, "a time printed", |m| {
+            time_printed(m).is_some()
+        });
+        time_printed(&m).unwrap()
     };
     for (name, bytecode) in [("loop", &lp), ("fib 20", &fb)] {
         let (c, rust) = (time(&r3, bytecode), time(&lapin, bytecode));

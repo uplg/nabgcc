@@ -1,15 +1,13 @@
 //! The released firmware, booted on the emulated board.
 
-use nabemu::{DEFAULT_MAC, Machine};
+mod common;
 
-fn released() -> Machine {
-    let image = nabemu::testing::image();
-    Machine::from_file(&image).0
-}
+use common::{PASSPHRASE, terrier, under_test, until_every};
+use nabemu::DEFAULT_MAC;
 
 #[test]
 fn boots_finds_its_wifi_stick_and_scans() {
-    let mut m = released();
+    let mut m = under_test();
     m.run_until_ms(8000);
 
     assert_eq!(m.events, [], "no reset, no undefined instruction");
@@ -40,10 +38,9 @@ fn boots_finds_its_wifi_stick_and_scans() {
 
     // The receiver is off for a moment at every change of channel:
     // it has to come back within the next step of the scan.
-    let limit = m.soc.millis() + 500;
-    while !m.radio.borrow().rx_enabled && m.soc.millis() < limit {
-        m.run_until_ms(m.soc.millis() + 10);
-    }
+    until_every(&mut m, 10, 500, "the receiver back on", |m| {
+        m.radio.borrow().rx_enabled
+    });
     let radio = m.radio.borrow();
     assert!(
         radio.firmware_loaded,
@@ -67,7 +64,7 @@ fn boots_finds_its_wifi_stick_and_scans() {
 
 #[test]
 fn blank_configuration_is_written_to_the_last_flash_sector() {
-    let mut m = released();
+    let mut m = under_test();
     assert!(m.soc.flash[0x1F000..].iter().all(|&b| b == 0xFF));
     m.run_until_ms(1000);
     assert_eq!(m.soc.flash_erases, 1);
@@ -75,13 +72,13 @@ fn blank_configuration_is_written_to_the_last_flash_sector() {
     // The default server URL is the first thing in the configuration.
     assert!(m.soc.flash[0x1F000..].starts_with(b"r.nabaztag.com/vl\0"));
     // Nothing below the configuration sector was touched.
-    let fresh = released();
+    let fresh = under_test();
     assert_eq!(m.soc.flash[..0x1F000], fresh.soc.flash[..0x1F000]);
 }
 
 #[test]
 fn runs_are_reproducible() {
-    let (mut a, mut b) = (released(), released());
+    let (mut a, mut b) = (under_test(), under_test());
     a.run_until_ms(1500);
     b.run_until_ms(1500);
     assert_eq!(a.soc.uart_tx, b.soc.uart_tx);
@@ -91,16 +88,8 @@ fn runs_are_reproducible() {
 
 #[test]
 fn scan_reports_an_access_point_in_range() {
-    use nabemu::air::{AccessPoint, Security};
-
-    let mut m = released();
-    let bssid = [0x02, 0, 0, 0, 0, 0xA1];
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        bssid,
-        6,
-        Security::wpa2("carotte-violette"),
-    ));
+    let mut m = under_test();
+    m.air.push(terrier(nabemu::air::Security::wpa2(PASSPHRASE)));
     m.run_until_ms(12_000);
 
     assert_eq!(m.events, []);

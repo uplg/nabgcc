@@ -3,7 +3,7 @@
 //! clock tree, in the same order, and the crystal left the same time to
 //! settle before the chip runs on it. Skipped when lapin is not built.
 
-use nabemu::Machine;
+mod common;
 
 const PECLKCNT: u32 = 0xB700_0000;
 const PLL1: u32 = 0xB700_0008;
@@ -29,7 +29,7 @@ fn name(a: u32) -> &'static str {
 /// The writes up to the peripheral clocks' (the end of the bring-up),
 /// with their time in microseconds.
 fn bring_up(image: &[u8]) -> Vec<(u64, u32, u32)> {
-    let mut m = Machine::from_file(image).0;
+    let mut m = common::machine(image);
     m.soc.trace = Some((
         vec![PECLKCNT, PLL1, PLL2, CLKCNT, TMEN, TMRLR, TMOVF],
         Vec::new(),
@@ -48,13 +48,8 @@ fn bring_up(image: &[u8]) -> Vec<(u64, u32, u32)> {
 
 #[test]
 fn the_clock_comes_up_as_in_the_c_firmware() {
-    let root = env!("CARGO_MANIFEST_DIR");
-    let Ok(lapin) = std::fs::read(format!("{root}/../../lapin/target/lapin-full.bin")) else {
-        eprintln!("skipped: lapin is not built");
-        return;
-    };
-    let r3 = std::fs::read(format!("{root}/../../artifacts/Nab-wpa23-gtk-r3.sim")).unwrap();
-    let (c, rust) = (bring_up(&r3), bring_up(&lapin));
+    let Some(lapin) = common::lapin() else { return };
+    let (c, rust) = (bring_up(&common::r3()), bring_up(&lapin));
     for (who, log) in [("r3", &c), ("lapin", &rust)] {
         eprintln!("{who}:");
         for (us, a, v) in log.iter() {

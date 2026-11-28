@@ -3,20 +3,15 @@
 //! before the fix it goes with. They need `lapin/build.sh`, and are
 //! skipped when the image is not there.
 
+mod common;
+
 use nabemu::Machine;
 use nabemu::cpu::Bus;
 use nabemu::soc::IRAM_BASE;
 
+/// lapin as built, symbols and all.
 fn elf() -> Option<Vec<u8>> {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../lapin/target/thumbv4t-none-eabi/release/lapin"
-    );
-    let elf = std::fs::read(path).ok();
-    if elf.is_none() {
-        eprintln!("skipped: lapin is not built");
-    }
-    elf
+    common::lapin_target("thumbv4t-none-eabi/release/lapin")
 }
 
 /// Where the arguments and the result go, and the address the called
@@ -190,60 +185,16 @@ fn the_curve_arithmetic_takes_the_same_time_whatever_the_numbers() {
 /// WPA3 on the emulated rabbit, against an access point that loses
 /// track of it.
 mod wpa3 {
-    use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
-    use nabemu::config::{Config, Wifi};
-    use nabemu::{DEFAULT_MAC, Machine};
-
-    const PASSPHRASE: &str = "carotte-violette";
+    use super::common::{
+        authorized, handshakes, ip_on_the_wire, lapin, on_wpa3_network, until_every,
+    };
+    use nabemu::Machine;
+    use nabemu::air::{AccessPoint, ApEvent};
 
     fn rabbit(ap: impl FnOnce(&mut AccessPoint)) -> Option<Machine> {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../lapin/target/lapin-full.bin"
-        );
-        let Ok(image) = std::fs::read(path) else {
-            eprintln!("skipped: lapin is not built");
-            return None;
-        };
-        let mut m = Machine::from_file(&image).0;
-        Config::new(
-            "Terrier",
-            Wifi::Wpa2 {
-                passphrase: PASSPHRASE.into(),
-            },
-        )
-        .install(&mut m.soc.flash);
-        let mut a = AccessPoint::new(
-            "Terrier",
-            [2, 0, 0, 0, 0, 0xA1],
-            6,
-            Security::wpa2(PASSPHRASE),
-        );
-        a.wpa3 = Wpa3::Only;
-        ap(&mut a);
-        m.air.push(a);
+        let mut m = on_wpa3_network(&lapin()?);
+        ap(&mut m.air[0]);
         Some(m)
-    }
-
-    fn until(m: &mut Machine, limit: u64, done: impl Fn(&Machine) -> bool) -> u64 {
-        while !done(m) {
-            assert!(
-                m.soc.millis() < limit,
-                "not by {limit} ms: {:?}\n{}",
-                m.air[0].events,
-                m.console()
-            );
-            m.run_until_ms(m.soc.millis() + 5);
-        }
-        m.soc.millis()
-    }
-
-    fn handshakes(m: &Machine) -> usize {
-        m.air[0]
-            .events
-            .iter()
-            .filter(|e| matches!(e, ApEvent::HandshakeComplete { .. }))
-            .count()
     }
 
     /// Scenario A of the review: the access point loses power and comes
@@ -254,12 +205,12 @@ mod wpa3 {
     #[test]
     fn after_the_access_point_restarts_the_rabbit_joins_again() {
         let Some(mut m) = rabbit(|_| {}) else { return };
-        let first = until(&mut m, 30_000, |m| m.air[0].is_authorized(DEFAULT_MAC));
+        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
         m.run_until_ms(first + 2000);
         m.air[0].power_cut();
         let cut = m.soc.millis();
-        let back = until(&mut m, cut + 40_000, |m| {
-            m.air[0].is_authorized(DEFAULT_MAC) && handshakes(m) == 2
+        let back = until_every(&mut m, 5, 40_000, "back", |m| {
+            authorized(m) && handshakes(m) == 2
         });
         assert!(
             m.air[0]
@@ -281,11 +232,11 @@ mod wpa3 {
         let Some(mut m) = rabbit(|ap| ap.lose_message_4 = 1) else {
             return;
         };
-        let done = until(&mut m, 30_000, |m| m.air[0].is_authorized(DEFAULT_MAC));
+        let done = until_every(&mut m, 5, 30_000, "authorized", authorized);
         m.run_until_ms(done + 3000);
-        assert!(m.air[0].is_authorized(DEFAULT_MAC));
+        assert!(authorized(&m));
         assert_eq!(handshakes(&m), 1);
-        assert!(m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00]));
+        assert!(ip_on_the_wire(&m));
         assert_eq!(m.events, []);
     }
 }

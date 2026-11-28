@@ -1,21 +1,16 @@
 //! The released firmware booting all the way: join, DHCP, DNS, fetch a
 //! bytecode over HTTP, run it.
 
-use nabemu::air::{AccessPoint, ApEvent, Security};
-use nabemu::config::{Config, Wifi};
+mod common;
+
+use common::{ap_saw, on_network, until_every, wep, wpa, wpa2};
+use nabemu::air::{ApEvent, Security};
+use nabemu::config::Wifi;
 use nabemu::lan::{Lan, Response};
 use nabemu::{DEFAULT_MAC, Machine, metal};
 
-fn rabbit_on(wifi: Wifi, security: Security) -> Machine {
-    let image = nabemu::testing::image();
-    let mut m = Machine::from_file(&image).0;
-    Config::new("Terrier", wifi).install(&mut m.soc.flash);
-    m.air.push(AccessPoint::new(
-        "Terrier",
-        [2, 0, 0, 0, 0, 0xA1],
-        6,
-        security,
-    ));
+fn rabbit_on(network: (Wifi, Security)) -> Machine {
+    let mut m = on_network(&nabemu::testing::image(), network);
     let mut lan = Lan::new();
     lan.handler = Box::new(|request| {
         if request.target.starts_with("/vl/bc.jsp?") {
@@ -29,22 +24,15 @@ fn rabbit_on(wifi: Wifi, security: Security) -> Machine {
 }
 
 fn run_until_console(m: &mut Machine, wanted: &str, limit_ms: u64) {
-    while !m.console().contains(wanted) {
-        assert!(
-            m.soc.millis() < limit_ms,
-            "{wanted:?} never printed.\nap: {:?}\nconsole:\n{}",
-            m.air[0].events,
-            m.console()
-        );
-        m.run_until_ms(m.soc.millis() + 50);
-    }
+    until_every(m, 50, limit_ms, &format!("{wanted:?} printed"), |m| {
+        m.console().contains(wanted)
+    });
 }
 
-fn boots_its_bytecode(wifi: Wifi, security: Security) -> Machine {
-    let mut m = rabbit_on(wifi, security);
+fn boots_its_bytecode(network: (Wifi, Security)) -> Machine {
+    let mut m = rabbit_on(network);
     run_until_console(&mut m, "BOOT DONE", 40_000);
-    let limit = m.soc.millis() + 2000;
-    run_until_console(&mut m, "20061225", limit);
+    run_until_console(&mut m, "20061225", 2000);
     assert_eq!(m.events, [], "no reset on the way");
 
     let lan = m.lan.as_ref().unwrap();
@@ -75,51 +63,25 @@ fn boots_its_bytecode(wifi: Wifi, security: Security) -> Machine {
 
 #[test]
 fn boots_its_bytecode_from_an_open_network() {
-    boots_its_bytecode(Wifi::Open, Security::Open);
+    boots_its_bytecode(common::open());
 }
 
 #[test]
 fn boots_its_bytecode_from_a_wpa2_network() {
-    let pass = "carotte-violette";
-    let m = boots_its_bytecode(
-        Wifi::Wpa2 {
-            passphrase: pass.into(),
-        },
-        Security::wpa2(pass),
-    );
+    let m = boots_its_bytecode(wpa2());
     // The DHCP answers are broadcast: they came through the group key.
     assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
-    assert!(
-        m.air[0]
-            .events
-            .contains(&ApEvent::HandshakeComplete { sta: DEFAULT_MAC })
-    );
+    assert!(ap_saw(&m, &ApEvent::HandshakeComplete { sta: DEFAULT_MAC }));
 }
 
 #[test]
 fn boots_its_bytecode_from_a_wpa_tkip_network() {
-    let pass = "carotte-violette";
-    let m = boots_its_bytecode(
-        Wifi::Wpa {
-            passphrase: pass.into(),
-        },
-        Security::wpa(pass),
-    );
+    let m = boots_its_bytecode(wpa());
     assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
 }
 
 #[test]
 fn boots_its_bytecode_from_a_wep_network() {
-    let key = "abcde";
-    let m = boots_its_bytecode(
-        Wifi::Wep {
-            key: key.into(),
-            shared_auth: false,
-        },
-        Security::Wep {
-            key: key.as_bytes().to_vec(),
-            shared_auth: false,
-        },
-    );
+    let m = boots_its_bytecode(wep("abcde", false));
     assert_eq!(m.radio.borrow().rx_cipher_errors, [0; 4]);
 }
