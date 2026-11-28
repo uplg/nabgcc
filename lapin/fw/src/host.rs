@@ -9,7 +9,7 @@ use lapin_metal::{Auth, Host, Motor, ScanResult};
 use crate::ears::{self, Turn};
 use crate::wifi::link::Radio;
 use crate::wifi::rt2573::{self, Stick};
-use crate::{board, codec, flash, i2c, led, rfid, timer, uart, usb, watchdog};
+use crate::{board, codec, flash, i2c, led, rfid, timer, uart, watchdog};
 
 /// How many scan results are kept for the bytecode; the C driver put
 /// them all on the machine's stack, every beacon of every network.
@@ -65,14 +65,7 @@ impl Board {
 
     /// The station and the stick together, if there is a stick.
     fn radio(&mut self) -> Option<(&mut Station, Radio<'_>)> {
-        let stick = self.stick.as_deref_mut()?;
-        Some((
-            &mut *self.station,
-            Radio {
-                stick,
-                pool: &mut self.pool,
-            },
-        ))
+        Some((&mut *self.station, link(&mut self.stick, &mut self.pool)?))
     }
 
     /// Take frames from the stick until one is for the bytecode (kept
@@ -82,12 +75,8 @@ impl Board {
             return;
         }
         let frame = &mut *self.frame;
-        let Some(stick) = self.stick.as_deref_mut() else {
+        let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return;
-        };
-        let mut radio = Radio {
-            stick,
-            pool: &mut self.pool,
         };
         self.station.poll(&mut radio);
         while let Some(rx) = radio.receive(frame) {
@@ -105,6 +94,16 @@ impl Board {
             self.held = None;
         }
     }
+}
+
+/// The stick and the random pool as the station's link, if there is a
+/// stick: from the fields, so that the station and the frame can be
+/// borrowed beside it.
+fn link<'a>(stick: &'a mut Option<&'static mut Stick>, pool: &'a mut Pool) -> Option<Radio<'a>> {
+    Some(Radio {
+        stick: stick.as_deref_mut()?,
+        pool,
+    })
 }
 
 /// The bytes before the first zero.
@@ -282,12 +281,8 @@ impl Host for Board {
         let frame = &mut *self.frame;
         let scan = &mut *self.scan;
         let mut n = 0;
-        let Some(stick) = self.stick.as_deref_mut() else {
+        let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return 0;
-        };
-        let mut radio = Radio {
-            stick,
-            pool: &mut self.pool,
         };
         self.station
             .scan(&mut radio, ssid.map(cstr), frame, &mut |r| {
@@ -366,10 +361,7 @@ impl Host for Board {
             led::set(2, if j & 1 != 0 { 0xFF } else { 0 });
             led::set(3, if j == 2 { 0xFF } else { 0 });
             watchdog::feed();
-            this.held = None;
-            while this.net_pending().is_some() {
-                this.held = None;
-            }
+            this.flush();
         }));
         pmk
     }
@@ -395,12 +387,7 @@ impl Host for Board {
         let Some(slot) = self.stick_slot.take() else {
             return;
         };
-        let stick = usb::init()
-            .and_then(|()| usb::attach(3000))
-            .and_then(|()| usb::enumerate())
-            .map_err(rt2573::Error::Usb)
-            .and_then(Stick::start);
-        match stick {
+        match Stick::bring_up() {
             Ok(stick) => {
                 uart::write(b"wifi ");
                 for (i, byte) in stick.mac.iter().enumerate() {
@@ -433,14 +420,10 @@ impl Host for Board {
     }
 
     fn net_timer(&mut self) {
-        let Some(stick) = self.stick.as_deref_mut() else {
+        let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return;
         };
-        let _ = stick.tick();
-        let mut radio = Radio {
-            stick,
-            pool: &mut self.pool,
-        };
+        let _ = radio.stick.tick();
         self.station.tick(&mut radio);
         // The main loop's rhythm, a little noise for the pool.
         self.pool.mix(timer::millis());

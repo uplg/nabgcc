@@ -28,6 +28,20 @@ pub mod usb;
 pub mod watchdog;
 pub mod wifi;
 
+/// What every program on the board brings up first, once the clock
+/// runs: the pins, the interrupt controller, the watchdog, the
+/// millisecond tick (interrupts on from here), both SPI buses, the leds
+/// dark.
+pub fn init() {
+    board::init();
+    irq::init();
+    watchdog::start();
+    timer::init();
+    irq::irq_enable();
+    spi::init();
+    led::init();
+}
+
 /// Stop here. Nothing feeds the watchdog any more, so on the real
 /// board this ends in a restart.
 pub fn halt() -> ! {

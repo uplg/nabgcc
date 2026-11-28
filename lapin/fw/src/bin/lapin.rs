@@ -10,7 +10,7 @@ use lapin_core::rng::Pool;
 use lapin_core::wifi::Station;
 use lapin_fw::host::{Board, SCAN_RESULTS};
 use lapin_fw::wifi::rt2573::Stick;
-use lapin_fw::{board, clock, codec, ears, i2c, irq, led, spi, timer, uart, watchdog};
+use lapin_fw::{board, clock, codec, ears, i2c, timer, uart, watchdog};
 use lapin_metal::{Memory, ScanResult, Vm};
 
 #[panic_handler]
@@ -42,13 +42,7 @@ static mut SCAN: MaybeUninit<[ScanResult; SCAN_RESULTS]> = MaybeUninit::uninit()
 extern "C" fn main() -> ! {
     lapin_fw::start::link();
     clock::init();
-    board::init();
-    irq::init();
-    watchdog::start();
-    timer::init();
-    irq::irq_enable();
-    spi::init();
-    led::init();
+    lapin_fw::init();
     i2c::init();
     codec::init();
     ears::init();

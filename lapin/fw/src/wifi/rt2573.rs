@@ -19,9 +19,7 @@ const SHARED_KEYS: u16 = 0x1000;
 const BEACON: u16 = 0x2400;
 const MAC_CSR1: u16 = 0x3004;
 const MAC_CSR2: u16 = 0x3008;
-const MAC_CSR3: u16 = 0x300C;
 const MAC_CSR4: u16 = 0x3010;
-const MAC_CSR5: u16 = 0x3014;
 const MAC_CSR12: u16 = 0x3030;
 const TXRX_CSR0: u16 = 0x3040;
 const TXRX_CSR5: u16 = 0x3054;
@@ -31,6 +29,9 @@ const PHY_CSR3: u16 = 0x308C;
 const PHY_CSR4: u16 = 0x3090;
 const SEC_CSR0: u16 = 0x30A0;
 const SEC_CSR1: u16 = 0x30A4;
+
+/// PHY_CSR3 is taken by a baseband command under way.
+const BBP_BUSY: u32 = 1 << 16;
 
 /// Receiver off, and on with the filters the station needs.
 const RX_OFF: u32 = 0x0257_B032;
@@ -225,7 +226,9 @@ fn on_packet(packet: &[u8]) {
         return;
     }
     // The stick's descriptor: six words in front of the frame.
-    let word0 = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    let word =
+        |i: usize| u32::from_le_bytes([buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]);
+    let word0 = word(0);
     let crc_error = word0 & (1 << 6) != 0;
     let cipher_error = (word0 >> 8) & 3;
     let cipher = word0 >> 29;
@@ -237,8 +240,6 @@ fn on_packet(packet: &[u8]) {
     // Words 2 and 3: the IV and extended IV of what the stick opened
     // (as Linux's rt73usb reads them), for the replay check it leaves
     // to us.
-    let word =
-        |i: usize| u32::from_le_bytes([buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]]);
     rxq::push(&buffer[24..24 + len], rssi, cipher != 0, word(8), word(12));
 }
 
@@ -292,18 +293,40 @@ impl Stick {
         Err(Error::NotReady)
     }
 
+    /// Write words from `at` on, the last one padded with zeros; returns
+    /// the address after them.
+    fn write_words(&self, mut at: u16, bytes: &[u8]) -> Result<u16, usb::Error> {
+        for chunk in bytes.chunks(4) {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write(at, u32::from_le_bytes(word))?;
+            at += 4;
+        }
+        Ok(at)
+    }
+
+    /// An address in two registers: its first four bytes in `low`, the
+    /// last two in the next one, under `flags`.
+    fn write_address(&self, low: u16, address: &[u8; 6], flags: u32) -> Result<(), usb::Error> {
+        self.write_words(low, &address[..4])?;
+        let [.., a4, a5] = *address;
+        self.write(low + 4, a4 as u32 | (a5 as u32) << 8 | flags << 16)
+    }
+
+    /// Hand the baseband a command once it is free.
+    fn bbp(&self, command: u32) -> Result<(), Error> {
+        self.idle(PHY_CSR3, BBP_BUSY)?;
+        Ok(self.write(PHY_CSR3, BBP_BUSY | command)?)
+    }
+
     fn bbp_read(&self, register: u8) -> Result<u8, Error> {
-        const BUSY: u32 = 1 << 16;
         const READ: u32 = 1 << 15;
-        self.idle(PHY_CSR3, BUSY)?;
-        self.write(PHY_CSR3, BUSY | READ | (register as u32) << 8)?;
-        Ok(self.idle(PHY_CSR3, BUSY)? as u8)
+        self.bbp(READ | (register as u32) << 8)?;
+        Ok(self.idle(PHY_CSR3, BBP_BUSY)? as u8)
     }
 
     fn bbp_write(&self, register: u8, value: u8) -> Result<(), Error> {
-        const BUSY: u32 = 1 << 16;
-        self.idle(PHY_CSR3, BUSY)?;
-        Ok(self.write(PHY_CSR3, BUSY | (register as u32) << 8 | value as u32)?)
+        self.bbp((register as u32) << 8 | value as u32)
     }
 
     fn rf_write(&self, value: u32) -> Result<(), Error> {
@@ -314,6 +337,15 @@ impl Stick {
     /// The stick's radio chip, from its calibration data.
     pub fn radio(&self) -> u8 {
         (self.antenna >> 11) as u8
+    }
+
+    /// Bring the stick up from nothing: the USB controller, the stick on
+    /// its port (three seconds to show up), its enumeration, then
+    /// [`Stick::start`].
+    pub fn bring_up() -> Result<Stick, Error> {
+        usb::init()?;
+        usb::attach(3000)?;
+        Stick::start(usb::enumerate()?)
     }
 
     /// Load the stick's firmware, set it up, read its calibration data
@@ -333,9 +365,7 @@ impl Stick {
             channel: 1,
             calibration_in: CALIBRATION_PERIOD,
         };
-        for (i, word) in FIRMWARE.as_chunks::<4>().0.iter().enumerate() {
-            s.write(FIRMWARE_BASE + 4 * i as u16, u32::from_le_bytes(*word))?;
-        }
+        s.write_words(FIRMWARE_BASE, FIRMWARE)?;
         // Run it.
         s.request(0x40, 0x01, 0x08, 0, &mut [])?;
         for (register, value) in MAC_DEFAULTS {
@@ -428,12 +458,7 @@ impl Stick {
         let mut mac = [0u8; 6];
         self.eeprom(EEPROM_MAC, &mut mac)?;
         self.mac = mac;
-        self.write(
-            MAC_CSR2,
-            u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]),
-        )?;
-        self.write(MAC_CSR3, mac[4] as u32 | (mac[5] as u32) << 8 | 0xFF << 16)?;
-        Ok(())
+        Ok(self.write_address(MAC_CSR2, &mac, 0xFF)?)
     }
 
     /// Select the receive antenna (always B on the rabbit) in the
@@ -564,11 +589,7 @@ impl Stick {
 
     /// The network whose frames count as ours.
     pub fn set_bssid(&self, bssid: &[u8; 6]) -> Result<(), Error> {
-        self.write(
-            MAC_CSR4,
-            u32::from_le_bytes([bssid[0], bssid[1], bssid[2], bssid[3]]),
-        )?;
-        Ok(self.write(MAC_CSR5, bssid[4] as u32 | (bssid[5] as u32) << 8 | 3 << 16)?)
+        Ok(self.write_address(MAC_CSR4, bssid, 3)?)
     }
 
     /// Load (or, with `Cipher::None`, clear) one of the four shared
@@ -593,10 +614,7 @@ impl Stick {
         entry[..key.len().min(16)].copy_from_slice(&key[..key.len().min(16)]);
         entry[16..24].copy_from_slice(tx_mic);
         entry[24..].copy_from_slice(rx_mic);
-        let base = SHARED_KEYS + index as u16 * 32;
-        for (i, word) in entry.as_chunks::<4>().0.iter().enumerate() {
-            self.write(base + 4 * i as u16, u32::from_le_bytes(*word))?;
-        }
+        self.write_words(SHARED_KEYS + index as u16 * 32, &entry)?;
         let algorithms = self.read(SEC_CSR1)? & !(0xF << (index * 4));
         self.write(SEC_CSR1, algorithms | (cipher as u32) << (index * 4))?;
         Ok(self.write(SEC_CSR0, valid | 1 << index)?)
@@ -614,7 +632,7 @@ impl Stick {
         }
         usb::transmit(total, |buffer| {
             buffer.fill(0);
-            buffer[..24].copy_from_slice(&descriptor_with(frame.len(), options, options.timestamp));
+            buffer[..24].copy_from_slice(&descriptor(frame.len(), options));
             buffer[24..24 + frame.len()].copy_from_slice(frame);
         })
     }
@@ -640,27 +658,16 @@ impl Stick {
         }
         let mut options = TxOptions::PLAIN;
         options.ack = false;
-        let head = descriptor_with(frame.len(), &options, true);
-        let mut at = BEACON;
-        let mut word = [0u8; 4];
-        for (i, byte) in head.iter().chain(frame).enumerate() {
-            word[i % 4] = *byte;
-            if i % 4 == 3 {
-                self.write(at, u32::from_le_bytes(word))?;
-                at += 4;
-                word = [0; 4];
-            }
-        }
-        if (24 + frame.len()) % 4 != 0 {
-            self.write(at, u32::from_le_bytes(word))?;
-        }
+        options.timestamp = true;
+        let at = self.write_words(BEACON, &descriptor(frame.len(), &options))?;
+        self.write_words(at, frame)?;
         // Clock running, no synchronisation to anyone, beacons on.
         Ok(self.write(TXRX_CSR9, control | 0x001F_0000)?)
     }
 }
 
 /// The six words that precede a frame handed to the stick.
-fn descriptor_with(len: usize, options: &TxOptions, timestamp: bool) -> [u8; 24] {
+fn descriptor(len: usize, options: &TxOptions) -> [u8; 24] {
     /// What the physical layer header says for each rate.
     const SIGNAL: [u8; 12] = [0, 1, 2, 3, 11, 15, 10, 14, 9, 3, 8, 12];
     let rate = options.rate as u32;
@@ -669,7 +676,7 @@ fn descriptor_with(len: usize, options: &TxOptions, timestamp: bool) -> [u8; 24]
 
     // Valid frame, retries on, the chip numbers the frame.
     let mut word0 = 1 << 1 | 1 << 7 | (len as u32 & 0xFFF) << 16 | (options.cipher as u32) << 29;
-    word0 |= (options.ack as u32) << 3 | (timestamp as u32) << 4 | (ofdm as u32) << 5;
+    word0 |= (options.ack as u32) << 3 | (options.timestamp as u32) << 4 | (ofdm as u32) << 5;
     if encrypted {
         // Shared key table; the chip adds the TKIP integrity code.
         word0 |= 1 << 8 | (options.key_index as u32 & 0x3F) << 10;

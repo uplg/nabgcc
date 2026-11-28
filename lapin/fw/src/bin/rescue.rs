@@ -13,7 +13,7 @@ use core::arch::{asm, global_asm};
 use lapin_fw::boot::{self, MAX_FAILED_BOOTS, Slots};
 use lapin_fw::rescue::Rescue;
 use lapin_fw::wifi::rt2573::Stick;
-use lapin_fw::{board, clock, irq, led, spi, timer, uart, usb, watchdog};
+use lapin_fw::{clock, led, timer, uart, watchdog};
 
 global_asm!(
     r#"
@@ -74,13 +74,7 @@ extern "C" fn main() -> ! {
         unsafe { asm!("bx {0}", in(reg) entry, options(noreturn)) }
     }
 
-    board::init();
-    irq::init();
-    watchdog::start();
-    timer::init();
-    irq::irq_enable();
-    spi::init();
-    led::init();
+    lapin_fw::init();
     led::set_all(RED);
     uart::init();
     uart::write(if failed == boot::ASKED {
@@ -90,12 +84,7 @@ extern "C" fn main() -> ! {
     } else {
         b"secours: no application\n"
     });
-    let stick = usb::init()
-        .and_then(|()| usb::attach(3000))
-        .and_then(|()| usb::enumerate())
-        .map_err(lapin_fw::wifi::rt2573::Error::Usb)
-        .and_then(Stick::start);
-    let Ok(mut stick) = stick else {
+    let Ok(mut stick) = Stick::bring_up() else {
         uart::write(b"secours: no stick\n");
         if app.is_some() {
             // No network to offer: the application, without one, is

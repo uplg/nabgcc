@@ -8,7 +8,7 @@
 use core::cell::UnsafeCell;
 
 use lapin_fw::ears::Turn;
-use lapin_fw::{board, clock, codec, ears, flash, i2c, irq, led, rfid, spi, timer, uart, watchdog};
+use lapin_fw::{clock, codec, ears, flash, i2c, led, rfid, timer, uart, watchdog};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -120,13 +120,7 @@ static TAPE: Tape = Tape(UnsafeCell::new([0; 2048]));
 extern "C" fn main() -> ! {
     lapin_fw::start::link();
     clock::init();
-    board::init();
-    irq::init();
-    watchdog::start();
-    timer::init();
-    irq::irq_enable();
-    spi::init();
-    led::init();
+    lapin_fw::init();
     uart::init();
     ears::init();
     i2c::init();
