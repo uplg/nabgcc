@@ -854,10 +854,28 @@ fn rfid(r: &Rabbit, card: &mut Card) {
     let read: &[u8] = &[GETGLOBALB, 1, INTB, 1, RFIDREAD];
     let write: &[u8] = &[GETGLOBALB, 1, INTB, 2, GETGLOBALB, 2, RFIDWRITE];
     let globals = [Global::Str(&UID), Global::Str(b"noix")];
-    let with = program(
-        &globals,
-        &[&timed(&[(20, &[RFIDGET]), (10, read), (10, write)])],
-    );
+    let mut main = timed(&[(20, &[RFIDGET]), (10, read), (10, write)]);
+    // The last `end` off: then ten writes 20 ms apart, each timed alone
+    // (lapin leaves the tag its 5 ms of programming after the bytecode
+    // has its answer, which writes in a row wait out).
+    main.b.truncate(main.b.len() - metal::int(0).len() - 1);
+    main.locals = 4;
+    main.int(0).op(&[SETLOCALB, ACC, TIME_MS, SETLOCALB, X]);
+    main.times(10, |c| {
+        // 20 ms since the last write began, then the next.
+        let (top, end) = (c.place(), c.place());
+        c.here(top)
+            .op(&[TIME_MS, GETLOCALB, X, SUB])
+            .int(20)
+            .op(&[LT])
+            .jump(ELSE, end)
+            .jump(GOTO, top)
+            .here(end);
+        c.op(&[TIME_MS, SETLOCALB, X]).op(write).op(&[DROP]);
+        c.op(&[TIME_MS, GETLOCALB, X, SUB, GETLOCALB, ACC, ADD, SETLOCALB, ACC]);
+    });
+    main.op(&[GETLOCALB, ACC]).say().end();
+    let with = program(&globals, &[&main]);
     let without = program(&globals, &[&timed(&[(20, &[RFIDGET])])]);
     let run = |card: &mut Card, bytecode: &[u8], tag: bool, n: usize| {
         let mut m = serving(&r.image, bytecode);
@@ -872,12 +890,18 @@ fn rfid(r: &Rabbit, card: &mut Card) {
         card.seen(&m);
         said(&m)
     };
-    let with = run(card, &with, true, 3);
+    let with = run(card, &with, true, 4);
     let without = run(card, &without, false, 1);
     card.ms("rfidGet, a tag there", Some(with[1] as f64 / 20.0));
     card.ms("rfidGet, no tag", Some(without[1] as f64 / 20.0));
     card.ms("rfidRead of a block", Some(with[2] as f64 / 10.0));
-    card.ms("rfidWrite of a block", Some(with[3] as f64 / 10.0));
+    card.ms("rfidWrite of a block", Some(with[4] as f64 / 10.0));
+    card.put(
+        "rfidWrite, ten in a row: each (the tag's programming waited out)",
+        Some(with[3] as f64 / 10.0),
+        "ms",
+        Better::Info,
+    );
 }
 
 // What the program does when something happens around the rabbit.

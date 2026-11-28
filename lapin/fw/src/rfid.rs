@@ -1,6 +1,7 @@
 //! The tag reader in the nose: an ST CRX14, talking ISO 14443-B to the
 //! tags (ST SRI family, sold as "Ztamps").
 
+use crate::sync::Shared;
 use crate::{i2c, timer, watchdog};
 
 const READER: u8 = 0xA0;
@@ -163,16 +164,50 @@ fn field_off() {
     let _ = field(false);
 }
 
+/// How long a tag programs a written block into its EEPROM, at most by
+/// the SRI data sheets, with nothing to say when it is done.
+const PROGRAMMING_MS: u32 = 5;
+
+/// A block written, its tag still programming it, the field on for it:
+/// since when (a [`timer::millis`]).
+static PROGRAMMING: Shared<bool> = Shared::new(false);
+static PROGRAMMING_SINCE: Shared<u32> = Shared::new(0);
+
+/// Wait out what remains of a block's programming, before the reader
+/// does anything else.
+fn programmed() {
+    if PROGRAMMING.get() {
+        let gone = timer::since(PROGRAMMING_SINCE.get());
+        if gone <= PROGRAMMING_MS {
+            // One tick more than what remains, as `delay_ms` waits.
+            timer::delay_ms(PROGRAMMING_MS - gone);
+        }
+        PROGRAMMING.set(false);
+    }
+}
+
+/// The field off once a written block has had its time, if it has: from
+/// the main loop, which comes back to it every few milliseconds.
+pub fn settle() {
+    if PROGRAMMING.get() && timer::since(PROGRAMMING_SINCE.get()) > PROGRAMMING_MS {
+        PROGRAMMING.set(false);
+        field_off();
+    }
+}
+
 /// The tags in front of the nose.
 pub fn scan(found: &mut [Tag]) -> Result<usize, Error> {
+    programmed();
     let result = scan_keeping_field(found);
     field_off();
     result
 }
 
-fn with_tag<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+/// `f` with the tag `uid` selected, the field left on.
+fn with_tag_on<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+    programmed();
     let mut found = [Tag::default(); 16];
-    let result = scan_keeping_field(&mut found).and_then(|count| {
+    scan_keeping_field(&mut found).and_then(|count| {
         let tag = found[..count]
             .iter()
             .find(|t| &t.uid == uid)
@@ -180,7 +215,11 @@ fn with_tag<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Err
         select(tag.chip_id)?;
         pause();
         f()
-    });
+    })
+}
+
+fn with_tag<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
+    let result = with_tag_on(uid, f);
     field_off();
     result
 }
@@ -197,14 +236,20 @@ pub fn read_block(uid: &Uid, block: u8) -> Result<[u8; 4], Error> {
     })
 }
 
-/// Write one of a tag's blocks. The tag then programs its EEPROM, 5 ms
-/// at most by the SRI data sheets, with nothing to say when it is done:
-/// that long before the field goes off (the C turned it off at once,
-/// which can cut the programming short).
+/// Write one of a tag's blocks. The tag then programs its EEPROM
+/// ([`PROGRAMMING_MS`]), which the field going off, or another frame,
+/// can cut short (the C turned the field off at once). The bytecode
+/// has its answer at once: the reader's next operation waits out what
+/// remains, or the main loop turns the field off after it ([`settle`]).
 pub fn write_block(uid: &Uid, block: u8, data: &[u8; 4]) -> Result<(), Error> {
-    with_tag(uid, || {
-        send(&[0x09, block + 7, data[0], data[1], data[2], data[3]])?;
-        timer::delay_ms(5);
-        Ok(())
-    })
+    let result = with_tag_on(uid, || {
+        send(&[0x09, block + 7, data[0], data[1], data[2], data[3]])
+    });
+    if result.is_ok() {
+        PROGRAMMING_SINCE.set(timer::millis());
+        PROGRAMMING.set(true);
+    } else {
+        field_off();
+    }
+    result
 }

@@ -15,6 +15,10 @@ const REG_SLOT_MARKER: u8 = 3;
 /// Bit of the parameter register that switches the radio field on.
 const CARRIER_ON: u8 = 0x10;
 
+/// How long a tag takes to program a block into its EEPROM, at most
+/// (the SRI data sheets' t_W), with nothing to say when it is done.
+pub const PROGRAMMING_US: u64 = 5000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     /// The identifier as the bytecode sees it, most significant byte
@@ -49,6 +53,16 @@ pub struct Reader {
     incoming: Vec<u8>,
     read_at: usize,
     draws: u8,
+    /// The board's time, in microseconds, at the end of each transfer.
+    pub now_us: u64,
+    /// When the last block written began programming, until the tag
+    /// is spoken to again or loses the field.
+    programming_since: Option<u64>,
+    /// Blocks whose programming the host cut short: the field off, or
+    /// another frame to the tags, within [`PROGRAMMING_US`] of the
+    /// write. The block may not hold what was written (here it does:
+    /// the count is what tells).
+    pub cut_short: u32,
 }
 
 impl Reader {
@@ -89,6 +103,17 @@ impl Reader {
             return;
         };
         self.pointer = register;
+        let disturbs = match (register, data) {
+            (REG_PARAMETER, [value, ..]) => value & CARRIER_ON == 0,
+            (REG_IO_FRAME, [_, ..]) | (REG_SLOT_MARKER, _) => true,
+            _ => false,
+        };
+        if disturbs
+            && let Some(since) = self.programming_since.take()
+            && self.now_us.saturating_sub(since) < PROGRAMMING_US
+        {
+            self.cut_short += 1;
+        }
         match (register, data) {
             (REG_PARAMETER, [value, ..]) => {
                 self.parameter = *value;
@@ -106,7 +131,7 @@ impl Reader {
         }
     }
 
-    fn field_on(&self) -> bool {
+    pub fn field_on(&self) -> bool {
         self.parameter & CARRIER_ON != 0
     }
 
@@ -171,10 +196,12 @@ impl Reader {
                 _ => vec![0],
             },
             [0x09, block, data @ ..] if data.len() == 4 => {
+                let now = self.now_us;
                 if let Some(tag) = self.selected_tag()
                     && (*block as usize) < 128
                 {
                     tag.blocks[*block as usize].copy_from_slice(data);
+                    self.programming_since = Some(now);
                 }
                 vec![0]
             }

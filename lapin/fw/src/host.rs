@@ -477,6 +477,9 @@ impl Host for Board {
     // The stick lost and plugged back is brought up again, as the C's
     // usbhost_events does.
     fn usb_events(&mut self) {
+        // Called at every turn of the main loop's inner loop: the place
+        // to turn the tag reader's field off after a write.
+        rfid::settle();
         if usb::take_disconnected()
             && let Some(stick) = self.stick.take()
         {

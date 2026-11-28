@@ -413,9 +413,14 @@ wrong:
   back); harmless.
 - Tag reader: the C's sequence and pauses, within 10 % of its time
   (rfidGet 5 ms, rfidRead 12 ms). Left different: the field is closed
-  once after a scan that found nothing (the C twice); a tag write waits
-  the tags' 5 ms of programming before the field goes off (the C turns
-  it off at once and may cut the write short); the C retries a refused
+  once after a scan that found nothing (the C twice); a tag write leaves
+  the tag its 5 ms of programming before the field goes off or another
+  frame goes out (the C turns the field off at once and may cut the
+  write short, Known defect in `tests/rfid.rs`, which the emulator's
+  reader counts): the bytecode has its answer at once, as from the C
+  (6 ms), and the reader's next operation waits out what remains, or
+  the main loop turns the field off once it is over; writes in a row
+  take 11 ms each where the C's take 6; the C retries a refused
   write for ever, lapin a thousand times; a bus that does not come
   free is tried again for 300 ms with interrupts let through (the C
   polls a million times with them off) and a timed-out transfer sends

@@ -1347,6 +1347,7 @@ impl Soc {
                     }
                 } else if !master && self.i2c.active {
                     if !self.i2c.nak {
+                        self.board.rfid.now_us = self.cycles / (CLOCK_HZ / 1_000_000);
                         self.board.rfid.stop();
                     }
                     self.i2c = I2c::default();
