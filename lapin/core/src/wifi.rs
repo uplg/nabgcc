@@ -645,6 +645,12 @@ impl Station {
         matches!(self.security, Security::Sae { .. })
     }
 
+    /// Whether the link runs WPA (its vendor element, TKIP's MD5 and
+    /// RC4, the group key in a handshake of its own).
+    fn is_wpa1(&self) -> bool {
+        matches!(self.security, Security::Psk { wpa2: false, .. })
+    }
+
     // ---- frames out ------------------------------------------------
 
     /// Start a management frame in the transmit buffer; returns the
@@ -2001,11 +2007,10 @@ impl Station {
         clear: bool,
     ) {
         let mut e = [0u8; 99 + 48];
-        let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
         e[0] = 1;
         e[1] = 3;
         e[2..4].copy_from_slice(&((95 + data.len()) as u16).to_be_bytes());
-        e[4] = if wpa1 { 0xFE } else { 0x02 };
+        e[4] = if self.is_wpa1() { 0xFE } else { 0x02 };
         e[5..7].copy_from_slice(&(info | self.version()).to_be_bytes());
         e[9..17].copy_from_slice(counter);
         e[17..49].copy_from_slice(nonce);
@@ -2227,7 +2232,7 @@ impl Station {
     /// The key data of message 3, in clear in `out`: WPA's carries the
     /// access point's element as is, the others are encrypted.
     fn message_3_data(&self, f: &[u8], out: &mut [u8; 256]) -> Option<usize> {
-        if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
+        if !self.is_wpa1() {
             return self.key_data(f, out);
         }
         let n = be16(f, 97) as usize;
@@ -2241,7 +2246,7 @@ impl Station {
     /// WPA3 the integrity group key. Checked before message 4 goes:
     /// after it, the access point takes the station for ready.
     fn group_keys_present(&self, plain: &[u8]) -> bool {
-        if matches!(self.security, Security::Psk { wpa2: false, .. }) {
+        if self.is_wpa1() {
             return true;
         }
         let tkip = matches!(
@@ -2289,40 +2294,16 @@ impl Station {
         if self.keys == KeyState::Msg1 {
             return;
         }
-        if f[17..49] != self.anonce || !self.check_mic(f) {
-            return;
-        }
         let mut plain = [0u8; 256];
-        let Some(n) = self.message_3_data(f, &mut plain) else {
+        // Message 4 goes as message 3 came: in clear while the access
+        // point holds no key (it would drop it otherwise).
+        let Some(n) = self.answer_message_3(link, f, &mut plain, !sealed) else {
             return;
         };
         let plain = &plain[..n];
-        if !self.same_offer(plain) {
-            // Not the network the scan saw: no further with it.
-            self.state = State::Idle;
-            return;
-        }
-        if !self.group_keys_present(plain) {
-            return;
-        }
-        let wpa1 = matches!(self.security, Security::Psk { wpa2: false, .. });
-        self.replay.copy_from_slice(&f[9..17]);
         self.replay_active = true;
-        let secure = if wpa1 { 0 } else { 0x200 };
-        // Message 4 goes as message 3 came: in clear while the access
-        // point holds no key (it would drop it otherwise).
-        let counter = self.replay;
-        self.send_key(
-            link,
-            0x0008 | 0x0100 | secure,
-            &counter,
-            &[0; 32],
-            &[],
-            !sealed,
-        );
-        self.renew_snonce = true;
         self.pmksa_proven = true;
-        if wpa1 {
+        if self.is_wpa1() {
             // The group key follows in its own handshake; the link is
             // up once it is in (before, broadcasts would go unheard,
             // and the bytecode's first frames raced the group key).
@@ -2340,37 +2321,11 @@ impl Station {
     /// Message 3 of a rekey: checked whole, message 4 leaves under the
     /// current key, then the new one takes over.
     fn rekey_message_3(&mut self, link: &mut impl Link, f: &mut [u8]) {
-        if f[17..49] != self.anonce || !self.check_mic(f) {
-            return;
-        }
         let mut plain = [0u8; 256];
-        let Some(n) = self.message_3_data(f, &mut plain) else {
+        let Some(n) = self.answer_message_3(link, f, &mut plain, false) else {
             return;
         };
         let plain = &plain[..n];
-        if !self.same_offer(plain) {
-            self.state = State::Idle;
-            return;
-        }
-        if !self.group_keys_present(plain) {
-            return;
-        }
-        self.replay.copy_from_slice(&f[9..17]);
-        let secure = if matches!(self.security, Security::Psk { wpa2: false, .. }) {
-            0
-        } else {
-            0x200
-        };
-        let counter = self.replay;
-        self.send_key(
-            link,
-            0x0008 | 0x0100 | secure,
-            &counter,
-            &[0; 32],
-            &[],
-            false,
-        );
-        self.renew_snonce = true;
         if !self.is_wpa3() {
             // Message 4 must leave under the current key: the stick
             // encrypts as it sends, not as it is given the frame.
@@ -2380,10 +2335,48 @@ impl Station {
             self.ptk = ptk;
         }
         self.install_pairwise(link, true);
-        if !matches!(self.security, Security::Psk { wpa2: false, .. }) {
+        if !self.is_wpa1() {
             self.install_group_keys(link, plain, Self::key_rsc(f));
         }
         self.timeout = RUN_TIMEOUT;
+    }
+
+    /// What a first message 3 and a rekey's have in common: the nonce,
+    /// the integrity code, the offer and the group keys checked, then
+    /// message 4 sent (`clear`: unencrypted). The length of the key
+    /// data, in clear in `plain`; None if the message goes unanswered.
+    fn answer_message_3(
+        &mut self,
+        link: &mut impl Link,
+        f: &mut [u8],
+        plain: &mut [u8; 256],
+        clear: bool,
+    ) -> Option<usize> {
+        if f[17..49] != self.anonce || !self.check_mic(f) {
+            return None;
+        }
+        let n = self.message_3_data(f, plain)?;
+        if !self.same_offer(&plain[..n]) {
+            // Not the network the scan saw: no further with it.
+            self.state = State::Idle;
+            return None;
+        }
+        if !self.group_keys_present(&plain[..n]) {
+            return None;
+        }
+        self.replay.copy_from_slice(&f[9..17]);
+        let secure = if self.is_wpa1() { 0 } else { 0x200 };
+        let counter = self.replay;
+        self.send_key(
+            link,
+            0x0008 | 0x0100 | secure,
+            &counter,
+            &[0; 32],
+            &[],
+            clear,
+        );
+        self.renew_snonce = true;
+        Some(n)
     }
 
     /// The key receive sequence counter of an EAPOL-Key frame: where the
@@ -2926,11 +2919,7 @@ mod tests {
     fn group_message_at(s: &Station, counter: u64, key: &[u8], rsc: u64) -> Vec<u8> {
         let mut e = std::vec![0u8; 99];
         e[..2].copy_from_slice(&[1, 3]);
-        e[4] = if matches!(s.security, Security::Psk { wpa2: false, .. }) {
-            0xFE
-        } else {
-            2
-        };
+        e[4] = if s.is_wpa1() { 0xFE } else { 2 };
         // Group, key 1, ack, MIC, secure; version 1.
         e[5..7].copy_from_slice(&0x0391u16.to_be_bytes());
         e[9..17].copy_from_slice(&counter.to_be_bytes());
