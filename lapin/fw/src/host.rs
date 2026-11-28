@@ -39,6 +39,9 @@ pub struct Board {
     /// receiving.
     rx_seen: u32,
     errors_at_rx: u32,
+    /// The stick was looked for once, at the first turn of the main
+    /// loop; after that it comes and goes with the port's events.
+    stick_tried: bool,
 }
 
 /// Transfer errors in a row, no frame received, that make the stick
@@ -78,6 +81,7 @@ impl Board {
             tag_count: 0,
             rx_seen: 0,
             errors_at_rx: 0,
+            stick_tried: false,
         }
     }
 
@@ -455,11 +459,31 @@ impl Host for Board {
         self.inbox.pop(data, source);
     }
 
+    // The stick lost and plugged back is brought up again, as the C's
+    // usbhost_events does.
     fn usb_events(&mut self) {
+        if usb::take_disconnected()
+            && let Some(stick) = self.stick.take()
+        {
+            uart::write(b"wifi: stick lost\n");
+            // SAFETY: a Stick has no destructor and nothing else refers
+            // to it any more: its place is the slot again.
+            self.stick_slot = Some(unsafe { &mut *(stick as *mut Stick).cast() });
+        }
         let Some(slot) = self.stick_slot.take() else {
             return;
         };
-        match Stick::bring_up() {
+        let again = self.stick_tried;
+        let result = if !again {
+            self.stick_tried = true;
+            Stick::bring_up()
+        } else if usb::take_connected() {
+            Stick::reconnect()
+        } else {
+            self.stick_slot = Some(slot);
+            return;
+        };
+        match result {
             Ok(stick) => {
                 uart::write(b"wifi ");
                 for (i, byte) in stick.mac.iter().enumerate() {
@@ -480,6 +504,14 @@ impl Host for Board {
                     self.pool.mix(board::noise());
                 }
                 self.stick = Some(slot.write(stick));
+                if again {
+                    // A new stick knows nothing of the old link: the
+                    // station starts again from idle (the C's
+                    // ieee80211_init), and the bytecode joins anew.
+                    if let Some((sta, mut radio)) = self.radio() {
+                        sta.set_mode(&mut radio, false, &[], 0);
+                    }
+                }
             }
             Err(rt2573::Error::Radio(radio)) => {
                 // Not the radio chip this firmware knows how to tune.
@@ -487,7 +519,11 @@ impl Host for Board {
                 uart::hex8(radio);
                 uart::write(b"\n");
             }
-            Err(_) => uart::write(b"wifi: no stick\n"),
+            Err(_) => {
+                uart::write(b"wifi: no stick\n");
+                // It may still come: the port says when.
+                self.stick_slot = Some(slot);
+            }
         }
     }
 
