@@ -131,6 +131,8 @@ struct Connection {
     inbox: Vec<u8>,
     outbox: Vec<u8>,
     answered: bool,
+    /// The answer went out whole, all of it acknowledged.
+    delivered: bool,
 }
 
 pub struct Lan {
@@ -143,6 +145,9 @@ pub struct Lan {
     pub handler: Box<dyn FnMut(&Request) -> Response>,
     /// Requests served, in order.
     pub requests: Vec<Request>,
+    /// When each answer was all acknowledged by the station, in board
+    /// milliseconds, in the order of the requests.
+    pub delivered_ms: Vec<u64>,
     /// Names asked to the DNS server, in order.
     pub dns_queries: Vec<String>,
     /// DHCP message types received (1 discover, 3 request, ...).
@@ -223,6 +228,7 @@ impl Lan {
                     inbox: Vec::new(),
                     outbox: Vec::new(),
                     answered: false,
+                    delivered: false,
                 }
             })
             .collect();
@@ -234,6 +240,7 @@ impl Lan {
             http,
             handler: Box::new(|_| Response::not_found()),
             requests: Vec::new(),
+            delivered_ms: Vec::new(),
             dns_queries: Vec::new(),
             dhcp_messages: Vec::new(),
             leased_to: None,
@@ -350,7 +357,7 @@ impl Lan {
         let now = Instant::from_millis(now_ms as i64);
         self.iface.poll(now, &mut self.wire, &mut self.sockets);
         self.serve_dns();
-        self.serve_http();
+        self.serve_http(now_ms);
         self.iface.poll(now, &mut self.wire, &mut self.sockets);
     }
 
@@ -379,13 +386,14 @@ impl Lan {
         }
     }
 
-    fn serve_http(&mut self) {
+    fn serve_http(&mut self, now_ms: u64) {
         for conn in &mut self.http {
             let socket = self.sockets.get_mut::<tcp::Socket>(conn.handle);
             if !socket.is_open() {
                 conn.inbox.clear();
                 conn.outbox.clear();
                 conn.answered = false;
+                conn.delivered = false;
                 socket.listen(80).unwrap();
                 continue;
             }
@@ -419,6 +427,10 @@ impl Lan {
                 conn.outbox.drain(..sent);
             }
             if conn.answered && conn.outbox.is_empty() && socket.send_queue() == 0 {
+                if !conn.delivered {
+                    conn.delivered = true;
+                    self.delivered_ms.push(now_ms);
+                }
                 socket.close();
             }
             if !socket.may_recv() && !conn.answered && socket.state() == tcp::State::CloseWait {

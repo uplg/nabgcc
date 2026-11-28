@@ -31,7 +31,7 @@
       "owner": "lapin"
     },
     {
-      "family_id": "b5505eea305720b1",
+      "family_id": "f029880c0f3ce9ab",
       "reason": "The rescue core's own internet checksum against the emulator's LAN: the rescue core stays self-contained in its 20 KB, and the emulator never links firmware code.",
       "owner": "lapin"
     },

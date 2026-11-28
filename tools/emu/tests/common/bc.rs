@@ -11,8 +11,11 @@ pub mod op {
     #[allow(unused_imports)]
     pub use nabemu::metal::{
         OP_DROP as DROP, OP_GETGLOBALB as GETGLOBALB, OP_IECHOLN as IECHOLN, OP_RET as RET,
+        OP_RFID_GET as RFIDGET, OP_RFID_READ as RFIDREAD, OP_RFID_WRITE as RFIDWRITE,
         OP_SECHOLN as SECHOLN,
     };
+    pub const EXEC: u8 = 0;
+    pub const INTB: u8 = 2;
     pub const NIL: u8 = 4;
     pub const DUP: u8 = 6;
     pub const GETLOCALB: u8 = 7;
@@ -21,21 +24,37 @@ pub mod op {
     pub const AND: u8 = 14;
     pub const NEG: u8 = 19;
     pub const EQ: u8 = 22;
+    pub const NE: u8 = 23;
     pub const LT: u8 = 24;
     pub const GT: u8 = 25;
+    pub const GE: u8 = 27;
     pub const GOTO: u8 = 28;
     pub const ELSE: u8 = 29;
     pub const DEFTABB: u8 = 32;
+    pub const FETCH: u8 = 35;
+    pub const SECHO: u8 = 38;
+    pub const SETLOCALB: u8 = 40;
     pub const SETGLOBAL: u8 = 42;
     pub const HD: u8 = 45;
+    pub const TL: u8 = 46;
+    pub const STORE: u8 = 48;
     pub const TIME_MS: u8 = 53;
+    pub const TABNEW: u8 = 54;
     pub const TIME: u8 = 61;
+    pub const STRNEW: u8 = 62;
     pub const STRCPY: u8 = 64;
     pub const STRLEN: u8 = 68;
     pub const STRGET: u8 = 69;
+    pub const STRSUB: u8 = 70;
+    pub const STRCAT: u8 = 71;
+    pub const LED: u8 = 74;
+    pub const MOTORSET: u8 = 75;
+    pub const MOTORGET: u8 = 76;
+    pub const BUTTON2: u8 = 77;
     pub const PLAYSTART: u8 = 79;
     pub const PLAYFEED: u8 = 80;
     pub const GC: u8 = 87;
+    pub const SAVE: u8 = 92;
     pub const BYTECODE: u8 = 93;
     pub const LOOPCB: u8 = 94;
     pub const ENVGET: u8 = 98;
@@ -47,6 +66,8 @@ pub mod op {
     pub const NETSETMODE: u8 = 108;
     pub const NETSCAN: u8 = 109;
     pub const NETAUTH: u8 = 110;
+    pub const RECSTART: u8 = 111;
+    pub const ITOA: u8 = 119;
     pub const REBOOT: u8 = 136;
     pub const STRCMP: u8 = 137;
     pub const ADP2WAV: u8 = 138;

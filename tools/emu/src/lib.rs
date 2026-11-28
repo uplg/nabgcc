@@ -61,6 +61,10 @@ pub struct Machine {
     pub stack_low: [u32; 32],
     /// Where the program was when each of those lows was reached.
     pub stack_low_pc: [u32; 32],
+    /// The highest stack pointer seen in each processor mode, inside the
+    /// internal RAM: where each stack starts, whatever the firmware's
+    /// layout; `stack_high - stack_low` is how deep it went.
+    pub stack_high: [u32; 32],
     /// The program stack's words at its deepest, from the top of the
     /// stack pointer up: the return addresses in it say how it got there.
     pub stack_low_words: Vec<u32>,
@@ -108,6 +112,7 @@ impl Machine {
             instructions: 0,
             stack_low: [u32::MAX; 32],
             stack_low_pc: [0; 32],
+            stack_high: [0; 32],
             stack_low_words: Vec::new(),
             masked_longest: 0,
             masked_since: None,
@@ -176,6 +181,7 @@ impl Machine {
         let sp = self.cpu.r[13];
         if (soc::IRAM_BASE..soc::IRAM_BASE + soc::IRAM_SIZE as u32).contains(&sp) {
             let mode = (self.cpu.mode() & 0x1F) as usize;
+            self.stack_high[mode] = self.stack_high[mode].max(sp);
             if sp < self.stack_low[mode] {
                 self.stack_low[mode] = sp;
                 self.stack_low_pc[mode] = self.cpu.pc();

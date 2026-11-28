@@ -1,2 +1,2 @@
 lapin_suites: --test boot --test board --test join --test link --test network --test setup --test rfid --test factory --test flash --test garenne --test soak --test crowded --test scan --test observable --test c_audit
-lapin_fixed: lapin limits rescue hardening odd_audio wifi_review clock idle_skip wpa3_sound scan_connected first_flash
+lapin_fixed: lapin limits rescue hardening odd_audio wifi_review clock idle_skip wpa3_sound scan_connected first_flash versus
