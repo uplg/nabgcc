@@ -14,12 +14,16 @@ pub fn size(src: &[u8]) -> usize {
     let short = |o: usize| {
         src.get(o).copied().unwrap_or(0) as u32 | (src.get(o + 1).copied().unwrap_or(0) as u32) << 8
     };
-    let int = |o: usize| short(o) | short(o + 2) << 16;
-    let n = int(0);
-    let b = int(n as usize);
-    let total = n.wrapping_add(4).wrapping_add(b);
-    let fun = short(total as usize);
-    total.wrapping_add(2).wrapping_add(fun << 2) as usize
+    let int = |o: u32| short(o as usize) | short(o as usize + 2) << 16;
+    size_by(int, |o| short(o as usize)) as usize
+}
+
+/// `loaderSizeBC` over the bytecode's 32- and 16-bit numbers at byte
+/// offsets: the globals' size, the code's, then the function table.
+fn size_by(int: impl Fn(u32) -> u32, short: impl Fn(u32) -> u32) -> u32 {
+    let globals = int(0);
+    let total = globals.wrapping_add(4).wrapping_add(int(globals));
+    total.wrapping_add(2).wrapping_add(short(total) << 2)
 }
 
 impl<H: Host> Vm<'_, H> {
@@ -38,11 +42,10 @@ impl<H: Host> Vm<'_, H> {
     /// `loaderInit` for a bytecode the machine holds as a string at byte
     /// `src`: copied down byte by byte, as the C does.
     pub(crate) fn load_heap(&mut self, src: i32) {
-        let globals = self.int32(src);
-        let code = self.int32(src.wrapping_add(globals));
-        let total = globals.wrapping_add(4).wrapping_add(code);
-        let fun = self.short(src.wrapping_add(total));
-        let n = total.wrapping_add(2).wrapping_add(fun << 2);
+        let n = size_by(
+            |o| self.int32(src.wrapping_add(o as i32)) as u32,
+            |o| self.short(src.wrapping_add(o as i32)) as u32,
+        ) as i32;
         self.copy_bytes(0, src, n);
         self.load_rest(n);
     }
