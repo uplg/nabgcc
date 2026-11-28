@@ -8,35 +8,58 @@
 
 /// Unpack `packed` into `out`; returns how many bytes came out (it
 /// stops when `out` is full).
+///
+/// ARM code, twice as fast as Thumb at it, out of line, and made of
+/// indexing and arithmetic alone: in ARM code the library's helpers,
+/// Thumb, would be calls.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+#[inline(never)]
 pub fn unpack(packed: &[u8], out: &mut [u8]) -> usize {
+    let (len, room) = (packed.len(), out.len());
     let (mut i, mut n) = (0, 0);
-    while i < packed.len() {
-        let flags = packed[i];
+    // The flag byte's bits still to read, above a 1 that marks their end.
+    let mut flags = 1;
+    while n < room {
+        if flags == 1 {
+            if i >= len {
+                break;
+            }
+            flags = packed[i] as u32 | 0x100;
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        let a = packed[i] as usize;
         i += 1;
-        for bit in 0..8 {
-            if i >= packed.len() || n >= out.len() {
-                return n;
-            }
-            if flags >> bit & 1 == 0 {
-                out[n] = packed[i];
-                n += 1;
-                i += 1;
-            } else {
-                let (a, b) = (
-                    packed[i] as usize,
-                    *packed.get(i + 1).unwrap_or(&0) as usize,
-                );
-                i += 2;
-                let len = (a >> 4) + 3;
-                let back = ((a & 15) << 8 | b) + 1;
-                for _ in 0..len {
-                    if n >= out.len() || back > n {
-                        return n;
-                    }
-                    out[n] = out[n - back];
-                    n += 1;
-                }
-            }
+        let copy = flags & 1;
+        flags >>= 1;
+        if copy == 0 {
+            out[n] = a as u8;
+            n += 1;
+            continue;
+        }
+        let b = if i < len { packed[i] as usize } else { 0 };
+        i += 1;
+        let back = ((a & 15) << 8 | b) + 1;
+        if back > n {
+            break;
+        }
+        let mut end = n + (a >> 4) + 3;
+        if end > room {
+            end = room;
+        }
+        // Byte by byte, forward: a copy may run into what it writes. The
+        // three every copy has, then the rest.
+        if n + 3 <= end {
+            out[n] = out[n - back];
+            out[n + 1] = out[n + 1 - back];
+            out[n + 2] = out[n + 2 - back];
+            n += 3;
+        }
+        while n < end {
+            out[n] = out[n - back];
+            n += 1;
         }
     }
     n
@@ -53,6 +76,60 @@ mod tests {
     use super::packer::pack;
     use super::unpack;
     use std::vec::Vec;
+
+    /// The first unpacker, one check per byte.
+    fn reference(packed: &[u8], out: &mut [u8]) -> usize {
+        let (mut i, mut n) = (0, 0);
+        while i < packed.len() {
+            let flags = packed[i];
+            i += 1;
+            for bit in 0..8 {
+                if i >= packed.len() || n >= out.len() {
+                    return n;
+                }
+                if flags >> bit & 1 == 0 {
+                    out[n] = packed[i];
+                    n += 1;
+                    i += 1;
+                } else {
+                    let (a, b) = (
+                        packed[i] as usize,
+                        *packed.get(i + 1).unwrap_or(&0) as usize,
+                    );
+                    i += 2;
+                    let len = (a >> 4) + 3;
+                    let back = ((a & 15) << 8 | b) + 1;
+                    for _ in 0..len {
+                        if n >= out.len() || back > n {
+                            return n;
+                        }
+                        out[n] = out[n - back];
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// The same as the first unpacker on any stream, into any room.
+    #[test]
+    fn as_the_first() {
+        let mut x = 0x2545_f491u32;
+        for case in 0..3000 {
+            let mut packed = Vec::new();
+            for _ in 0..case % 97 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                packed.push(x as u8);
+            }
+            let room = (x >> 8) as usize % 400;
+            let (mut a, mut b) = (std::vec![7u8; room], std::vec![7u8; room]);
+            assert_eq!(unpack(&packed, &mut a), reference(&packed, &mut b));
+            assert_eq!(a, b);
+        }
+    }
 
     #[test]
     fn round_trips() {

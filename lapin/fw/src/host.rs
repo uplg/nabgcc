@@ -70,7 +70,7 @@ impl Board {
         scan: &'static mut [ScanResult; SCAN_RESULTS],
         inbox: &'static mut [u8; inbox::SIZE],
     ) -> Board {
-        scan.fill(SCAN_NONE);
+        // What `scan` holds is read only once a scan has written it.
         Board {
             stick: None,
             stick_slot: Some(stick_slot),
