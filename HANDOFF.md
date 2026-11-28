@@ -362,7 +362,15 @@ wrong:
   waited 2.1 s). A sector that already holds what it would be given is
   not rewritten (the manual guarantees a hundred rewrites). The rest of
   the image's last sector is erased (the C keeps the old bytes there;
-  the header's length and CRC make them meaningless).
+  the header's length and CRC make them meaningless). A sector that
+  reads all ones is written without an erase: the manual forbids
+  erasing one twice with nothing written between (20.5.5), which the C
+  does to the blank settings sector at first boot (Known defect) and
+  to the free sectors past its own image when it writes lapin as the
+  first flash. The commands' timing (an instruction after FLWE, 8
+  clocks free of the flash around each) is written out as four dummy
+  loads, as the manual's example; the C's NOPs keep it too. The
+  emulator checks all of it (`Soc::flash_rules`).
 - Board: the volume wheel at 1 MHz as the C (lapin had 2). The rescue
   core starts the watchdog first and sets the pins before checking the
   application (they were set 76 ms later than the C's). An interrupt
