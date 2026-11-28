@@ -80,24 +80,21 @@ Done since:
 - **The CI** splits the tests on lapin over three runners (about 4 min
   end to end on GitHub); the suites that pick their own images run
   once.
+- **The last global of a served bytecode** is kept (it was open item
+  1, `7737b92`): lapin's `OPbytecode` leaves the new main's result for
+  its caller's pull, where r3 pulls it itself and its caller then
+  takes the new bytecode's last global off the stack. Harmless to
+  every bytecode served today, by the accident of where their last
+  string sits; see "Deliberate differences from r3".
 
 Open, in this order:
 
-1. **The last global of a served bytecode** lies above the stack
-   (`7737b92`): `OPbytecode` leaves the interpreter with the new
-   bytecode's stack, and the caller's `VPULL` pops from it. r3 and
-   lapin alike; the next push overwrites that global, and the collector
-   no longer marks it (an object held only there can be collected while
-   still referenced). lapin keeps the C's behaviour for now: whether to
-   fix it (a C bug, so lapin should not reproduce it) is Léonard's
-   call, since it changes what the bytecode sees and the differential
-   tests against the C.
-2. **Receive throughput in a crowded band**: lapin takes about two
+1. **Receive throughput in a crowded band**: lapin takes about two
    frames a millisecond off the stick; with 200 neighbours beaconing
    every 20 ms (`crowded.rs`) it lists 100 to 200 of them depending on
    their phase, where r3 lists 175 (the home network always). Worth a
    look at the receive transfers in flight.
-3. **cargo-mutants** only on Léonard's go; nose gates the code it adds.
+2. **cargo-mutants** only on Léonard's go; nose gates the code it adds.
 
 ## Things worth knowing before continuing
 
@@ -226,6 +223,33 @@ r3's misbehaviour where the emulator shows it.
 
 What the bytecode sees:
 
+- **The last global of a bytecode started by `OPbytecode`** stays its
+  own once its main function returned. r3's `OPbytecode` pulls the new
+  main's result, then leaves the interpreter, and its caller (the main
+  loop or a callback's wrapper in `main.c`, `vnet.c`, `vaudio.c`) pulls
+  once more, off the new stack: the last global then lies above the
+  top, the collector no longer marks it, and the outermost callback's
+  frame lands on it (its first argument, its first local, or its saved
+  program counter, -1). Reading the global then reads that slot of the
+  frame, writing it writes the frame; r3's string natives take an
+  integer n found there for the object at heap word n and write into
+  it (the -1 happens to read as nil). Nested loads
+  lose one global more each. No dangling pointer is read: every entry
+  into the interpreter pushes over the slot before any bytecode runs.
+  The Metal compiler lays the globals out in the order it first meets
+  them, `var`s and string literals alike, each literal its own global,
+  nothing added at the end; the last is the last literal or `var` in
+  the source. Harmless today by accident: garenne's is `" ip="`,
+  read only in `garenne_init`, which runs inside main (its console and
+  calls to the board are the same either way; only the collector's
+  own counts move); the boot bytecode is never served. A `var`
+  declared last, or a literal in a function placed after
+  `garenne_init` and called later, would break on r3. lapin leaves the
+  new main's result for its caller's pull. `tests/observable.rs`
+  (`the_last_global_of_a_served_bytecode_is_kept`, a Known defect on
+  r3), and `lapin/cref`, whose C machine is built with that one pull
+  cut out of `vinterp.c` (`build.rs`), so that the differential tests
+  and `vm_diff` compare everything else against the C as it is.
 - **Scan results**: one entry per network (BSSID and name), the
   strongest frame heard, up to 256 networks; r3 lists every frame it
   hears, as many as its heap holds, and loses some neighbours in a

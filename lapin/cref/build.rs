@@ -1,6 +1,7 @@
 //! Build the C firmware's virtual machine for the machine running the
-//! tests: `src/vm/*.c` as they are, the play and record half of
-//! `src/hal/audio.c` with its hardware functions cut out, and a shim
+//! tests: `src/vm/*.c` as they are but for one line of `vinterp.c`
+//! (`OPbytecode`'s pull, [`vinterp_as_lapin`]), the play and record half
+//! of `src/hal/audio.c` with its hardware functions cut out, and a shim
 //! that sends every hardware call to the Rust side.
 
 use std::path::{Path, PathBuf};
@@ -58,6 +59,27 @@ fn audio_without_hardware(source: &str) -> String {
     out.join("\n") + "\n"
 }
 
+/// `vinterp.c` without the pull that ends `OPbytecode`: the one
+/// difference from r3's machine lapin's makes on purpose (HANDOFF.md,
+/// "Deliberate differences from r3"). r3 pulls the new main's result
+/// there, its caller pulls again, off the new stack, and the new
+/// bytecode's last global falls above the top. Everything else is
+/// compared against the C as it is.
+fn vinterp_as_lapin(source: &str) -> String {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let pull: Vec<usize> = (1..lines.len() - 1)
+        .filter(|&i| {
+            lines[i - 1].trim() == "interpGo();"
+                && lines[i].trim() == "(void)VPULL();"
+                && lines[i + 1].contains("OPbytecode done")
+        })
+        .collect();
+    assert_eq!(pull.len(), 1, "OPbytecode's pull moved");
+    let mut out = lines;
+    out.remove(pull[0]);
+    out.concat()
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.join("../..").canonicalize().unwrap();
@@ -68,10 +90,15 @@ fn main() {
     let audio_vm = out.join("audio_vm.c");
     std::fs::write(&audio_vm, audio_without_hardware(&audio)).unwrap();
 
-    let mut sources: Vec<PathBuf> = ["vinterp", "vmem", "vloader", "vlog", "vaudio", "vnet"]
+    let vinterp = std::fs::read_to_string(repo.join("src/vm/vinterp.c")).unwrap();
+    let vinterp_vm = out.join("vinterp.c");
+    std::fs::write(&vinterp_vm, vinterp_as_lapin(&vinterp)).unwrap();
+
+    let mut sources: Vec<PathBuf> = ["vmem", "vloader", "vlog", "vaudio", "vnet"]
         .iter()
         .map(|f| repo.join(format!("src/vm/{f}.c")))
         .collect();
+    sources.push(vinterp_vm);
     sources.push(audio_vm);
     sources.push(manifest.join("c/shim.c"));
 
@@ -108,9 +135,8 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=cvm");
     println!("cargo:rerun-if-changed={}", Path::new("c/shim.c").display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        repo.join("src/hal/audio.c").display()
-    );
+    for patched in ["src/hal/audio.c", "src/vm/vinterp.c"] {
+        println!("cargo:rerun-if-changed={}", repo.join(patched).display());
+    }
     println!("cargo:rerun-if-changed={}", repo.join("inc").display());
 }

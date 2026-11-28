@@ -6,11 +6,11 @@
 //! runs when the bytecode is loaded.
 //!
 //! A bytecode the server sends (started by the boot bytecode's
-//! `OPbytecode`) loses its last global once its main function has
-//! returned, on r3 and lapin alike: the stack's top is then one past
-//! it, and a callback's frame lands on it. A test that reads its
-//! globals in a callback keeps a spare one last (see
-//! `tests/observable.rs`, `the_last_global_lies_above_the_stack_once_main_returned`).
+//! `OPbytecode`) loses its last global on r3 once its main function has
+//! returned (lapin keeps it): the stack's top is then one past it, and
+//! a callback's frame lands on it. A test that reads its globals in a
+//! callback on both firmwares keeps a spare one last (see
+//! `tests/observable.rs`, `the_last_global_of_a_served_bytecode_is_kept`).
 
 pub const OP_RET: u8 = 1;
 pub const OP_INT: u8 = 3;

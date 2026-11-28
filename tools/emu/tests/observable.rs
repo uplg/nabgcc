@@ -5,9 +5,10 @@
 mod common;
 
 use common::bc::{self, op::*};
-use common::{ap_count, ap_saw, find, printed, program_ended, program_started, until, wait};
+use common::{ap_count, ap_saw, printed, program_ended, program_started, until, wait};
 use nabemu::air::ApEvent;
 use nabemu::config::{Config, Wifi};
+use nabemu::testing::is_lapin;
 use nabemu::{DEFAULT_MAC, Machine, metal};
 
 /// Where `program` puts the body: 7 bytes into its function's code.
@@ -480,45 +481,68 @@ fn frames_that_came_before_a_scan_are_kept() {
     assert!(delivered >= 20, "{delivered} delivered");
 }
 
-/// The last global of a served bytecode is not the bytecode's to keep,
-/// on r3 and on lapin alike. `OPbytecode` loads the new bytecode over
-/// a fresh stack (the system slots, then the globals, the last on top),
-/// runs its main function, then leaves the interpreter at once; whoever
-/// had called the interpreter for the old bytecode (the main loop, for
-/// a callback) then pulls the value it had pushed, and the stack's top
-/// is one past the last global. That global now lies above the stack:
-/// the next push writes over it (in a loop callback, the callback's
-/// frame puts the saved program counter, -1, there), and the
-/// collector, which marks from the top, no longer sees it. Read in the
-/// main function it is intact. Tests that need their globals in a
-/// callback keep a spare one last (`tests/scan_connected.rs`).
+/// The last global of a served bytecode stays its own once its main
+/// function returned, and the collector keeps what it holds.
+///
+/// Known defect: r3 loses it. `OPbytecode` loads the new bytecode over
+/// a fresh stack (the system slots, then the globals, the last on
+/// top), runs its main function and pulls its result, then leaves the
+/// interpreter at once; whoever had called the interpreter for the old
+/// bytecode (the main loop, for a callback) pulls again, and the
+/// stack's top is one past the last global. The next push writes over
+/// it (in a loop callback, the frame's saved program counter, -1), the
+/// collector no longer marks it, and from then on the global and the
+/// outermost callback's first slot are one word: the bytecode reads
+/// its frame there, and writes into it. lapin leaves the new main's
+/// result for that second pull.
 #[test]
-fn the_last_global_lies_above_the_stack_once_main_returned() {
+fn the_last_global_of_a_served_bytecode_is_kept() {
     // main: print the last global, then set the loop callback.
     let mut main = vec![GETGLOBALB, 1, SECHOLN, DROP];
     main.extend(metal::int(1));
     main.extend([LOOPCB, DROP]);
     let main = program(&main);
-    // The callback: both globals, the first a string still, the last
-    // the callback's own saved program counter.
+    // The callback, after a collection: the first global, then the
+    // last, printed as a number if it is -1 (r3), else as a string.
+    let mut body = vec![GC, DROP, GETGLOBALB, 0, SECHOLN, DROP, GETGLOBALB, 1];
+    body.extend(metal::int(-1));
+    body.extend([EQ, ELSE, 0, 0]);
+    let to_string = body.len() - 2;
+    body.extend([GETGLOBALB, 1, IECHOLN, DROP, GOTO, 0, 0]);
+    let to_end = body.len() - 2;
+    bc::land_here(&mut body, to_string, 0);
+    body.extend([GETGLOBALB, 1, SECHOLN, DROP]);
+    bc::land_here(&mut body, to_end, 0);
+    body.extend(metal::int(9990));
+    body.extend([IECHOLN, RET]);
     let mut callback = metal::FUNCTION_HEADER.to_vec();
-    callback.extend([GETGLOBALB, 0, SECHOLN, DROP]);
-    callback.extend([GETGLOBALB, 1, IECHOLN, DROP]);
-    callback.extend(metal::int(9990));
-    callback.extend([IECHOLN, RET]);
+    callback.extend(body);
     let mut m = common::under_test();
     m.serve(&metal::bytecode_functions(
         &[b"first", b"last"],
         &[&main, &callback],
     ));
-    until(&mut m, 40_000, "the callback", |m| {
-        find(&m.soc.uart_tx, b"9990").is_some()
+    until(&mut m, 40_000, "two callbacks", |m| {
+        m.console().matches("9990").count() >= 2
     });
     let c = m.console();
     let main_ran = c.find("7770").expect("the program ran");
     let in_main = &c[main_ran..c.find("8880").unwrap()];
     assert!(in_main.contains("last"), "{in_main:?}");
-    let called = &c[c.find("8880").unwrap() + 4..c.find("9990").unwrap()];
-    let lines: Vec<&str> = called.split_whitespace().collect();
-    assert_eq!(lines, ["first", "-1"], "{called:?}");
+    let called = &c[c.find("8880").unwrap() + 4..c.rfind("9990").unwrap()];
+    // Without what the collector prints of itself.
+    let lines: Vec<&str> = called
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("#GC") && !l.starts_with("b:"))
+        .collect();
+    if is_lapin() {
+        assert_eq!(lines, ["first", "last", "9990", "first", "last"]);
+    } else {
+        assert_eq!(
+            lines,
+            ["first", "-1", "9990", "first", "-1"],
+            "Known defect"
+        );
+    }
 }

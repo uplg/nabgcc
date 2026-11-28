@@ -839,13 +839,13 @@ impl<H: Host> Vm<'_, H> {
                     }
                     self.push(int(0));
                     self.interp_go();
-                    self.pull();
-                    // Out at once, as the C: whoever called the machine
-                    // for the old bytecode then pulls the value it had
-                    // pushed, from the new stack, and the new bytecode's
-                    // last global lies above the top from then on (the
-                    // next push writes over it, the collector no longer
-                    // marks it). Bytecodes have lived with it; kept.
+                    // Out at once, as the C, but with the new main's
+                    // result left on top: whoever called the machine
+                    // for the old bytecode pulls one value, and that
+                    // is it. The C pulls it here, so its caller's pull
+                    // takes the new bytecode's last global off the
+                    // stack (the next push writes over it, the
+                    // collector no longer marks it); lapin keeps it.
                     return Flow::Return;
                 }
             }

@@ -626,6 +626,37 @@ fn a_new_bytecode_takes_over_with_its_environment() {
     assert!(out.contains("the environment"), "{out}");
 }
 
+/// A bytecode started by `OPbytecode`, itself started so, keeps its
+/// last global once its main function returned: in the loop callback,
+/// after a collection that moved the heap, it is still the string
+/// only it holds. (r3 lost it: `tools/emu/tests/observable.rs`; this
+/// C machine has lapin's fix, `build.rs`.)
+#[test]
+fn a_new_bytecode_keeps_its_last_global() {
+    let mut main = main_fun();
+    main.int(1).op(LOOPCB).op(DROP);
+    end(&mut main);
+    let mut callback = Fun::new(0, 0);
+    callback.int(64).op(STRNEW).op(DROP).op(GC).op(DROP);
+    callback.b(GETGLOBALB, 1).shows().b(GETGLOBALB, 0).shows();
+    end(&mut callback);
+    let third = bytecode(&[b"first", b"last"], &[&main, &callback]);
+    let mut start = main_fun();
+    start.b(GETGLOBALB, 0).op(BYTECODE);
+    end(&mut start);
+    let second = bytecode(&[&third], &[&start]);
+    let mut first = main_fun();
+    first
+        .int(32)
+        .op(STRNEW)
+        .op(DROP)
+        .b(GETGLOBALB, 1)
+        .op(BYTECODE);
+    end(&mut first);
+    let out = both(&bytecode(&[b"garbage", &second], &[&first]));
+    assert_eq!(out.matches("last\r\nfirst\r\n").count(), 3, "{out:?}");
+}
+
 /// What a run left, without the world's handlers (which stay on their
 /// thread).
 #[derive(Debug, PartialEq)]

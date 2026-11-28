@@ -30,10 +30,10 @@ fn program() -> Vec<u8> {
     // rejoin = if netState == IDLE then netAuth g0 0 WPA2 g1
     let rejoin = bc::rejoin(0, &[GETGLOBALB, 1]);
     // The key the setup page derived from the passphrase. (Not last:
-    // the last global of a served bytecode lies above the stack once
-    // its main function returned, and the callback's frame writes over
-    // it, on both machines: `tests/observable.rs`,
-    // `the_last_global_lies_above_the_stack_once_main_returned`.)
+    // on r3 the last global of a served bytecode lies above the stack
+    // once its main function returned, and the callback's frame writes
+    // over it: `tests/observable.rs`,
+    // `the_last_global_of_a_served_bytecode_is_kept`.)
     let key = nabemu::crypto::wpa_psk(PASSPHRASE, SSID);
     let globals = [
         Global::Word(u32::MAX),
