@@ -77,22 +77,9 @@ impl Aes {
             for b in s.iter_mut() {
                 *b = SBOX[*b as usize];
             }
-            // Shift rows: row i of the column-major state turns by i.
-            let t = *s;
-            for c in 0..4 {
-                for row in 1..4 {
-                    s[4 * c + row] = t[4 * ((c + row) % 4) + row];
-                }
-            }
+            shift_rows(s);
             if r != 10 {
-                for c in s.as_chunks_mut::<4>().0 {
-                    let all = c[0] ^ c[1] ^ c[2] ^ c[3];
-                    let first = c[0];
-                    c[0] ^= all ^ xtime(c[0] ^ c[1]);
-                    c[1] ^= all ^ xtime(c[1] ^ c[2]);
-                    c[2] ^= all ^ xtime(c[2] ^ c[3]);
-                    c[3] ^= all ^ xtime(c[3] ^ first);
-                }
+                mix_columns(s);
             }
             add(s, &self.rounds[r]);
         }
@@ -123,7 +110,11 @@ impl Aes {
     }
 }
 
+/// Row i of the column-major state turns by i. This and the column
+/// mix are inlined in both directions: a call in every round made the
+/// key unwrap 14% slower to save 168 bytes.
 #[allow(clippy::needless_range_loop)]
+#[inline(always)]
 fn shift_rows(s: &mut Block) {
     let t = *s;
     for c in 0..4 {
@@ -133,6 +124,7 @@ fn shift_rows(s: &mut Block) {
     }
 }
 
+#[inline(always)]
 fn mix_columns(s: &mut Block) {
     for c in s.as_chunks_mut::<4>().0 {
         let all = c[0] ^ c[1] ^ c[2] ^ c[3];
