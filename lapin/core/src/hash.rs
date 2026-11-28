@@ -51,14 +51,22 @@ impl Engine {
             (self.compress)(&mut self.state, &self.block);
             self.block = [0; 64];
         }
-        let swap = if self.big_endian { 0 } else { 7 };
-        for (i, byte) in self.block[56..].iter_mut().enumerate() {
-            *byte = (bits >> (8 * ((7 - i) ^ swap))) as u8;
-        }
+        // As bytes, not shifts of the 64-bit number by a variable: each
+        // of these is a call into the library on the ARM7.
+        self.block[56..].copy_from_slice(&if self.big_endian {
+            bits.to_be_bytes()
+        } else {
+            bits.to_le_bytes()
+        });
         (self.compress)(&mut self.state, &self.block);
-        let swap = swap & 3;
+        self.digest(&self.state, out);
+    }
+
+    /// The first `out.len() / 4` words of `state`, in the hash's order.
+    fn digest(&self, state: &[u32; 8], out: &mut [u8]) {
+        let swap = if self.big_endian { 0 } else { 3 };
         for (i, byte) in out.iter_mut().enumerate() {
-            *byte = (self.state[i / 4] >> (8 * ((3 - i % 4) ^ swap))) as u8;
+            *byte = (state[i / 4] >> (8 * ((3 - i % 4) ^ swap))) as u8;
         }
     }
 }
@@ -112,6 +120,29 @@ impl Keyed {
         let mut outer = self.outer.clone();
         outer.update(digest);
         outer.finish(out);
+    }
+
+    /// The code of `message`, as long as the digest, in its place:
+    /// PBKDF2's rounds. Each of its two hashes is one block after the
+    /// key's, whose padding is known: the block function alone, on one
+    /// block written once. For SHA's byte order (PBKDF2-SHA1).
+    #[inline(never)]
+    pub(crate) fn code_in_place(&self, message: &mut [u8]) {
+        debug_assert!(self.inner.big_endian);
+        let size = self.size;
+        let mut block = [0u8; 64];
+        block[size] = 0x80;
+        // The length in bits, a block and the message: under 2^16.
+        let bits = (64 + size) * 8;
+        block[62] = (bits >> 8) as u8;
+        block[63] = bits as u8;
+        block[..size].copy_from_slice(message);
+        for fresh in [&self.inner, &self.outer] {
+            let mut state = fresh.state;
+            (fresh.compress)(&mut state, &block);
+            fresh.digest(&state, &mut block[..size]);
+        }
+        message.copy_from_slice(&block[..size]);
     }
 
     /// The code of the concatenation of `parts`, `N` the digest's length.

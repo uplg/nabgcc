@@ -182,6 +182,45 @@ fn the_curve_arithmetic_takes_the_same_time_whatever_the_numbers() {
     }
 }
 
+/// SHA-1's block function, which a WPA2 passphrase runs 16 384 times
+/// (PBKDF2, 4096 rounds of HMAC for each of two blocks): it chose each
+/// round's function with `i / 20`, a call to the library's division on
+/// the ARM7, 80 times a block, 6 s of the 13 the setup page waited on.
+/// The cycles of one block, and its result (the digest of "abc").
+#[test]
+fn sha1_takes_no_division() {
+    let Some(image) = elf() else { return };
+    let (mut m, symbols) = Machine::from_file(&image);
+    let symbols = symbols.unwrap().symbols;
+    let compress = symbol(&symbols, "10lapin_core4sha18compress");
+    let start = [
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    ];
+    for (i, w) in start.iter().enumerate() {
+        m.soc.write32(ARGS + 4 * i as u32, *w);
+    }
+    let mut block = [0u8; 64];
+    block[..4].copy_from_slice(b"abc\x80");
+    block[63] = 24;
+    write(&mut m, ARGS + 32, &block);
+    // The symbol table lost the Thumb bit: ARM code begins on an
+    // instruction that always runs (condition 0xE), Thumb's does not.
+    let arm = m.soc.read32(compress) >> 28 == 0xE;
+    let entry = if arm { compress } else { compress | 1 };
+    let (cycles, _) = call(&mut m, entry, &[ARGS, ARGS + 32], &[]);
+    let digest: Vec<u32> = (0..5).map(|i| m.soc.read32(ARGS + 4 * i)).collect();
+    assert_eq!(
+        digest,
+        [0xa9993e36, 0x4706816a, 0xba3e2571, 0x7850c26c, 0x9cd0d89d]
+    );
+    eprintln!("SHA-1, one block: {cycles} cycles");
+    assert!(cycles < 6000, "SHA-1, one block: {cycles} cycles");
+}
+
 /// WPA3 on the emulated rabbit, against an access point that loses
 /// track of it.
 mod wpa3 {

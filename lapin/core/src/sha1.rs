@@ -13,38 +13,73 @@ const START: Engine = Engine::new(
 
 hasher!(Sha1, sha1, 20);
 
+/// The rounds' constants, twenty rounds each, and which function they
+/// take (0: choose, 1: parity, 2: majority).
+const ROUNDS: [(u32, u8); 4] = [
+    (0x5A827999, 0),
+    (0x6ED9EBA1, 1),
+    (0x8F1BBCDC, 2),
+    (0xCA62C1D6, 1),
+];
+
+/// A sum modulo 2^32, as an operator the ARM code can take inline
+/// (`wrapping_add` would be a call into Thumb code), and ARM code itself
+/// so that it can be.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+#[inline(always)]
+fn add(a: u32, b: u32) -> u32 {
+    (a as u64 + b as u64) as u32
+}
+
+/// The block function, which PBKDF2 runs 16 384 times for a WPA2
+/// passphrase. Each round's function comes from a loop of its own: `i /
+/// 20` was a call to the library's division (the ARM7 has none), 80 a
+/// block. Compiled as ARM code, whose shifts and rotations come with
+/// the operation that takes them; written with plain loops and no call,
+/// since the compiler will not inline the library's (Thumb) iterators
+/// into it.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
 fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 16];
-    for (slot, word) in w.iter_mut().zip(block.as_chunks::<4>().0) {
-        *slot = u32::from_be_bytes(*word);
+    let mut i = 0;
+    while i < 16 {
+        w[i] = (block[4 * i] as u32) << 24
+            | (block[4 * i + 1] as u32) << 16
+            | (block[4 * i + 2] as u32) << 8
+            | block[4 * i + 3] as u32;
+        i += 1;
     }
     let [mut a, mut b, mut c, mut d, mut e, ..] = *state;
-    for i in 0..80 {
-        if i >= 16 {
-            let x = w[(i + 13) & 15] ^ w[(i + 8) & 15] ^ w[(i + 2) & 15] ^ w[i & 15];
-            w[i & 15] = x.rotate_left(1);
+    let mut i = 0;
+    let mut phase = 0;
+    while phase < 4 {
+        let (k, f) = ROUNDS[phase];
+        let end = i + 20;
+        while i < end {
+            if i >= 16 {
+                let x = w[(i + 13) & 15] ^ w[(i + 8) & 15] ^ w[(i + 2) & 15] ^ w[i & 15];
+                w[i & 15] = x << 1 | x >> 31;
+            }
+            let f = match f {
+                0 => (b & c) | (!b & d),
+                1 => b ^ c ^ d,
+                _ => (b & c) | (b & d) | (c & d),
+            };
+            let t = add(add(add(add(a << 5 | a >> 27, f), e), k), w[i & 15]);
+            e = d;
+            d = c;
+            c = b << 30 | b >> 2;
+            b = a;
+            a = t;
+            i += 1;
         }
-        let (f, k) = match i / 20 {
-            0 => ((b & c) | (!b & d), 0x5A827999),
-            1 => (b ^ c ^ d, 0x6ED9EBA1),
-            2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-            _ => (b ^ c ^ d, 0xCA62C1D6),
-        };
-        let t = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(k)
-            .wrapping_add(w[i & 15]);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = t;
+        phase += 1;
     }
-    for (s, x) in state.iter_mut().zip([a, b, c, d, e]) {
-        *s = s.wrapping_add(x);
-    }
+    state[0] = add(state[0], a);
+    state[1] = add(state[1], b);
+    state[2] = add(state[2], c);
+    state[3] = add(state[3], d);
+    state[4] = add(state[4], e);
 }
 
 fn keyed(key: &[u8]) -> Keyed {
@@ -69,7 +104,7 @@ pub fn passphrase_to_pmk(
         let mut u = key.code::<20>(&[ssid, &(block as u32 + 1).to_be_bytes()]);
         let mut sum = u;
         for round in 1..4096 {
-            u = key.code(&[&u]);
+            key.code_in_place(&mut u);
             for (s, x) in sum.iter_mut().zip(u) {
                 *s ^= x;
             }
