@@ -59,8 +59,8 @@ Done since:
 
 - **A packed first image.** The server sends an r3 rabbit
   `lapin-first.bin`, once (see "The first flash" below and
-  `docs/first-flash.md`): 1931 ms unfed at the manual's slowest flash,
-  166 ms to spare, where `lapin-full.bin` is bitten. A power cut in the
+  `docs/first-flash.md`): 1937 ms unfed at the manual's slowest flash,
+  157 ms to spare, where `lapin-full.bin` is bitten. A power cut in the
   first ~0.35 s, while r3 writes the rescue core itself, stays fatal
   (pinned as a Known defect): nothing on the lapin side can change
   that.
@@ -118,9 +118,10 @@ Open:
 
 **Flash budget.** 124 KB below the settings sector. lapin takes 113.0
 KB (115 692 bytes), the boot bytecode's 27.6 KB included, packed to 16
-KB, and the rescue core's 20 KB (19 884 bytes used of its 20 472, the
-first image's unpacker in them): 11.0 KB left. `lapin-first.bin` is
-81 499 bytes, 20 sectors and 421 bytes short of a 21st. The curve and the
+KB, and the rescue core's 20 KB (20 316 bytes used of its 20 472, the
+first image's unpacker in them): 10.4 KB left (lapin-full.bin is 116 340
+bytes). `lapin-first.bin` is 80 603 bytes, 20 sectors and 1 317 bytes
+short of a 21st. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -477,22 +478,25 @@ the flash unfed by its own routine: `lapin-full.bin` takes 1951 ms of
 the watchdog's 2097 with the flash's typical timings, and with the
 manual's slowest (50 ms an erase, 40 µs a word) it is bitten after
 21577 of 28558 operations. So the first image, which the server sends
-an r3 rabbit once, is `lapin-first.bin` (81.7 KB, from `lapin/build.sh`
+an r3 rabbit once, is `lapin-first.bin` (80.6 KB, from `lapin/build.sh`
 through `lapin/pack`): the same rescue core, then the application
-packed to 64.6 % (`lapin/core/src/pack.rs`: LZ77 and an adaptive binary
-coder, rANS with 12-bit probabilities, after a filter that makes
-Thumb's BL offsets targets; copies reach back into the rescue core,
-which the application shares much code with; LZMA at its best does
-59.4 KB against these 61.2) behind a header "LAPP" (packed length,
+packed to 62.7 % (`lapin/core/src/pack.rs`: LZ77 and an adaptive binary
+coder, rANS with two 16-bit probabilities a context, a fast and a slow
+one, averaged; a repeat's length has its own contexts; after a filter
+that makes Thumb's BL offsets targets; copies reach back into the
+rescue core, which the application shares much code with; the boot
+bytecode inside the application keeps its flags, literals and copies
+apart, which the packer finds side by side; xz's best with the same
+dictionary does about 60.0 KB, against these 60.1) behind a header "LAPP" (packed length,
 unpacked length, CRC-32 of each). r3 writes it with the watchdog unfed
-1371 ms typically, 1931 ms at the slowest: 166 ms to spare. That is
-thin: a sector more costs about 97 ms, the image is 211 bytes short of
-one, and `build.sh` prints that number. At its first start the rescue
+1377 ms typically, 1937 ms at the slowest: 157 ms to spare. A sector
+more costs about 97 ms; the image is 1 317 bytes short of one, and `build.sh` prints that number. At its first start the rescue
 core finds no application but the packed one, unpacks it into the
-external RAM behind a copy of itself (2.5 s), checks its CRC and
+external RAM behind a copy of itself (3.3 s; its probabilities live in
+the external RAM too, the rescue core's stack has no room for them), checks its CRC and
 header, writes the 9 sectors past the packed ones (which leaves those
 whole), restarts, unpacks again, writes the rest over them, restarts
-into lapin: 6.4 s, the watchdog fed (54 ms unfed at most). Cuts at
+into lapin: 8.3 s, the watchdog fed (56 ms unfed at most). Cuts at
 every 32nd of that: while the packed application is whole (the first
 5.2 s) the rabbit unpacks again and comes back on lapin; in the last
 step (it cannot keep the packed application: 92.6 KB and 60 KB do not

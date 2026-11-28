@@ -10,11 +10,12 @@ C firmware with a bytecode, and only with his yes.
 Each line names the test that shows it.
 
 1. **The first image is `lapin-first.bin`**, not `lapin-full.bin`.
-   `lapin/build.sh` makes both. `lapin-first.bin` (81.7 KB) is the rescue
+   `lapin/build.sh` makes both. `lapin-first.bin` (80.6 KB) is the rescue
    core as in `lapin-full.bin` (its 20 KB, trailer included), then the
-   application packed to 64.6 % (`lapin/pack`, `lapin/core/src/pack.rs`:
-   LZ77 with an adaptive binary coder, after a filter on Thumb's calls,
-   the copies reaching into the rescue core too), behind a header of
+   application packed to 62.7 % (`lapin/pack`, `lapin/core/src/pack.rs`:
+   LZ77 with an adaptive binary coder, two probabilities a context,
+   after a filter on Thumb's calls, the copies reaching into the rescue
+   core too), behind a header of
    five words: "LAPP", the packed length, the unpacked length, the CRC-32
    of the unpacked application, the CRC-32 of the packed bytes. The
    server sends it once, to a rabbit that runs r3. A lapin rabbit is
@@ -23,13 +24,12 @@ Each line names the test that shows it.
 2. **The watchdog during r3's write.** r3's routine does not feed it
    (it sets the pause bit without the unlock). For `lapin-first.bin`,
    20 sectors where `lapin-full.bin` takes 29, the watchdog goes
-   unfed 1371 ms of its 2097 with the flash's typical timings (726 ms to
-   spare) and 1931 ms with the manual's slowest, 50 ms an erase and 40
-   µs a word (166 ms to spare) (`first_flash::r3_writes_the_first_image_within_the_watchdog_even_at_the_slowest_flash`,
-   which fails under 100 ms to spare). The margin is thin at the slowest:
-   one sector more costs about 97 ms, and the image is 211 bytes short
-   of one (`build.sh` prints that number; the application must not grow
-   past it unnoticed). `lapin-full.bin` takes 1951 ms typically and is
+   unfed 1380 ms of its 2097 with the flash's typical timings (717 ms to
+   spare) and 1940 ms with the manual's slowest, 50 ms an erase and 40
+   µs a word (157 ms to spare) (`first_flash::r3_writes_the_first_image_within_the_watchdog_even_at_the_slowest_flash`,
+   which fails under 100 ms to spare). One sector more would cost about 97 ms at the slowest; the image
+   is 1 317 bytes short of one (`build.sh` prints that number; the application must not grow
+   past it unnoticed). `lapin-full.bin` takes 1973 ms typically and is
    bitten at the slowest (`first_flash::with_the_slowest_flash_r3_is_bitten_mid_write_and_the_rescue_core_takes_over`).
    r3's sysFlash checks (a length from 4 KB to 124 KB, five `ldr pc`
    vectors) take it: it opens on the same vectors.
@@ -37,10 +37,10 @@ Each line names the test that shows it.
    packed one whose CRC checks. It unpacks it into the external RAM
    behind a copy of itself, checks the unpacked CRC and the
    application's header, and writes it with lapin's own routine, which
-   feeds the watchdog (54 ms unfed at most). In two steps, each ending
+   feeds the watchdog (56 ms unfed at most). In two steps, each ending
    in a restart: first the 9 sectors past the packed application's 15,
    which leave it whole; then the rest, over it. Each time a sector
-   already right is skipped. About 6.4 s from the first start to lapin
+   already right is skipped. About 8.3 s from the first start to lapin
    (`first_flash::the_rescue_core_unpacks_the_first_image_and_writes_the_application`).
    A packed application that does not check is not installed: the
    rescue network (`first_flash::a_damaged_first_image_is_not_installed`).
@@ -144,7 +144,7 @@ Each line names the test that shows it.
    slowest flash) and restarts. **Do not touch the power in those
    first seconds** (item 5).
 4. Expected: the rescue core unpacks and writes the application (the
-   console says `secours: unpacked` twice, about 6.4 s, with two
+   console says `secours: unpacked` twice, about 8.3 s, with two
    restarts), then lapin starts (its bytecode, then the network);
    within a minute the rabbit is on its network and asks clapier for
    garenne. From then on clapier sends lapin `lapin-full.bin`, never
