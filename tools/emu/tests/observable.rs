@@ -468,3 +468,70 @@ fn a_stick_that_reports_no_packet_numbers_still_carries_traffic() {
     let m = wpa2_with_a_stick_that_reports_iv(true);
     assert!(!m.console().contains(NO_PN));
 }
+
+const NETSEND: u8 = 104;
+const NETPMK: u8 = 142;
+const STRCMP: u8 = 137;
+
+/// The rabbit on the open network running `function` with `strings`,
+/// for `ms` after it started.
+fn running_for(strings: &[&[u8]], function: &[u8], ms: u64) -> Machine {
+    let mut m = common::under_test();
+    m.serve(&metal::bytecode(strings, function));
+    until(&mut m, 40_000, "the program", |m| {
+        find(&m.soc.uart_tx, b"7770").is_some()
+    });
+    wait(&mut m, ms);
+    m
+}
+
+/// Known defect of r3: `netSend` of a frame longer than the stick's
+/// buffer copies it past the end, and the watchdog restarts the rabbit.
+/// lapin refuses it (nothing sent) and goes on.
+#[test]
+fn net_send_of_a_frame_too_long() {
+    let frame = vec![0x45u8; 3000];
+    let mut body = vec![metal::OP_GETGLOBALB, 0];
+    body.extend(metal::int(0));
+    body.push(NIL);
+    body.extend([metal::OP_GETGLOBALB, 1]);
+    body.extend(metal::int(0));
+    body.extend(metal::int(0));
+    body.extend([NETSEND, IECHOLN, DROP]);
+    let m = running_for(&[&frame, &[0xFF; 6]], &program(&body), 10_000);
+    if nabemu::testing::is_lapin() {
+        assert_eq!(m.events, []);
+        assert_eq!(printed(&m), [0]);
+    } else {
+        assert!(!m.events.is_empty(), "no restart");
+    }
+}
+
+/// Known defect of r3: `netPmk` copies a network name of more than 32
+/// bytes over what follows its buffer, and the rabbit hangs there.
+/// lapin derives the key from the first 32 (a name has at most 32
+/// bytes): the same key as for them.
+#[test]
+fn net_pmk_of_a_name_too_long() {
+    let long = b"Un-nom-de-reseau-bien-trop-long-pour-le-802.11";
+    let short = &long[..32];
+    let mut body = Vec::new();
+    for name in [1u8, 2] {
+        body.extend([metal::OP_GETGLOBALB, name, metal::OP_GETGLOBALB, 0, NETPMK]);
+    }
+    body.extend([STRCMP, IECHOLN, DROP]);
+    let strings: [&[u8]; 3] = [b"carotte-violette", short, long];
+    if nabemu::testing::is_lapin() {
+        let mut m = running_for(&strings, &program(&body), 0);
+        until(&mut m, 60_000, "the keys", |m| {
+            find(&m.soc.uart_tx, b"8880").is_some()
+        });
+        assert_eq!(printed(&m), [0], "the same key");
+    } else {
+        // Ninety seconds on, nothing more: the second key never comes
+        // (the first takes a few seconds).
+        let m = running_for(&strings, &program(&body), 90_000);
+        assert!(find(&m.soc.uart_tx, b"8880").is_none());
+        assert_eq!(printed(&m), []);
+    }
+}

@@ -119,6 +119,33 @@ fn mixed_mode_is_refused_because_message_2_misnames_the_group_cipher() {
     assert_eq!(handshakes(&m), 0);
 }
 
+/// Known defect of r3: on a WPA2 network whose ciphers are TKIP alone,
+/// the pairwise handshake completes, but the group key is never
+/// installed and the access point's frames fail to decrypt: no address
+/// from DHCP. lapin gets in.
+#[test]
+fn wpa2_with_tkip_alone() {
+    let tkip = Security::Psk {
+        wpa2: true,
+        pairwise: nabemu::crypto::Cipher::Tkip,
+        group: nabemu::crypto::Cipher::Tkip,
+        passphrase: PASSPHRASE.into(),
+    };
+    if nabemu::testing::is_lapin() {
+        join((wpa2().0, tkip));
+        return;
+    }
+    let mut m = rabbit((wpa2().0, tkip));
+    m.lan = Some(nabemu::lan::Lan::new());
+    wait(&mut m, 20_000);
+    assert!(handshakes(&m) > 0);
+    assert!(!ap_saw(
+        &m,
+        &ApEvent::GroupKeyInstalled { sta: DEFAULT_MAC }
+    ));
+    assert_eq!(m.lan.as_ref().unwrap().leased_to, None);
+}
+
 #[test]
 fn joins_a_wep_network_with_open_authentication() {
     let m = join(wep("abcde", false));
