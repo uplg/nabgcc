@@ -14,6 +14,12 @@ const INV8: [u8; 128] = [
     51, 85, 255,
 ];
 
+/// The size of the settings sector.
+const SETTINGS: i32 = 4096;
+
+/// How many times the C asks an I2C device before it gives up.
+const TRIES: u32 = 1000;
+
 const ITOA: [i32; 10] = [
     1_000_000_000,
     100_000_000,
@@ -27,7 +33,8 @@ const ITOA: [i32; 10] = [
     1,
 ];
 
-fn hex_digit(v: i32) -> u8 {
+/// A digit of a number in base 16, small letters past 9.
+pub(crate) fn hex_digit(v: i32) -> u8 {
     if v < 10 {
         b'0' + v as u8
     } else {
@@ -38,26 +45,26 @@ fn hex_digit(v: i32) -> u8 {
 impl<H: Host> Vm<'_, H> {
     /// `logSecho`.
     pub(crate) fn secho(&mut self, p: i32, nl: bool) {
-        if p == NIL {
-            self.host.console(b"NIL");
-        } else {
+        self.echo(p, nl, |vm, p| {
             let q = val(p);
-            let (at, len) = (Self::start_bin(q), self.size_bin(q));
-            let text = crate::bytes(&self.mem.heap);
-            let text = clip(text, at, len);
-            self.host.console(text);
-        }
-        if nl {
-            self.host.console(b"\r\n");
-        }
+            let (at, len) = (Self::start_bin(q), vm.size_bin(q));
+            let text = clip(crate::bytes(&vm.mem.heap), at, len);
+            vm.host.console(text);
+        });
     }
 
     /// `logIecho`.
     pub(crate) fn iecho(&mut self, i: i32, nl: bool) {
-        if i == NIL {
+        self.echo(i, nl, |vm, i| vm.console_int(val(i)));
+    }
+
+    /// What the two echoes share: nil printed as such, then the end of
+    /// the line if asked.
+    fn echo(&mut self, v: i32, nl: bool, show: impl FnOnce(&mut Self, i32)) {
+        if v == NIL {
             self.host.console(b"NIL");
         } else {
-            self.console_int(val(i));
+            show(self, v);
         }
         if nl {
             self.host.console(b"\r\n");
@@ -74,24 +81,11 @@ impl<H: Host> Vm<'_, H> {
         src: i32,
         j: i32,
         lsrc: i32,
-        mut len: i32,
+        len: i32,
     ) {
-        if i < 0 || j < 0 || len <= 0 {
-            return;
+        if let Some(len) = fit(i, ldst, j, lsrc, len) {
+            self.copy_bytes(dst.wrapping_add(i), src.wrapping_add(j), len);
         }
-        if i.wrapping_add(len) > ldst {
-            len = ldst - i;
-        }
-        if len <= 0 {
-            return;
-        }
-        if j.wrapping_add(len) > lsrc {
-            len = lsrc - j;
-        }
-        if len <= 0 {
-            return;
-        }
-        self.copy_bytes(dst.wrapping_add(i), src.wrapping_add(j), len);
     }
 
     /// `sysCmp`.
@@ -110,40 +104,15 @@ impl<H: Host> Vm<'_, H> {
             return 0;
         }
         if i.wrapping_add(len) > ldst && j.wrapping_add(len) > lsrc {
-            len = if ldst - i > lsrc - j {
-                ldst - i
-            } else {
-                lsrc - j
-            };
+            len = (ldst - i).max(lsrc - j);
         }
-        let (mut d, mut s) = (dst.wrapping_add(i), src.wrapping_add(j));
-        while len > 0 {
-            len -= 1;
-            let (a, b) = (self.b(d), self.b(s));
-            if a > b {
-                return 1;
-            } else if a < b {
-                return -1;
-            }
-            d = d.wrapping_add(1);
-            s = s.wrapping_add(1);
-        }
-        0
+        self.memcmp(dst.wrapping_add(i), src.wrapping_add(j), len)
+            .signum()
     }
 
-    /// `mystrcmp`: zero when the `len` bytes are the same.
-    fn same(&self, a: i32, b: i32, len: i32) -> bool {
-        let mut i = 0;
-        while i < len {
-            if self.b(a.wrapping_add(i)) != self.b(b.wrapping_add(i)) {
-                return false;
-            }
-            i += 1;
-        }
-        true
-    }
-
-    /// `sysFind`.
+    /// `sysFind` going `forward` from `i`, `sysFindrev` going back: where
+    /// the `len` bytes from `j` in `src` are in `dst`, as an integer, or
+    /// nil.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn sys_find(
         &self,
@@ -154,47 +123,29 @@ impl<H: Host> Vm<'_, H> {
         j: i32,
         lsrc: i32,
         len: i32,
+        forward: bool,
     ) -> i32 {
         if j < 0 || j.wrapping_add(len) > lsrc {
             return NIL;
         }
         let src = src.wrapping_add(j);
-        if i < 0 {
-            i = 0;
-        }
-        while i.wrapping_add(len) <= ldst {
-            if self.same(dst.wrapping_add(i), src, len) {
-                return int(i);
-            }
-            i += 1;
-        }
-        NIL
-    }
-
-    /// `sysFindrev`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn sys_findrev(
-        &self,
-        dst: i32,
-        mut i: i32,
-        ldst: i32,
-        src: i32,
-        j: i32,
-        lsrc: i32,
-        len: i32,
-    ) -> i32 {
-        if j < 0 || j.wrapping_add(len) > lsrc {
-            return NIL;
-        }
-        let src = src.wrapping_add(j);
-        if i.wrapping_add(len) > ldst {
+        if forward {
+            i = i.max(0);
+        } else if i.wrapping_add(len) > ldst {
             i = ldst - len;
         }
-        while i >= 0 {
-            if self.same(dst.wrapping_add(i), src, len) {
+        let inside = |i: i32| {
+            if forward {
+                i.wrapping_add(len) <= ldst
+            } else {
+                i >= 0
+            }
+        };
+        while inside(i) {
+            if self.memcmp(dst.wrapping_add(i), src, len) == 0 {
                 return int(i);
             }
-            i -= 1;
+            i += if forward { 1 } else { -1 };
         }
         NIL
     }
@@ -268,79 +219,58 @@ impl<H: Host> Vm<'_, H> {
 
     /// `sysCtoa`.
     pub(crate) fn ctoa(&mut self, c: i32) {
-        let p = self.alloc_str(&[c as u8]);
-        self.push(pnt(p));
+        self.push_str(&[c as u8]);
     }
 
     /// `sysItoa`.
-    pub(crate) fn itoa(&mut self, mut v: i32) {
-        let mut res = [0u8; 16];
-        let mut n = 0;
-        if v == 0 {
-            res[n] = b'0';
-            n += 1;
-        } else {
-            let mut start = true;
-            if v < 0 {
-                v = v.wrapping_neg();
-                res[n] = b'-';
-                n += 1;
+    pub(crate) fn itoa(&mut self, v: i32) {
+        // The most negative number stays negative: no digit, as in the C.
+        let mut rest = if v < 0 { v.wrapping_neg() } else { v };
+        let digits = ITOA.iter().map(move |&unit| {
+            let mut k = 0;
+            while rest >= unit {
+                k += 1;
+                rest -= unit;
             }
-            for unit in ITOA {
-                let mut k = 0u8;
-                // The most negative number stays negative: no digit, as
-                // in the C.
-                while v >= unit {
-                    k += 1;
-                    v -= unit;
-                }
-                if k != 0 || !start {
-                    start = false;
-                    res[n] = b'0' + k;
-                    n += 1;
-                }
-            }
-        }
-        let p = self.alloc_str(&res[..n]);
-        self.push(pnt(p));
+            k
+        });
+        self.push_number(v < 0, digits);
     }
 
     /// `sysItoh`.
     pub(crate) fn itoh(&mut self, v: i32) {
+        self.push_number(false, (0..8).rev().map(|d| (v >> (4 * d)) & 15));
+    }
+
+    /// What `sysItoa` and `sysItoh` share: the sign, then the digits
+    /// without their leading zeros, "0" if nothing is left, pushed as a
+    /// string.
+    fn push_number(&mut self, minus: bool, digits: impl Iterator<Item = i32>) {
         let mut res = [0u8; 16];
         let mut n = 0;
-        if v == 0 {
+        if minus {
+            res[n] = b'-';
+            n += 1;
+        }
+        for d in digits.skip_while(|&d| d == 0) {
+            res[n] = hex_digit(d);
+            n += 1;
+        }
+        if n == 0 {
             res[n] = b'0';
             n += 1;
-        } else {
-            let mut start = true;
-            let mut imul = 28;
-            while imul >= 0 {
-                let c = (v >> imul) & 15;
-                if c != 0 || !start {
-                    start = false;
-                    res[n] = hex_digit(c);
-                    n += 1;
-                }
-                imul -= 4;
-            }
         }
-        let p = self.alloc_str(&res[..n]);
-        self.push(pnt(p));
+        self.push_str(&res[..n]);
     }
 
     /// `sysCtoh`.
     pub(crate) fn ctoh(&mut self, c: i32) {
-        let res = [hex_digit((c >> 4) & 15), hex_digit(c & 15)];
-        let p = self.alloc_str(&res);
-        self.push(pnt(p));
+        self.push_str(&[hex_digit((c >> 4) & 15), hex_digit(c & 15)]);
     }
 
     /// `sysItobin2`.
     pub(crate) fn itobin2(&mut self, c: i32) {
-        let res = [(c >> 8) as u8, c as u8];
-        let p = self.alloc_str(&res);
-        self.push(pnt(p));
+        self.push_str(&[(c >> 8) as u8, c as u8]);
     }
 
     /// `sysListswitch`: the value paired with `key` in a list of pairs.
@@ -384,48 +314,23 @@ impl<H: Host> Vm<'_, H> {
     /// `sysLoad`. As in the C, the bytes land at the start of the
     /// string, whatever the index says.
     pub(crate) fn sys_load(&mut self, dst: i32, i: i32, ldst: i32, j: i32, len: i32) -> i32 {
-        let Some(len) = Self::settings_len(i, ldst, j, len) else {
+        let Some(len) = fit(i, ldst, j, SETTINGS, len) else {
             return 0;
         };
-        let heap = crate::bytes_mut(&mut self.mem.heap);
-        if let Some(d) = usize::try_from(dst)
-            .ok()
-            .and_then(|at| heap.get_mut(at..at + len))
-        {
+        if let Some(d) = span_mut(crate::bytes_mut(&mut self.mem.heap), dst, len as usize) {
             self.host.settings_read(j as u32, d);
         }
-        len as i32
+        len
     }
 
     /// `sysSave`, with the same quirk.
     pub(crate) fn sys_save(&mut self, dst: i32, i: i32, ldst: i32, j: i32, len: i32) -> i32 {
-        let Some(len) = Self::settings_len(i, ldst, j, len) else {
+        let Some(len) = fit(i, ldst, j, SETTINGS, len) else {
             return 0;
         };
-        let heap = crate::bytes(&self.mem.heap);
-        let data = clip(heap, dst, len as i32);
+        let data = clip(crate::bytes(&self.mem.heap), dst, len);
         self.host.settings_write(j as u32, data);
-        len as i32
-    }
-
-    /// The bounds `sysLoad` and `sysSave` share.
-    fn settings_len(i: i32, ldst: i32, j: i32, mut len: i32) -> Option<usize> {
-        if j < 0 || i < 0 || len <= 0 {
-            return None;
-        }
-        if i.wrapping_add(len) > ldst {
-            len = ldst - i;
-        }
-        if len <= 0 {
-            return None;
-        }
-        if j.wrapping_add(len) > 4096 {
-            len = 4096 - j;
-        }
-        if len <= 0 {
-            return None;
-        }
-        Some(len as usize)
+        len
     }
 
     /// `sysRand`: a value between 0 and 65535.
@@ -438,7 +343,9 @@ impl<H: Host> Vm<'_, H> {
         self.rndval = seed;
     }
 
-    /// `sysCrypt` (`encode8`).
+    /// `sysCrypt` (`encode8`), or `sysUncrypt` (`decode8`) to `decode`:
+    /// each byte changed by the key the clear byte before it leaves.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn crypt(
         &mut self,
         src: i32,
@@ -447,6 +354,7 @@ impl<H: Host> Vm<'_, H> {
         lsrc: i32,
         key: i32,
         alpha: i32,
+        decode: bool,
     ) -> i32 {
         if index < 0 || index.wrapping_add(len) > lsrc || len <= 0 {
             return -1;
@@ -455,34 +363,17 @@ impl<H: Host> Vm<'_, H> {
         for k in 0..len {
             let at = src + index + k;
             let v = self.b(at);
-            self.set_b(
-                at,
-                alpha.wrapping_add(v.wrapping_mul(INV8[(key >> 1) as usize])),
-            );
-            key = v.wrapping_add(v).wrapping_add(1);
-        }
-        key as i32
-    }
-
-    /// `sysUncrypt` (`decode8`).
-    pub(crate) fn uncrypt(
-        &mut self,
-        src: i32,
-        index: i32,
-        len: i32,
-        lsrc: i32,
-        key: i32,
-        alpha: i32,
-    ) -> i32 {
-        if index < 0 || index.wrapping_add(len) > lsrc || len <= 0 {
-            return -1;
-        }
-        let (mut key, alpha) = (key as u8, alpha as u8);
-        for k in 0..len {
-            let at = src + index + k;
-            let v = self.b(at).wrapping_sub(alpha).wrapping_mul(key);
-            self.set_b(at, v);
-            key = v.wrapping_add(v).wrapping_add(1);
+            let (out, clear) = if decode {
+                let d = v.wrapping_sub(alpha).wrapping_mul(key);
+                (d, d)
+            } else {
+                (
+                    alpha.wrapping_add(v.wrapping_mul(INV8[(key >> 1) as usize])),
+                    v,
+                )
+            };
+            self.set_b(at, out);
+            key = clear.wrapping_add(clear).wrapping_add(1);
         }
         key as i32
     }
@@ -559,23 +450,13 @@ impl<H: Host> Vm<'_, H> {
     pub(crate) fn net_callback(&mut self, len: usize) {
         let p = self.alloc_bin(len as i32);
         let mut source = [0u8; 6];
-        {
-            let at = Self::start_bin(p);
-            let heap = crate::bytes_mut(&mut self.mem.heap);
-            match usize::try_from(at)
-                .ok()
-                .and_then(|at| heap.get_mut(at..at + len))
-            {
-                Some(dst) if p >= 0 => self.host.net_take(dst, &mut source),
-                _ => {
-                    let mut sink = [0u8; 0];
-                    self.host.net_take(&mut sink, &mut source);
-                }
-            }
+        let heap = crate::bytes_mut(&mut self.mem.heap);
+        match span_mut(heap, Self::start_bin(p), len) {
+            Some(dst) if p >= 0 => self.host.net_take(dst, &mut source),
+            _ => self.host.net_take(&mut [], &mut source),
         }
         self.push(pnt(p));
-        let q = self.alloc_str(&source);
-        self.push(pnt(q));
+        self.push_str(&source);
         self.push(self.cget(self.sys_start, SYS_CBTCP));
         if self.sget(0) != NIL {
             self.interp_go();
@@ -602,22 +483,16 @@ impl<H: Host> Vm<'_, H> {
         for i in 0..found {
             let r = self.host.net_scan_result(i);
             let n = r.ssid.iter().position(|&c| c == 0).unwrap_or(r.ssid.len());
-            let p = self.alloc_str(&r.ssid[..n]);
-            self.push(pnt(p));
-            let p = self.alloc_str(&r.mac);
-            self.push(pnt(p));
-            let p = self.alloc_str(&r.bssid);
-            self.push(pnt(p));
+            self.push_str(&r.ssid[..n]);
+            self.push_str(&r.mac);
+            self.push_str(&r.bssid);
             self.push(int(r.rssi as i32));
             self.push(int(r.channel as i32));
             self.push(int(r.rateset as i32));
             self.push(int(r.encryption as i32));
             self.stack_to_tab(7);
         }
-        self.push(NIL);
-        for _ in 0..found {
-            self.stack_to_tab(2);
-        }
+        self.stack_to_list(found as i32);
     }
 
     /// `netAuth`, with the C firmware's check that what the person chose
@@ -663,22 +538,22 @@ impl<H: Host> Vm<'_, H> {
     pub(crate) fn net_seq_add(&mut self, seq: i32, n: i32) {
         let s = self.slice_padded::<4>(seq);
         let v = u32::from_be_bytes(s).wrapping_add(n as u32);
-        let p = self.alloc_str(&v.to_be_bytes());
-        self.push(pnt(p));
+        self.push_str(&v.to_be_bytes());
     }
 
     /// `sysRfidgetList`.
     pub(crate) fn rfid_list(&mut self) {
         let n = self.host.rfid_count();
-        if n <= 0 {
-            self.push(NIL);
-            return;
-        }
         for i in 0..n {
             let id = self.host.rfid_nth(i);
-            let p = self.alloc_str(&id);
-            self.push(pnt(p));
+            self.push_str(&id);
         }
+        self.stack_to_list(n);
+    }
+
+    /// The top `n` words, the deepest first, become a list of pairs
+    /// ended by nil.
+    fn stack_to_list(&mut self, n: i32) {
         self.push(NIL);
         for _ in 0..n {
             self.stack_to_tab(2);
@@ -693,8 +568,7 @@ impl<H: Host> Vm<'_, H> {
             self.push(NIL);
             return;
         }
-        let p = self.alloc_str(&data);
-        self.push(pnt(p));
+        self.push_str(&data);
     }
 
     /// `sysI2cRead`. The C reads into a null pointer and returns the
@@ -704,15 +578,8 @@ impl<H: Host> Vm<'_, H> {
         let at = Self::start_bin(p);
         // The allocation takes the whole size, the device the low byte.
         let len = (size.max(0) as usize).min(size as u8 as usize);
-        let mut tries = 1000;
-        let heap = crate::bytes_mut(&mut self.mem.heap);
-        if let Some(data) = usize::try_from(at)
-            .ok()
-            .and_then(|at| heap.get_mut(at..at + len))
-        {
-            while tries > 0 && !self.host.i2c_read(address, data) {
-                tries -= 1;
-            }
+        if let Some(data) = span_mut(crate::bytes_mut(&mut self.mem.heap), at, len) {
+            (0..TRIES).any(|_| self.host.i2c_read(address, data));
         }
         self.push(pnt(p));
     }
@@ -721,10 +588,7 @@ impl<H: Host> Vm<'_, H> {
     pub(crate) fn i2c_write(&mut self, address: u8, data: i32, len: i32) {
         let heap = crate::bytes(&self.mem.heap);
         let data = clip(heap, data, len as u8 as i32);
-        let mut tries = 1000;
-        while tries > 0 && !self.host.i2c_write(address, data) {
-            tries -= 1;
-        }
+        (0..TRIES).any(|_| self.host.i2c_write(address, data));
     }
 
     /// `sysFlash`: the last checks before the flash erases itself. There
@@ -754,6 +618,35 @@ pub(crate) fn cstr(heap: &[u8], at: i32) -> &[u8] {
     let rest = heap.get(start..).unwrap_or(&[]);
     let n = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
     &rest[..n]
+}
+
+/// The bytes `[at, at + len)` of the heap, if they all are in it.
+fn span_mut(heap: &mut [u8], at: i32, len: usize) -> Option<&mut [u8]> {
+    usize::try_from(at)
+        .ok()
+        .and_then(|at| heap.get_mut(at..at + len))
+}
+
+/// The bounds `sysCpy`, `sysLoad` and `sysSave` share: `len` bytes from
+/// `i` in `ldst` and from `j` in `lsrc`, cut to what fits in both. None
+/// when nothing is left.
+fn fit(i: i32, ldst: i32, j: i32, lsrc: i32, mut len: i32) -> Option<i32> {
+    if i < 0 || j < 0 || len <= 0 {
+        return None;
+    }
+    if i.wrapping_add(len) > ldst {
+        len = ldst - i;
+    }
+    if len <= 0 {
+        return None;
+    }
+    if j.wrapping_add(len) > lsrc {
+        len = lsrc - j;
+    }
+    if len <= 0 {
+        return None;
+    }
+    Some(len)
 }
 
 /// The bytes `[at, at + len)` of the heap, cut where it ends.

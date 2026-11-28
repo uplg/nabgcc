@@ -622,12 +622,13 @@ impl<H: Host> Vm<'_, H> {
                 let r = match self.pull_two() {
                     Ok(s) => {
                         let len = val_or(s.len, s.lq.wrapping_sub(s.start));
-                        if op == STRFIND {
-                            self.sys_find(s.p, val(s.index), s.lp, s.q, s.start, s.lq, len)
+                        let forward = op == STRFIND;
+                        let index = if forward {
+                            val(s.index)
                         } else {
-                            let index = val_or(s.index, s.lp - 1);
-                            self.sys_findrev(s.p, index, s.lp, s.q, s.start, s.lq, len)
-                        }
+                            val_or(s.index, s.lp - 1)
+                        };
+                        self.sys_find(s.p, index, s.lp, s.q, s.start, s.lq, len, forward)
                     }
                     Err(_) => NIL,
                 };
@@ -1072,11 +1073,10 @@ impl<H: Host> Vm<'_, H> {
                 let alpha = val(self.pull());
                 let key = val(self.pull());
                 let r = match self.pull_span() {
-                    Some(s) => int(if op == CRYPT {
-                        self.crypt(s.at, s.index, s.len, s.size, key, alpha)
-                    } else {
-                        self.uncrypt(s.at, s.index, s.len, s.size, key, alpha)
-                    }),
+                    Some(s) => {
+                        let decode = op == UNCRYPT;
+                        int(self.crypt(s.at, s.index, s.len, s.size, key, alpha, decode))
+                    }
                     None => NIL,
                 };
                 self.sset(0, r);

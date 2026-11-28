@@ -547,7 +547,7 @@ impl<'m, H: Host> Vm<'m, H> {
             let d = (v >> (shift * 4)) & 15;
             if d != 0 || started || shift == 0 {
                 started = true;
-                buf[n] = b"0123456789abcdef"[d as usize];
+                buf[n] = natives::hex_digit(d as i32);
                 n += 1;
             }
         }
