@@ -34,6 +34,7 @@ impl<H: Host> Vm<'_, H> {
 
     /// A block's three header words: its size and kind, the collector's
     /// two cleared.
+    #[inline(always)]
     fn header(&mut self, p: i32, first: i32) {
         self.set(p, first);
         self.set(p + HEADER_GC, 0);
@@ -263,6 +264,9 @@ impl<H: Host> Vm<'_, H> {
 
     /// What both allocations do: room for `wsize` words, the header, the
     /// last word zeroed. -1 when there is no room.
+    // Inline, as the header: called, they cost a program that allocates
+    // much 2% of its time (measured).
+    #[inline(always)]
     fn alloc(&mut self, wsize: i32, first: i32) -> i32 {
         if !self.check(wsize) {
             return -1;
