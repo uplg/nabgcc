@@ -4,6 +4,7 @@ mod common;
 
 use common::{PASSPHRASE, terrier, under_test, until_every};
 use nabemu::DEFAULT_MAC;
+use nabemu::testing::is_lapin;
 
 #[test]
 fn boots_finds_its_wifi_stick_and_scans() {
@@ -67,8 +68,20 @@ fn blank_configuration_is_written_to_the_last_flash_sector() {
     let mut m = under_test();
     assert!(m.soc.flash[0x1F000..].iter().all(|&b| b == 0xFF));
     m.run_until_ms(1000);
-    assert_eq!(m.soc.flash_erases, 1);
     assert!(m.soc.flash_programs > 0);
+    let rules = &m.soc.flash_rules;
+    if is_lapin() {
+        // The sector is blank: written as it is (manual 20.5.5).
+        assert_eq!(m.soc.flash_erases, 0);
+        assert_eq!(rules.breaches, 0, "{:?}", rules.log);
+    } else {
+        // Known defect: r3 erases the sector again first, which the
+        // manual forbids (20.5.5: no erase twice with nothing written
+        // between). Nothing has shown what it costs.
+        assert_eq!(m.soc.flash_erases, 1);
+        assert_eq!(rules.breaches, 1);
+        assert!(rules.log[0].contains("erased twice"), "{:?}", rules.log);
+    }
     // The default server URL is the first thing in the configuration.
     assert!(m.soc.flash[0x1F000..].starts_with(b"r.nabaztag.com/vl\0"));
     // Nothing below the configuration sector was touched.

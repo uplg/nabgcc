@@ -100,6 +100,10 @@ fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
         image[RESCUE..],
         "the application written"
     );
+    // The sectors the cut left erased were written without a second
+    // erase (manual 20.5.5), and every command was timed as it says.
+    let rules = &m.soc.flash_rules;
+    assert_eq!(rules.breaches, 0, "the manual's rules: {:?}", rules.log);
     m.visitor = None;
     until(&mut m, 60_000, "the application back on its network", |m| {
         m.console().contains("4242")

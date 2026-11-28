@@ -215,8 +215,12 @@ fn every_driver_does_its_job() {
     // was; nothing else touched.
     assert!(console.contains("flash ok\n"), "{console}");
     assert!(m.soc.flash[0x1F000..].iter().all(|b| *b == 0xFF));
-    assert_eq!(m.soc.flash_erases, 2);
+    // The sector was blank: written without an erase, which the manual
+    // forbids twice in a row (20.5.5); one erase to put it back.
+    assert_eq!(m.soc.flash_erases, 1);
     assert_eq!(m.soc.flash_reads_while_busy, 0, "the routine ran from RAM");
+    let rules = &m.soc.flash_rules;
+    assert_eq!(rules.breaches, 0, "the manual's rules: {:?}", rules.log);
     let fresh = machine(&image);
     assert_eq!(m.soc.flash[..0x1F000], fresh.soc.flash[..0x1F000]);
 

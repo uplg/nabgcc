@@ -31,6 +31,30 @@ const WDTCNT: *mut u16 = 0xB7E0_0010 as *mut u16;
 // inline into their two callers. `lapin/build.sh` checks the result:
 // no branch out of the RAM code.
 
+/// Four dummy reads of the RAM (the stack), as the manual's example
+/// does (20.5.5): around a command, nothing may touch the flash for 8
+/// clocks, and the command's first byte may not follow the instruction
+/// that sets FLWE. Four loads take 12 clocks; written out here, they
+/// do not hang on what the compiler happens to put there.
+///
+/// # Safety
+/// As [`flash_wait`].
+#[inline(always)]
+unsafe fn settle() {
+    // SAFETY: loads from the top of the stack, which is RAM; the block
+    // is a barrier the compiler moves no access across.
+    unsafe {
+        core::arch::asm!(
+            "ldr {t}, [sp]",
+            "ldr {t}, [sp]",
+            "ldr {t}, [sp]",
+            "ldr {t}, [sp]",
+            t = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Wait for the flash's command to complete.
 ///
 /// # Safety
@@ -50,12 +74,35 @@ unsafe fn flash_command(command: u8) {
     // SAFETY: the command registers of the flash, the routine in RAM.
     unsafe {
         FLACON.write_volatile(0x03);
+        settle();
         COMMAND_1.write_volatile(0xAA);
         COMMAND_2.write_volatile(0x55);
         COMMAND_1.write_volatile(command);
     }
 }
 
+/// Whether the sector at `at` reads all ones.
+///
+/// # Safety
+/// As [`flash_wait`]; `at` is a sector of the flash.
+#[inline(always)]
+unsafe fn blank(at: *const u32) -> bool {
+    let mut i = 0;
+    while i < SECTOR / 4 {
+        // SAFETY: inside the sector.
+        if unsafe { at.add(i).read_volatile() } != u32::MAX {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Erase the sector at `at`. Never one that reads all ones: the
+/// manual forbids erasing a sector twice with nothing written between
+/// (20.5.5), and a sector all ones is one erased with nothing written
+/// since (this code never writes a word of all ones), ready as it is.
+///
 /// # Safety
 /// As [`flash_wait`]; `at` is a sector of the flash, which is erased.
 #[inline(always)]
@@ -66,6 +113,7 @@ unsafe fn erase_sector(at: *mut u8) {
         COMMAND_1.write_volatile(0xAA);
         COMMAND_2.write_volatile(0x55);
         at.write_volatile(0x30);
+        settle();
         flash_wait();
     }
 }
@@ -86,6 +134,7 @@ unsafe fn program_word(at: *mut u8, word: u32) {
         at.add(1).write_volatile((word >> 8) as u8);
         at.add(2).write_volatile((word >> 16) as u8);
         at.add(3).write_volatile((word >> 24) as u8);
+        settle();
         flash_wait();
     }
 }
@@ -103,7 +152,9 @@ unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
     let at = address as *mut u8;
     // SAFETY: interrupts are off (the caller's duty), this runs from RAM.
     unsafe {
-        erase_sector(at);
+        if !blank(at as *const u32) {
+            erase_sector(at);
+        }
         let mut i = 0;
         while i < SECTOR / 4 {
             program_word(at.add(4 * i), data.add(i).read_volatile());
@@ -138,7 +189,8 @@ unsafe fn image_word(image: *const u32, len: usize, offset: usize) -> u32 {
 /// millisecond, as the C's `flash_uc` does.
 ///
 /// A sector that already holds what it would be given is left alone
-/// (the manual guarantees a hundred rewrites); the rest of the last
+/// (the manual guarantees a hundred rewrites), one all ones is written
+/// without an erase (see [`erase_sector`]); the rest of the last
 /// sector past the image is erased (the C keeps the old bytes there;
 /// the header's length and CRC make them meaningless either way).
 ///
@@ -156,16 +208,22 @@ unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize, to: usi
         while sector < len {
             let at = (to + sector) as *mut u8;
             let mut same = true;
+            let mut blank = true;
             let mut offset = sector;
             while offset < sector + SECTOR {
                 let now = (at.add(offset - sector) as *const u32).read_volatile();
                 if now != image_word(image, len, offset) {
                     same = false;
                 }
+                if now != u32::MAX {
+                    blank = false;
+                }
                 offset += 4;
             }
             if !same {
-                erase_sector(at);
+                if !blank {
+                    erase_sector(at);
+                }
                 let mut offset = sector;
                 while offset < sector + SECTOR && offset < len {
                     program_word(at.add(offset - sector), image_word(image, len, offset));

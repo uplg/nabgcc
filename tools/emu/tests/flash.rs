@@ -46,6 +46,8 @@ fn flashes_a_new_firmware_over_the_air_and_boots_it() {
         m.soc.flash_reads_while_busy, 0,
         "nothing ran from the flash while it was busy"
     );
+    let rules = &m.soc.flash_rules;
+    assert_eq!(rules.breaches, 0, "the manual's rules: {:?}", rules.log);
 
     // The whole rewrite has to fit in one watchdog period (2.09 s): the
     // firmware does not feed the watchdog while it erases itself.

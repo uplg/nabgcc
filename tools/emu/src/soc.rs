@@ -124,6 +124,123 @@ struct FlashCtl {
     ended: bool,
 }
 
+/// The rules of manual 20.5.5 a program writing the flash must keep,
+/// checked as it runs: at least one instruction between setting FLWE
+/// and a command byte; no flash access in the 8 clocks before and after
+/// a command byte; no sector erased twice with nothing written between,
+/// no word written twice with no erase between. The flash keeps what
+/// it knows of its sectors across resets and power cuts.
+#[derive(Default)]
+pub struct FlashRules {
+    /// Breaches since the board was made, and the first few of them.
+    pub breaches: u64,
+    pub log: Vec<String>,
+    /// CPU clocks and instructions since the board was made.
+    clocks: u64,
+    instructions: u64,
+    /// The instruction under way read the flash, or wrote a command byte.
+    read_now: bool,
+    command_now: bool,
+    /// CPU clock at the end of the last instruction that read the flash.
+    read_end: u64,
+    /// The flash may not be read before this CPU clock.
+    command_until: u64,
+    /// Instructions done when FLACON was last written with FLWE set.
+    flwe_at: u64,
+    /// Sectors erased, with nothing written since (a bit each).
+    blank: u32,
+    /// Words written since their sector's last erase (a bit each).
+    written: Vec<u64>,
+}
+
+impl FlashRules {
+    fn new() -> Self {
+        FlashRules {
+            written: vec![0; FLASH_SIZE / 4 / 64],
+            ..Default::default()
+        }
+    }
+
+    /// The flash as a programmer leaves it: the chip erased, then
+    /// written with `flash`. Its words not all ones are written; a
+    /// sector left all ones is erased with nothing written since.
+    fn programmed(&mut self, flash: &[u8]) {
+        self.blank = 0;
+        self.written.fill(0);
+        for (at, word) in flash.chunks(4).enumerate() {
+            if word.iter().any(|&b| b != 0xFF) {
+                self.written[at / 64] |= 1 << (at % 64);
+            }
+        }
+        for (sector, bytes) in flash.chunks(SECTOR).enumerate() {
+            if bytes.iter().all(|&b| b == 0xFF) {
+                self.blank |= 1 << sector;
+            }
+        }
+    }
+
+    fn breach(&mut self, what: &str) {
+        self.breaches += 1;
+        if self.log.len() < 8 {
+            self.log.push(format!("{what} (CPU clock {})", self.clocks));
+        }
+    }
+
+    /// The end of an instruction that took `clocks`.
+    #[inline]
+    fn tick(&mut self, clocks: u64) {
+        self.clocks += clocks;
+        self.instructions += 1;
+        if self.read_now {
+            self.read_now = false;
+            self.read_end = self.clocks;
+        }
+        if self.command_now {
+            self.command_now = false;
+            self.command_until = self.clocks + 8;
+        }
+    }
+
+    /// A read of the flash, in the instruction under way.
+    #[inline]
+    fn read(&mut self) {
+        self.read_now = true;
+        if self.clocks < self.command_until {
+            self.breach("the flash read within 8 clocks after a command byte");
+        }
+    }
+
+    /// A command byte, written with FLWE set.
+    fn command(&mut self) {
+        if self.instructions - self.flwe_at <= 1 {
+            self.breach("a command byte right after the instruction setting FLWE");
+        }
+        if self.read_now || self.clocks < self.read_end + 8 {
+            self.breach("the flash read within 8 clocks before a command byte");
+        }
+        self.command_now = true;
+        self.command_until = u64::MAX;
+    }
+
+    fn erased(&mut self, sector: usize) {
+        if self.blank & 1 << sector != 0 {
+            self.breach("a sector erased twice with nothing written between");
+        }
+        self.blank |= 1 << sector;
+        let words = SECTOR / 4;
+        self.written[sector * words / 64..(sector + 1) * words / 64].fill(0);
+    }
+
+    fn wrote(&mut self, offset: usize) {
+        self.blank &= !(1 << (offset / SECTOR));
+        let word = offset / 4;
+        if self.written[word / 64] & 1 << (word % 64) != 0 {
+            self.breach("a word written twice with no erase between");
+        }
+        self.written[word / 64] |= 1 << (word % 64);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetCause {
     Watchdog,
@@ -350,6 +467,8 @@ pub struct Soc {
     /// Reads of the flash while it was erasing or programming. The real
     /// part answers garbage then; here they read as all ones.
     pub flash_reads_while_busy: u64,
+    /// The flash's rules of use (manual 20.5.5), and their breaches.
+    pub flash_rules: FlashRules,
     /// Lose power once this many flash operations (erases and word
     /// programs together) have completed since power-on.
     pub cut_power_after_flash_ops: Option<u64>,
@@ -435,6 +554,7 @@ impl Soc {
             flash_erase_ms: FLASH_ERASE_MS,
             flash_program_us: FLASH_PROGRAM_US,
             flash_reads_while_busy: 0,
+            flash_rules: FlashRules::new(),
             cut_power_after_flash_ops: None,
             flash_first_op: None,
             flash_last_op: 0,
@@ -486,6 +606,9 @@ impl Soc {
         self.cpu_cycle_rest = 0;
         self.pending_reset = None;
         self.flash_ctl = FlashCtl::default();
+        // The core stops with the reset: the command under way is lost.
+        self.flash_rules.command_now = false;
+        self.flash_rules.command_until = 0;
         self.ext = ExtBus::default();
         self.ext_wait = 0;
         self.ohci.reset();
@@ -495,6 +618,7 @@ impl Soc {
     pub fn load_flash(&mut self, image: &[u8]) {
         let n = image.len().min(FLASH_SIZE);
         self.flash[..n].copy_from_slice(&image[..n]);
+        self.flash_rules.programmed(&self.flash);
     }
 
     pub fn millis(&self) -> u64 {
@@ -535,6 +659,7 @@ impl Soc {
     /// fed again at the end as it would have been.
     pub(crate) fn skip(&mut self, cycles: u64, fed: bool) {
         self.cycles += cycles;
+        self.flash_rules.clocks += cycles;
         if fed && self.wdt.running {
             let now = self.cycles;
             self.watchdog_fed_at = now;
@@ -548,6 +673,7 @@ impl Soc {
         let spent = cycles as u64 + self.ext_wait;
         self.ext_wait_total += self.ext_wait;
         self.ext_wait = 0;
+        self.flash_rules.tick(spent);
         if self.cpu_hz == CLOCK_HZ {
             self.cycles += spent;
         } else {
@@ -1061,6 +1187,9 @@ impl Soc {
                 if v & 0x40 != 0 {
                     self.flash_ctl.state = FlashState::Idle;
                 }
+                if v & 1 != 0 {
+                    self.flash_rules.flwe_at = self.flash_rules.instructions;
+                }
                 self.regs.insert(addr, v & 0x11);
             }
             WDTCON => {
@@ -1228,6 +1357,7 @@ impl Soc {
             return;
         }
         let off = addr as usize & (FLASH_SIZE - 1);
+        self.flash_rules.command();
         use FlashState::*;
         let before = self.flash_erases + self.flash_programs;
         self.flash_ctl.state = match (self.flash_ctl.state, off, val) {
@@ -1242,6 +1372,7 @@ impl Soc {
                 self.flash[start..start + SECTOR].fill(0xFF);
                 self.flash_erases += 1;
                 self.flash_sector_erases[start / SECTOR % 32] += 1;
+                self.flash_rules.erased(start / SECTOR);
                 self.flash_ctl.busy_until = self.cycles + CLOCK_HZ * self.flash_erase_ms / 1000;
                 self.flash_ctl.started = true;
                 Idle
@@ -1250,6 +1381,7 @@ impl Soc {
                 // Programming can only clear bits.
                 self.flash[off] &= val;
                 if left == 1 {
+                    self.flash_rules.wrote(off);
                     self.flash_programs += 1;
                     self.flash_ctl.busy_until =
                         self.cycles + CLOCK_HZ * self.flash_program_us / 1_000_000;
@@ -1290,7 +1422,11 @@ impl Soc {
     /// back: code that keeps running from it, or reads it, is lost.
     #[inline]
     fn flash_is_away(&mut self, addr: u32) -> bool {
-        if addr >> 28 != 0 || self.cycles >= self.flash_ctl.busy_until {
+        if addr >> 28 != 0 {
+            return false;
+        }
+        self.flash_rules.read();
+        if self.cycles >= self.flash_ctl.busy_until {
             return false;
         }
         self.flash_reads_while_busy += 1;
@@ -1411,5 +1547,118 @@ impl Bus for Soc {
     #[inline]
     fn write32(&mut self, addr: u32, val: u32) {
         self.write::<4>(addr, val)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECTOR_5: u32 = FLASH_BASE + 5 * SECTOR as u32;
+    const SECTOR_6: u32 = SECTOR_5 + SECTOR as u32;
+    const C1: u32 = FLASH_BASE + 0x1_5554;
+    const C2: u32 = FLASH_BASE + 0xAAA8;
+
+    /// A board whose flash holds data up to sector 5, nothing from 6.
+    fn board() -> Soc {
+        let mut s = Soc::new();
+        s.load_flash(&vec![0x11; 6 * SECTOR]);
+        s
+    }
+
+    /// Store `bytes` (address, value), an instruction each, as the
+    /// manual's example: FLWE set, four dummy loads, the command, four
+    /// dummy loads again.
+    fn command(s: &mut Soc, bytes: &[(u32, u8)]) {
+        s.write8(FLACON, 3);
+        s.tick(2);
+        for _ in 0..4 {
+            s.tick(3);
+        }
+        for &(at, value) in bytes {
+            s.write8(at, value);
+            s.tick(2);
+        }
+        for _ in 0..4 {
+            s.tick(3);
+        }
+        // Long enough for the flash to be done.
+        s.tick(2_000_000);
+    }
+
+    fn erase(s: &mut Soc, sector: u32) {
+        let bytes = [(C1, 0xAA), (C2, 0x55), (C1, 0x80), (C1, 0xAA), (C2, 0x55)];
+        command(s, &[&bytes[..], &[(sector, 0x30)]].concat());
+    }
+
+    fn program(s: &mut Soc, at: u32, word: u32) {
+        let mut bytes = vec![(C1, 0xAA), (C2, 0x55), (C1, 0xA0)];
+        for (i, b) in word.to_le_bytes().into_iter().enumerate() {
+            bytes.push((at + i as u32, b));
+        }
+        command(s, &bytes);
+    }
+
+    #[test]
+    fn the_manuals_way_breaks_no_rule() {
+        let mut s = board();
+        erase(&mut s, SECTOR_5);
+        program(&mut s, SECTOR_5, 0x1234_5678);
+        program(&mut s, SECTOR_5 + 4, 0x9ABC_DEF0);
+        erase(&mut s, SECTOR_5);
+        // Sector 6 was left erased: written without an erase.
+        program(&mut s, SECTOR_6, 1);
+        assert_eq!(s.flash_rules.breaches, 0, "{:?}", s.flash_rules.log);
+        assert_eq!(s.flash[5 * SECTOR..5 * SECTOR + 4], [0xFF; 4]);
+        assert_eq!(s.flash[6 * SECTOR..6 * SECTOR + 4], [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_command_byte_right_after_flwe_is_set_is_a_breach() {
+        let mut s = board();
+        s.tick(20);
+        s.write8(FLACON, 3);
+        s.tick(2);
+        s.write8(C1, 0xAA);
+        assert_eq!(s.flash_rules.breaches, 1);
+        assert!(s.flash_rules.log[0].contains("FLWE"));
+    }
+
+    #[test]
+    fn the_flash_read_within_8_clocks_of_a_command_byte_is_a_breach() {
+        let mut s = board();
+        s.write8(FLACON, 3);
+        s.tick(2);
+        s.tick(3);
+        s.read32(FLASH_BASE);
+        s.tick(3);
+        s.tick(2);
+        s.write8(C1, 0xAA);
+        s.tick(2);
+        assert_eq!(s.flash_rules.breaches, 1, "before");
+        s.tick(3);
+        s.read16(FLASH_BASE);
+        assert_eq!(s.flash_rules.breaches, 2, "after");
+        s.tick(3);
+        s.tick(3);
+        s.read16(FLASH_BASE);
+        assert_eq!(s.flash_rules.breaches, 2, "8 clocks on");
+    }
+
+    #[test]
+    fn an_erase_of_an_erased_sector_is_a_breach_and_so_is_a_word_written_twice() {
+        let mut s = board();
+        // Sector 6 is blank, as the programmer left it.
+        erase(&mut s, SECTOR_6);
+        assert_eq!(s.flash_rules.breaches, 1);
+        erase(&mut s, SECTOR_5);
+        erase(&mut s, SECTOR_5);
+        assert_eq!(s.flash_rules.breaches, 2);
+        program(&mut s, SECTOR_5, 0xFFFF_0000);
+        program(&mut s, SECTOR_5, 0);
+        assert_eq!(s.flash_rules.breaches, 3);
+        // Words the programmer wrote count as written.
+        program(&mut s, FLASH_BASE, 0);
+        assert_eq!(s.flash_rules.breaches, 4, "{:?}", s.flash_rules.log);
     }
 }
