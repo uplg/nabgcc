@@ -1110,6 +1110,7 @@ impl Soc {
                 let mut pins = self.gpio_in[port];
                 if port == 1 {
                     // The codec's data request line.
+                    self.board.codec.now_us = self.cycles / (CLOCK_HZ / 1_000_000);
                     pins = (pins & !0x04)
                         | if self.board.codec.wants_data() {
                             0x04
@@ -1315,6 +1316,7 @@ impl Soc {
                 // The codec's two chip selects are active low.
                 let sci = self.reg(PO2) & 0x08 == 0;
                 let sdi = self.reg(PO11) & 0x01 == 0;
+                self.board.codec.now_us = self.cycles / (CLOCK_HZ / 1_000_000);
                 self.board.spi_write(bus, val as u8, sci, sdi);
             }
             a if a >= USB_BASE => {

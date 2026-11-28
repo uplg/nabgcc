@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 
 const REG_MODE: usize = 0;
+const REG_CLOCKF: usize = 3;
 const REG_DECODE_TIME: usize = 4;
 const REG_AUDATA: usize = 5;
 const REG_HDAT0: usize = 8;
@@ -160,6 +161,10 @@ pub struct Vs1003 {
     sci: Vec<u8>,
     reply: u8,
     now_ms: u64,
+    /// The board's time in µs, as it last told it (before each access).
+    pub now_us: u64,
+    /// DREQ stays down until then: the register write being carried out.
+    sci_busy_until_us: u64,
 }
 
 impl Default for Vs1003 {
@@ -193,6 +198,8 @@ impl Vs1003 {
             sci: Vec::new(),
             reply: 0,
             now_ms: 0,
+            now_us: 0,
+            sci_busy_until_us: 0,
         }
     }
 
@@ -202,6 +209,7 @@ impl Vs1003 {
         self.software_reset();
         self.recording = false;
         self.sci.clear();
+        self.sci_busy_until_us = 0;
     }
 
     fn software_reset(&mut self) {
@@ -225,9 +233,30 @@ impl Vs1003 {
         self.record_credit = 0;
     }
 
-    /// The data request pin: high when the chip can take more.
+    /// The data request pin: high when the chip can take more, and not
+    /// while it carries out a register write.
     pub fn wants_data(&self) -> bool {
-        !self.dead && FIFO_BYTES - self.buffered >= FIFO_MARGIN
+        !self.dead
+            && FIFO_BYTES - self.buffered >= FIFO_MARGIN
+            && self.now_us >= self.sci_busy_until_us
+    }
+
+    /// How long DREQ stays down after a write to `reg`: the data sheet's
+    /// worst case (its register table, in CLKI cycles, CLOCKF's in XTALI
+    /// ones), CLKI being the 12.288 MHz crystal times CLOCKF's SC_MULT.
+    fn write_time_us(&self, reg: usize) -> u64 {
+        const XTALI_HZ: u64 = 12_288_000;
+        let cycles: u64 = match reg {
+            0x0 => 70,
+            0x1 | 0x4 => 40,
+            0x2 | 0xB => 2100,
+            0x3 => return 11_000 * 1_000_000 / XTALI_HZ + 1,
+            0x5 | 0xA => 3200,
+            0x6 | 0x7 => 80,
+            _ => 50,
+        };
+        let clki = XTALI_HZ * (2 + (self.registers[REG_CLOCKF] >> 13) as u64) / 2;
+        (cycles * 1_000_000).div_ceil(clki)
     }
 
     /// Output attenuation of the left channel in half decibels: 0 is
@@ -285,6 +314,7 @@ impl Vs1003 {
     }
 
     fn write_register(&mut self, reg: usize, value: u16) {
+        self.sci_busy_until_us = self.now_us + self.write_time_us(reg);
         self.registers[reg] = value;
         if reg == REG_MODE && value & SM_OUTOFWAV != 0 && !matches!(self.play, Play::Mp3 { .. }) {
             // Stop a WAV or MIDI stream: what follows is skipped, the

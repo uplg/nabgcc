@@ -407,22 +407,28 @@ const GC: u8 = 87;
 const IECHOLN: u8 = 95;
 const RET: u8 = 1;
 
-/// A WAV header for 16-bit mono at 8 kHz, of `len` bytes of samples.
-fn wav_header(len: u32) -> Vec<u8> {
+/// A WAV header for 16-bit sound at `rate` hertz on `channels`, of
+/// `len` bytes of samples.
+fn wav_header_at(rate: u32, channels: u16, len: u32) -> Vec<u8> {
     let mut h = Vec::new();
     h.extend(b"RIFF");
     h.extend((len + 36).to_le_bytes());
     h.extend(b"WAVEfmt ");
     h.extend(16u32.to_le_bytes());
     h.extend(1u16.to_le_bytes());
-    h.extend(1u16.to_le_bytes());
-    h.extend(8000u32.to_le_bytes());
-    h.extend(16000u32.to_le_bytes());
-    h.extend(2u16.to_le_bytes());
+    h.extend(channels.to_le_bytes());
+    h.extend(rate.to_le_bytes());
+    h.extend((rate * 2 * channels as u32).to_le_bytes());
+    h.extend((2 * channels).to_le_bytes());
     h.extend(16u16.to_le_bytes());
     h.extend(b"data");
     h.extend(len.to_le_bytes());
     h
+}
+
+/// The same for 16-bit mono at 8 kHz.
+fn wav_header(len: u32) -> Vec<u8> {
+    wav_header_at(8000, 1, len)
 }
 
 /// Bytes the play callback hands over at a time.
@@ -449,10 +455,8 @@ fn player(stream: &[u8], eof: bool) -> Vec<u8> {
     cb.extend(metal::int(1));
     cb.extend([AND, ELSE, 0, 0]);
     let to_skip = cb.len() - 2;
-    cb.extend(metal::int(1));
-    cb.extend([GETGLOBALB, 0, GETGLOBALB, 1]);
-    cb.extend(metal::int(CHUNK as i32));
-    cb.extend([PLAYFEED, GETGLOBALB, 1, ADD, SETGLOBAL, DROP, GC, DROP]);
+    cb.extend(feed(CHUNK));
+    cb.extend([GC, DROP]);
     if eof {
         // Once it is all in (position minus length is 0, on which ELSE
         // jumps): playFeed nil, the C's play_eof.
@@ -478,6 +482,86 @@ fn player(stream: &[u8], eof: bool) -> Vec<u8> {
     )
 }
 
+/// Global 1 += playFeed stream (global 0) from global 1, `chunk` bytes.
+fn feed(chunk: usize) -> Vec<u8> {
+    let mut f = metal::int(1);
+    f.extend([GETGLOBALB, 0, GETGLOBALB, 1]);
+    f.extend(metal::int(chunk as i32));
+    f.extend([PLAYFEED, GETGLOBALB, 1, ADD, SETGLOBAL, DROP]);
+    f
+}
+
+/// Global 2 += 1.
+fn next_phase() -> Vec<u8> {
+    let mut f = metal::int(2);
+    f.extend([GETGLOBALB, 2]);
+    f.extend(metal::int(1));
+    f.extend([ADD, SETGLOBAL]);
+    f
+}
+
+/// A bytecode that plays `stream` as it would come from the network:
+/// two `chunk`s every `period_ms`, the first when due, the second at the
+/// next call but one (a call that gives nothing ends the machine's
+/// refill, and sits between), and the call after it, the last of that
+/// refill, sets the volume. Global 2 is the phase of the four calls,
+/// global 3 when the next two are due.
+fn streamer(stream: &[u8], chunk: usize, period_ms: i32) -> Vec<u8> {
+    let mut main = metal::int(7770);
+    main.extend([IECHOLN, DROP]);
+    main.extend(metal::int(1));
+    main.extend(metal::int(1));
+    main.extend([PLAYSTART, DROP, NIL, RET]);
+    let label = |cb: &mut Vec<u8>, at: usize| {
+        let here = cb.len() as u16;
+        cb[at..at + 2].copy_from_slice(&here.to_le_bytes());
+    };
+    // Phase 0 (global 2 & 3 is 0) to P0, phase 2 to P2.
+    let mut cb = vec![GETGLOBALB, 2];
+    cb.extend(metal::int(3));
+    cb.extend([AND, ELSE, 0, 0]);
+    let to_p0 = cb.len() - 2;
+    cb.extend([GETGLOBALB, 2]);
+    cb.extend(metal::int(1));
+    cb.extend([AND, ELSE, 0, 0]);
+    let to_p2 = cb.len() - 2;
+    // Phases 1 and 3 give nothing; after 3, the next two are due a
+    // period on.
+    cb.extend(next_phase());
+    cb.extend(metal::int(3));
+    cb.extend([AND, ELSE, 0, 0]);
+    let to_due = cb.len() - 2;
+    cb.extend([NIL, RET]);
+    label(&mut cb, to_due);
+    cb.extend(metal::int(3));
+    cb.push(TIME_MS);
+    cb.extend(metal::int(period_ms));
+    cb.extend([ADD, SETGLOBAL, DROP]);
+    // Then the volume set (again), last: the codec carries the write
+    // out with DREQ down, as the machine's refill ends.
+    cb.extend(metal::int(40));
+    cb.extend([SNDVOL, DROP, NIL, RET]);
+    // P0: the first chunk once due.
+    label(&mut cb, to_p0);
+    cb.extend([TIME_MS, GETGLOBALB, 3, LT, ELSE, 0, 0]);
+    let to_give = cb.len() - 2;
+    cb.extend([NIL, RET]);
+    label(&mut cb, to_give);
+    cb.extend(feed(chunk));
+    cb.extend(next_phase());
+    cb.extend([DROP, NIL, RET]);
+    // P2: the second chunk.
+    label(&mut cb, to_p2);
+    cb.extend(feed(chunk));
+    cb.extend(next_phase());
+    cb.extend([DROP, NIL, RET]);
+    let spare = [0u8; 4];
+    bytecode(
+        &[stream, &[], &[], &[], &spare, &spare, &spare, &spare],
+        &[fun(0, 4, &main), fun(1, 0, &cb)],
+    )
+}
+
 /// What the codec received of the last stream played.
 fn played(m: &Machine) -> Vec<u8> {
     let codec = &m.soc.board.codec;
@@ -497,6 +581,35 @@ fn a_pcm_stream(samples: usize) -> Vec<u8> {
     s
 }
 
+/// A mono WAV stream of format `tag` (1 PCM, 0x11 IMA ADPCM), `bits`
+/// a sample at `rate` hertz, `byte_rate` bytes a second: whole `chunk`s
+/// of about `len` bytes, the samples a sweep with no zero byte in it.
+fn a_wav_stream(
+    tag: u16,
+    bits: u16,
+    rate: u32,
+    byte_rate: u32,
+    len: usize,
+    chunk: usize,
+) -> Vec<u8> {
+    let len = (44 + len).div_ceil(chunk) * chunk - 44;
+    let mut s = Vec::new();
+    s.extend(b"RIFF");
+    s.extend((len as u32 + 36).to_le_bytes());
+    s.extend(b"WAVEfmt ");
+    s.extend(16u32.to_le_bytes());
+    s.extend(tag.to_le_bytes());
+    s.extend(1u16.to_le_bytes());
+    s.extend(rate.to_le_bytes());
+    s.extend(byte_rate.to_le_bytes());
+    s.extend(1u16.to_le_bytes());
+    s.extend(bits.to_le_bytes());
+    s.extend(b"data");
+    s.extend((len as u32).to_le_bytes());
+    s.extend((0..len).map(|i| (i % 251) as u8 + 1));
+    s
+}
+
 /// The C writes the byte it took from the ring whatever happened in the
 /// bytecode's refill; lapin re-checked the codec's DREQ and dropped the
 /// byte when a collection in the callback had filled the codec meanwhile
@@ -509,6 +622,30 @@ fn no_byte_of_a_stream_is_lost_to_a_slow_play_callback() {
     wait(&mut m, 6000);
     let got = played(&m);
     assert!(got.len() > stream.len() / 2, "{} bytes played", got.len());
+    let n = got.len().min(stream.len());
+    let first_wrong = (0..n).find(|&i| got[i] != stream[i]);
+    assert_eq!(first_wrong, None, "{} bytes played", got.len());
+}
+
+/// The same end to end with a codec that is slow to take its last
+/// register write (A14): a stream that comes as from the network, two
+/// chunks at a time, the codec run dry in between, whose callback sets
+/// the volume as it ends the machine's refill. DREQ is down while the
+/// codec carries the write out (its data sheet's worst case, 43 µs
+/// here), when the machine has the byte it took after the refill:
+/// lapin dropped it, here at the second chunk's first byte, and every
+/// 16-bit sample after it was swapped. It now waits in the ring.
+#[test]
+fn no_byte_of_a_stream_is_lost_to_a_codec_still_busy_after_the_refill() {
+    // 16-bit mono at 8 kHz, 16 bytes a millisecond: the two chunks play
+    // in 150 ms of the 200.
+    let chunk = 1200;
+    let stream = a_wav_stream(1, 16, 8000, 16_000, 4 * chunk, chunk);
+    let mut m = common::serving(&nabemu::testing::image(), &streamer(&stream, chunk, 200));
+    until(&mut m, 60_000, "the sound", |m| played(m).len() > 1000);
+    wait(&mut m, 500);
+    let got = played(&m);
+    assert!(got.len() >= 3 * chunk, "{} bytes played", got.len());
     let n = got.len().min(stream.len());
     let first_wrong = (0..n).find(|&i| got[i] != stream[i]);
     assert_eq!(first_wrong, None, "{} bytes played", got.len());
