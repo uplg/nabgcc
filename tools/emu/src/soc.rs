@@ -1264,8 +1264,9 @@ impl Soc {
             || (USB_BASE..ohci::RAM_BASE).contains(&addr)
     }
 
-    #[inline]
-    fn mem(&mut self, addr: u32, len: u32) -> Option<&mut [u8]> {
+    /// The `N` bytes of memory at `addr`, if memory is there.
+    #[inline(always)]
+    fn mem<const N: usize>(&mut self, addr: u32) -> Option<&mut [u8; N]> {
         let (buf, off) = match addr >> 28 {
             0x0 if addr < 0x0800_0000 => (&mut self.flash, addr),
             0x0 => (&mut self.flash, addr - FLASH_BASE),
@@ -1275,7 +1276,67 @@ impl Soc {
             _ => return None,
         };
         let off = off as usize;
-        buf.get_mut(off..off + len as usize)
+        buf.get_mut(off..off + N)?.try_into().ok()
+    }
+
+    /// A read of `N` bytes (1, 2 or 4) from the processor's bus, zero
+    /// extended. The width is a constant so that each of [`Bus`]'s
+    /// reads compiles to its own straight path.
+    #[inline(always)]
+    fn read<const N: usize>(&mut self, addr: u32) -> u32 {
+        if self.flash_is_away(addr) {
+            return !0;
+        }
+        if addr >= XRAM_BASE && !self.external(addr, N as u32, false) {
+            return 0;
+        }
+        if let Some(m) = self.mem::<N>(addr) {
+            let mut b = [0u8; 4];
+            b[..N].copy_from_slice(m);
+            return u32::from_le_bytes(b);
+        }
+        if Self::is_mmio(addr) {
+            return if N == 4 {
+                self.mmio_read(addr)
+            } else {
+                self.mmio_read(addr & !3) >> ((addr & (4 - N as u32)) * 8)
+            };
+        }
+        self.fault(addr);
+        0
+    }
+
+    /// A write of the low `N` bytes (1, 2 or 4) of `val`. Only bytes
+    /// reach the flash: wider stores to it are dropped.
+    #[inline(always)]
+    fn write<const N: usize>(&mut self, addr: u32, val: u32) {
+        if addr >= XRAM_BASE && !self.external(addr, N as u32, true) {
+            return;
+        }
+        if addr >> 28 == 0 {
+            if N == 1 {
+                self.touched += 1;
+                self.flash_store(addr, val as u8);
+            }
+            return;
+        }
+        if let Some(m) = self.mem::<N>(addr) {
+            let b = val.to_le_bytes();
+            if m[..] != b[..N] {
+                m.copy_from_slice(&b[..N]);
+                self.touched += 1;
+            }
+        } else if Self::is_mmio(addr) {
+            if N == 4 {
+                self.mmio_write(addr, val, !0);
+            } else {
+                let sh = (addr & (4 - N as u32)) * 8;
+                let mask = !0u32 >> (32 - 8 * N as u32);
+                self.mmio_write(addr & !3, val << sh, mask << sh);
+            }
+        } else {
+            self.fault(addr);
+        }
     }
 
     fn fault(&mut self, addr: u32) {
@@ -1286,118 +1347,31 @@ impl Soc {
 impl Bus for Soc {
     #[inline]
     fn read8(&mut self, addr: u32) -> u8 {
-        if self.flash_is_away(addr) {
-            return !0;
-        }
-        if addr >= XRAM_BASE && !self.external(addr, 1, false) {
-            return 0;
-        }
-        if let Some(m) = self.mem(addr, 1) {
-            return m[0];
-        }
-        if Self::is_mmio(addr) {
-            return (self.mmio_read(addr & !3) >> ((addr & 3) * 8)) as u8;
-        }
-        self.fault(addr);
-        0
+        self.read::<1>(addr) as u8
     }
 
     #[inline]
     fn read16(&mut self, addr: u32) -> u16 {
-        if self.flash_is_away(addr) {
-            return !0;
-        }
-        if addr >= XRAM_BASE && !self.external(addr, 2, false) {
-            return 0;
-        }
-        if let Some(m) = self.mem(addr, 2) {
-            return u16::from_le_bytes([m[0], m[1]]);
-        }
-        if Self::is_mmio(addr) {
-            return (self.mmio_read(addr & !3) >> ((addr & 2) * 8)) as u16;
-        }
-        self.fault(addr);
-        0
+        self.read::<2>(addr) as u16
     }
 
     #[inline]
     fn read32(&mut self, addr: u32) -> u32 {
-        if self.flash_is_away(addr) {
-            return !0;
-        }
-        if addr >= XRAM_BASE && !self.external(addr, 4, false) {
-            return 0;
-        }
-        if let Some(m) = self.mem(addr, 4) {
-            return u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
-        }
-        if Self::is_mmio(addr) {
-            return self.mmio_read(addr);
-        }
-        self.fault(addr);
-        0
+        self.read::<4>(addr)
     }
 
     #[inline]
     fn write8(&mut self, addr: u32, val: u8) {
-        if addr >= XRAM_BASE && !self.external(addr, 1, true) {
-            return;
-        }
-        if addr >> 28 == 0 {
-            self.touched += 1;
-            return self.flash_store(addr, val);
-        }
-        if let Some(m) = self.mem(addr, 1) {
-            if m[0] != val {
-                m[0] = val;
-                self.touched += 1;
-            }
-        } else if Self::is_mmio(addr) {
-            let sh = (addr & 3) * 8;
-            self.mmio_write(addr & !3, (val as u32) << sh, 0xFF << sh);
-        } else {
-            self.fault(addr);
-        }
+        self.write::<1>(addr, val as u32)
     }
 
     #[inline]
     fn write16(&mut self, addr: u32, val: u16) {
-        if addr >= XRAM_BASE && !self.external(addr, 2, true) {
-            return;
-        }
-        if addr >> 28 == 0 {
-            return;
-        }
-        if let Some(m) = self.mem(addr, 2) {
-            if *m != val.to_le_bytes() {
-                m.copy_from_slice(&val.to_le_bytes());
-                self.touched += 1;
-            }
-        } else if Self::is_mmio(addr) {
-            let sh = (addr & 2) * 8;
-            self.mmio_write(addr & !3, (val as u32) << sh, 0xFFFF << sh);
-        } else {
-            self.fault(addr);
-        }
+        self.write::<2>(addr, val as u32)
     }
 
     #[inline]
     fn write32(&mut self, addr: u32, val: u32) {
-        if addr >= XRAM_BASE && !self.external(addr, 4, true) {
-            return;
-        }
-        if addr >> 28 == 0 {
-            return;
-        }
-        if let Some(m) = self.mem(addr, 4) {
-            if *m != val.to_le_bytes() {
-                m.copy_from_slice(&val.to_le_bytes());
-                self.touched += 1;
-            }
-        } else if Self::is_mmio(addr) {
-            self.mmio_write(addr, val, 0xFFFF_FFFF);
-        } else {
-            self.fault(addr);
-        }
+        self.write::<4>(addr, val)
     }
 }
