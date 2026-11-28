@@ -9,6 +9,9 @@ step() { printf '\n== %s\n' "$*"; }
 cd "$root/lapin"
 step "lapin: portable crates and the firmware"
 cargo test --profile host -p lapin-p256 -p lapin-core -p lapin-metal -p lapin-metal-cref
+# The fuzzing harness's own tests: its access point must still take a
+# station through every kind of network.
+(cd fuzz && cargo test --release)
 ./build.sh
 
 cd "$root/tools/emu"
