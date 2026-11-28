@@ -512,3 +512,180 @@ fn the_end_of_a_stream_is_flushed_and_the_amplifier_switched_off() {
         assert!(m.soc.board.amplifier, "Known defect: amplifier left on");
     }
 }
+
+// ---- the tag reader -------------------------------------------------------
+
+const TIME_MS: u8 = 53;
+
+/// Milliseconds `calls` of `call` take on `image` with a tag in front
+/// of the nose, as the bytecode times them.
+fn rfid_ms(image: &[u8], call: &[u8], calls: usize) -> u64 {
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.push(TIME_MS);
+    for _ in 0..calls {
+        f.extend_from_slice(call);
+    }
+    f.extend([TIME_MS, SUB, IECHOLN, RET]);
+    let mut m = common::serving(image, &metal::bytecode(&[], &f));
+    m.soc.board.rfid.tags = vec![nabemu::rfid::Tag::new(common::UID)];
+    until(&mut m, 60_000, "the timing", |m| {
+        common::time_printed(m).is_some()
+    });
+    common::time_printed(&m).unwrap()
+}
+
+/// The tag reader's calls take as long as r3's, within 10 % (A15): the
+/// C's pauses, as long as its own, and no more of them. lapin took two
+/// and a half times as long.
+#[test]
+fn the_tag_reader_is_as_quick_as_r3s() {
+    let Some(lapin) = common::lapin() else { return };
+    let get = [metal::OP_RFID_GET, DROP];
+    let mut read = vec![metal::OP_RFID_GET];
+    read.extend(metal::int(1));
+    read.extend([metal::OP_RFID_READ, DROP]);
+    for (name, call) in [("rfidGet", &get[..]), ("rfidRead", &read[..])] {
+        let r3 = rfid_ms(&common::r3(), call, 40) as f64 / 40.0;
+        let ours = rfid_ms(&lapin, call, 40) as f64 / 40.0;
+        eprintln!("{name}: r3 {r3:.2} ms, lapin {ours:.2} ms");
+        assert!(
+            ours <= r3 * 1.1,
+            "{name}: r3 {r3:.2} ms, lapin {ours:.2} ms"
+        );
+    }
+}
+
+// ---- more of r3's defects --------------------------------------------------
+
+const WAV2ALAW: u8 = 141;
+const SNDVOL: u8 = 100;
+const LT: u8 = 24;
+
+/// Known defect (B36): wav2alaw with a negative length writes over the
+/// heap and r3 restarts, and restarts again as the server gives it the
+/// same bytecode. lapin converts nothing and carries on.
+#[test]
+fn a_negative_length_to_wav2alaw_is_nothing_to_convert() {
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.extend([GETGLOBALB, 0]);
+    f.extend(metal::int(0));
+    f.extend([GETGLOBALB, 1]);
+    f.extend(metal::int(0));
+    f.extend(metal::int(-200));
+    f.extend(metal::int(0));
+    f.extend([WAV2ALAW, DROP]);
+    f.extend(metal::int(8880));
+    f.extend([IECHOLN, RET]);
+    let bytecode = metal::bytecode(&[&[0; 64], &[0x55; 64]], &f);
+    let mut m = common::serving(&nabemu::testing::image(), &bytecode);
+    wait(&mut m, 30_000);
+    if is_lapin() {
+        assert!(m.console().contains("8880"), "{}", m.console());
+        assert_eq!(m.events, []);
+    } else {
+        assert!(!m.events.is_empty(), "Known defect: r3 restarts");
+    }
+}
+
+/// A codec that never raises DREQ (M8). Known defect: r3 waits for it
+/// for ever, at its start, feeding the watchdog: no bytecode, no
+/// network. lapin gives up after half a second once, then no longer
+/// waits: ten volume changes take no time.
+#[test]
+fn a_dead_codec_costs_half_a_second_once() {
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    f.push(TIME_MS);
+    for _ in 0..10 {
+        f.extend(metal::int(40));
+        f.extend([SNDVOL, DROP]);
+    }
+    f.extend([TIME_MS, SUB, IECHOLN, RET]);
+    let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&[], &f));
+    m.soc.board.codec.dead = true;
+    if !is_lapin() {
+        wait(&mut m, 30_000);
+        assert!(
+            m.lan.as_ref().unwrap().requests.is_empty(),
+            "Known defect: r3 never gets as far as its server"
+        );
+        return;
+    }
+    until(&mut m, 60_000, "the timing", |m| {
+        common::time_printed(m).is_some()
+    });
+    let ms = common::time_printed(&m).unwrap();
+    assert!(ms < 20, "ten volume changes took {ms} ms");
+}
+
+/// The rescue core's network, then the application, with the stick
+/// powered throughout (I3): the C never cleared the stick's beacon
+/// registers, lapin did not either, and the application kept sending the
+/// rescue network's beacons. They stop at the application's start.
+#[test]
+fn the_rescue_networks_beacons_stop_with_the_application() {
+    if !is_lapin() {
+        return;
+    }
+    let image = nabemu::testing::image();
+    let app = image[common::RESCUE..common::RESCUE + 4096].to_vec();
+    let mut m = common::without_application(&image);
+    wait(&mut m, 2000);
+    let beacons = |m: &Machine| {
+        m.radio
+            .borrow()
+            .tx
+            .iter()
+            .filter(|f| f.data[0] == 0x80 && common::find(&f.data, b"Nabaztag-secours").is_some())
+            .count()
+    };
+    assert!(beacons(&m) > 0, "the rescue network beacons");
+    // The application back in its place, and a restart (the watchdog's,
+    // the stick keeps its power and its registers).
+    m.soc.flash[common::RESCUE..common::RESCUE + 4096].copy_from_slice(&app);
+    m.soc.pending_reset = Some(nabemu::soc::ResetCause::Watchdog);
+    until(&mut m, 20_000, "the application", |m| {
+        m.console().contains("lapin 0.1")
+    });
+    wait(&mut m, 3000);
+    m.radio.borrow_mut().tx.clear();
+    wait(&mut m, 3000);
+    assert_eq!(beacons(&m), 0, "still beaconing for the rescue core");
+}
+
+/// The processor seeing the interrupt line late (I1): an interrupt whose
+/// source went away is taken, and the controller names source 0, the
+/// system timer. lapin counted a millisecond for each: its clock ran
+/// ahead of the board's. Now its clock never runs ahead.
+#[test]
+fn an_illegal_interrupt_is_no_millisecond() {
+    // Wait in the bytecode until its clock says 30 s, say so, then
+    // until it says 40 s, and say so.
+    let mut f = metal::FUNCTION_HEADER.to_vec();
+    for (until_ms, say) in [(30_000, 731_731), (40_000, 937_937)] {
+        let top = (f.len() - 3) as u16;
+        f.push(TIME_MS);
+        f.extend(metal::int(until_ms));
+        f.extend([LT, ELSE, 0, 0]);
+        let to_end = f.len() - 2;
+        f.push(GOTO);
+        f.extend(top.to_le_bytes());
+        let end = (f.len() - 3) as u16;
+        f[to_end..to_end + 2].copy_from_slice(&end.to_le_bytes());
+        f.extend(metal::int(say));
+        f.extend([IECHOLN, DROP]);
+    }
+    f.extend([NIL, RET]);
+    let mut m = common::serving(&nabemu::testing::image(), &metal::bytecode(&[], &f));
+    m.soc.irq_lag = true;
+    let first = common::until_every(&mut m, 1, 60_000, "30 s", |m| {
+        m.console().contains("\n731731")
+    });
+    let second = common::until_every(&mut m, 1, 30_000, "40 s", |m| {
+        m.console().contains("\n937937")
+    });
+    let board = second - first;
+    assert!(
+        board + 2 >= 10_000,
+        "10 s on the rabbit's clock in {board} ms"
+    );
+}

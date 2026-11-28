@@ -15,12 +15,15 @@ struct Codec {
     played: Vec<u8>,
     amplifier: bool,
     resets: u32,
+    console: Vec<u8>,
 }
 
 struct Reset;
 
 impl Host for Codec {
-    fn console(&mut self, _: &[u8]) {}
+    fn console(&mut self, text: &[u8]) {
+        self.console.extend_from_slice(text);
+    }
     fn time_ms(&mut self) -> u32 {
         // Time passes as it is looked at; the codec plays meanwhile.
         self.now += 1;
@@ -292,4 +295,30 @@ fn the_end_of_a_stream_is_flushed_then_the_amplifier_goes_off() {
     assert_eq!(tail.len(), 2048);
     assert!(tail.iter().all(|b| *b == 0));
     assert!(!codec.amplifier);
+}
+
+/// recVol from a negative start: the C reads the 256 bytes before the
+/// string (B38); 0 here, as from a start too close to its end.
+#[test]
+fn rec_vol_from_a_negative_start_is_0() {
+    let block = [0x77u8; 512];
+    let mut main = Vec::new();
+    for start in [-256, -1, 0, 300] {
+        main.extend([GETGLOBALB as u8, 0]);
+        main.extend(int(start));
+        main.extend([RECVOL as u8, IECHOLN as u8, DROP as u8]);
+    }
+    main.extend([NIL_ as u8, RET as u8]);
+    let mut mem: Box<Memory> = unsafe {
+        let layout = std::alloc::Layout::new::<Memory>();
+        Box::from_raw(std::alloc::alloc_zeroed(layout) as *mut Memory)
+    };
+    let mut vm = Vm::new(Codec::default(), &mut mem);
+    vm.boot(&bytecode(&[&block], &[fun(0, &main)]));
+    let console = String::from_utf8(vm.into_host().console).unwrap();
+    let values: Vec<&str> = console.lines().collect();
+    assert_eq!(values[0], "0");
+    assert_eq!(values[1], "0");
+    assert_ne!(values[2], "0", "a real block is loud");
+    assert_eq!(values[3], "0");
 }
