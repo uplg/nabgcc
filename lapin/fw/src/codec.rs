@@ -1,6 +1,7 @@
 //! The VLSI VS1003 audio codec: it decodes what it is fed (MP3, WAV,
 //! MIDI) to the loudspeaker, and records the microphone as ADPCM.
 
+use crate::sync::Shared;
 use crate::{board, spi, timer, watchdog};
 
 const READ: u8 = 0x03;
@@ -22,13 +23,30 @@ const MODE_BASE: u16 = 0x0C00;
 const MODE_RESET: u16 = 0x0004;
 const MODE_RECORD: u16 = 0x3000;
 
+/// The chip gave no DREQ for half a second: taken for dead until it
+/// shows one again.
+static DEAD: Shared<bool> = Shared::new(false);
+
 /// Wait for the chip to take more, at most half a second: a codec that
 /// never answers (the C waits for ever, feeding the watchdog) leaves a
-/// rabbit without sound, not a frozen one.
+/// rabbit without sound, not a frozen one. Once it has failed so, it is
+/// not waited for again until it raises DREQ: every command would
+/// otherwise cost half a second, the main loop two turns a second.
 fn wait_ready() {
+    if board::codec_wants_data() {
+        DEAD.set(false);
+        return;
+    }
+    if DEAD.get() {
+        return;
+    }
     let start = timer::millis();
-    while !board::codec_wants_data() && timer::since(start) < 500 {
+    while !board::codec_wants_data() {
         watchdog::feed();
+        if timer::since(start) >= 500 {
+            DEAD.set(true);
+            return;
+        }
     }
 }
 
@@ -84,10 +102,14 @@ pub fn reset() {
 pub fn init() {
     // The chip only takes a slow clock until its own is multiplied.
     spi::CODEC.set_divider(8);
+    // The chip wants its reset held two of its clock cycles and is then
+    // busy 1.35 to 4 ms with DREQ down (data sheet, XRESET timings),
+    // which `wait_ready` waits out: the C's DelayMs(1), up to the next
+    // tick, around each edge is plenty.
     board::codec_reset(true);
-    timer::delay_ms(1);
+    timer::wait_ticks(1);
     board::codec_reset(false);
-    timer::delay_ms(1);
+    timer::wait_ticks(1);
     write(CLOCK, 0xC000);
     spi::CODEC.set_divider(2);
     reset();

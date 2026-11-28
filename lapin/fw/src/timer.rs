@@ -79,3 +79,10 @@ pub fn delay_ms(ms: u32) {
         }
     }
 }
+
+/// Wait for the `n`-th tick from now: between `n - 1` and `n`
+/// milliseconds, as the C's `DelayMs`. For waits that are a courtesy
+/// to a chip that tells when it is ready, not a requirement.
+pub fn wait_ticks(n: u32) {
+    delay_ms(n.saturating_sub(1));
+}
