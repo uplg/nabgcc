@@ -701,6 +701,12 @@ impl Station {
         24
     }
 
+    /// The same, from the station to the access point.
+    fn header_to_ap(&mut self, link: &impl Link, fc0: u8, fc1: u8) -> usize {
+        let (own, ap, bssid) = (link.mac(), self.ap, self.bssid);
+        self.header(&own, fc0, fc1, &ap, &bssid)
+    }
+
     /// Fill in the duration and send `tx[..len]` as a management frame
     /// at the lowest rate, protected in software if `protect`.
     fn send_management(&mut self, link: &mut impl Link, len: usize, protect: bool) -> bool {
@@ -798,9 +804,7 @@ impl Station {
     }
 
     fn associate(&mut self, link: &mut impl Link) {
-        let own = link.mac();
-        let (ap, bssid) = (self.ap, self.bssid);
-        let at = self.header(&own, 0x00, 0, &ap, &bssid);
+        let at = self.header_to_ap(link, 0x00, 0);
         // Capabilities (ESS), listen interval 100.
         let at = put(&mut self.tx, at, &[0x01, 0x00, 0x64, 0x00]);
         let at = put_element(&mut self.tx, at, 0, &self.ssid[..self.ssid_len]);
@@ -1668,9 +1672,7 @@ impl Station {
         let body = &frame[24..len - ccmp::OVERHEAD];
         match *body {
             [8, 0, a, b, ..] => {
-                let own = link.mac();
-                let (ap, bssid) = (self.ap, self.bssid);
-                let at = self.header(&own, 0xD0, 0, &ap, &bssid);
+                let at = self.header_to_ap(link, 0xD0, 0);
                 let at = put(&mut self.tx, at, &[8, 1, a, b]);
                 self.send_management(link, at, true);
             }
@@ -1712,9 +1714,7 @@ impl Station {
             q.sent += 1;
         }
         q.next = link.millis().wrapping_add(SA_QUERY_RETRY_MS);
-        let own = link.mac();
-        let (ap, bssid) = (self.ap, self.bssid);
-        let at = self.header(&own, 0xD0, 0, &ap, &bssid);
+        let at = self.header_to_ap(link, 0xD0, 0);
         let at = put(&mut self.tx, at, &[8, 0, id[0], id[1]]);
         self.send_management(link, at, true);
     }
@@ -1742,9 +1742,7 @@ impl Station {
                     self.state = State::Idle;
                     return;
                 };
-                let own = link.mac();
-                let (ap, bssid) = (self.ap, self.bssid);
-                let at = self.header(&own, 0xB0, 0x40, &ap, &bssid);
+                let at = self.header_to_ap(link, 0xB0, 0x40);
                 let at = put(&mut self.tx, at, &[1, 0, 3, 0, 0, 0]);
                 let n = put_element(&mut self.tx, at, 16, challenge);
                 let Security::Wep { long, .. } = self.security else {
@@ -2607,9 +2605,7 @@ impl Station {
     /// An authentication frame with `body`; `token` goes where the
     /// access point wants it (after the group, or in a container).
     fn send_sae(&mut self, link: &mut impl Link, body: &[u8], token: &[u8]) {
-        let own = link.mac();
-        let (ap, bssid) = (self.ap, self.bssid);
-        let at = self.header(&own, 0xB0, 0, &ap, &bssid);
+        let at = self.header_to_ap(link, 0xB0, 0);
         let h2e = matches!(self.security, Security::Sae { h2e: true });
         let n = if token.is_empty() || h2e {
             let n = put(&mut self.tx, at, body);
