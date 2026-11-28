@@ -92,11 +92,13 @@ const I2CDR: u32 = 0xB780_0C0C;
 /// Bus address of the RFID reader, the only I2C device on the board.
 const CRX14_ADDRESS: u8 = 0xA0;
 
-/// Time a sector erase keeps the flash busy. With 1024 word programs
-/// this adds up to the 63 ms per sector the firmware's comments quote.
-const ERASE_CYCLES: u64 = CLOCK_HZ * 22 / 1000;
-/// Time programming one 32-bit word takes.
-const PROGRAM_CYCLES: u64 = CLOCK_HZ * 40 / 1_000_000;
+/// Time a sector erase keeps the flash busy, in ms by default. With
+/// 1024 word programs this adds up to the 63 ms per sector the
+/// firmware's comments quote; the manual's maximum is 50 ms.
+pub const FLASH_ERASE_MS: u64 = 22;
+pub const FLASH_ERASE_MAX_MS: u64 = 50;
+/// Time programming one 32-bit word takes, in µs (the manual's maximum).
+pub const FLASH_PROGRAM_US: u64 = 40;
 const SECTOR: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -340,6 +342,11 @@ pub struct Soc {
     /// Sector erases and word programs carried out since power-on.
     pub flash_erases: u64,
     pub flash_programs: u64,
+    /// Erases of each of the 32 sectors since power-on.
+    pub flash_sector_erases: [u32; 32],
+    /// How long a sector erase and a word program take.
+    pub flash_erase_ms: u64,
+    pub flash_program_us: u64,
     /// Reads of the flash while it was erasing or programming. The real
     /// part answers garbage then; here they read as all ones.
     pub flash_reads_while_busy: u64,
@@ -416,6 +423,9 @@ impl Soc {
             ext_wait_total: 0,
             flash_erases: 0,
             flash_programs: 0,
+            flash_sector_erases: [0; 32],
+            flash_erase_ms: FLASH_ERASE_MS,
+            flash_program_us: FLASH_PROGRAM_US,
             flash_reads_while_busy: 0,
             cut_power_after_flash_ops: None,
             flash_first_op: None,
@@ -1208,7 +1218,8 @@ impl Soc {
                 let start = off & !(SECTOR - 1);
                 self.flash[start..start + SECTOR].fill(0xFF);
                 self.flash_erases += 1;
-                self.flash_ctl.busy_until = self.cycles + ERASE_CYCLES;
+                self.flash_sector_erases[start / SECTOR % 32] += 1;
+                self.flash_ctl.busy_until = self.cycles + CLOCK_HZ * self.flash_erase_ms / 1000;
                 self.flash_ctl.started = true;
                 Idle
             }
@@ -1217,7 +1228,8 @@ impl Soc {
                 self.flash[off] &= val;
                 if left == 1 {
                     self.flash_programs += 1;
-                    self.flash_ctl.busy_until = self.cycles + PROGRAM_CYCLES;
+                    self.flash_ctl.busy_until =
+                        self.cycles + CLOCK_HZ * self.flash_program_us / 1_000_000;
                     self.flash_ctl.started = true;
                     Idle
                 } else {
