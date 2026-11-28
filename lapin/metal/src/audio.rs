@@ -269,6 +269,14 @@ impl<H: Host> Vm<'_, H> {
     }
 
     fn fifo_copy(&mut self, at: i32, src: i32, len: i32) {
+        let (a, s, l) = (at as u32 as usize, src as u32 as usize, len as u32 as usize);
+        if len > 0 && a <= AUDIO_FIFOPLAY && l <= AUDIO_FIFOPLAY - a {
+            let heap = crate::bytes(&self.mem.heap);
+            if s < heap.len() && l <= heap.len() - s {
+                self.mem.fifo[a..a + l].copy_from_slice(&heap[s..s + l]);
+                return;
+            }
+        }
         for k in 0..len.max(0) {
             let v = self.b(src + k);
             if let Some(d) = self.mem.fifo.get_mut((at + k) as usize) {

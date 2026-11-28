@@ -20,6 +20,30 @@ compile_error!(
     "the bytecode's strings live in the words of the heap, little-endian as on the rabbit"
 );
 
+/// A word of the memory read and written inline, `$w` and `$set`, with
+/// `$attr` on both: outside the heap, reads give zero and writes are
+/// dropped.
+macro_rules! accessors {
+    ($(#[$attr:meta])* $w:ident, $set:ident) => {
+        $(#[$attr])*
+        #[inline(always)]
+        fn $w(&self, i: i32) -> i32 {
+            match self.mem.heap.get(i as usize) {
+                Some(v) => *v,
+                None => 0,
+            }
+        }
+
+        $(#[$attr])*
+        #[inline(always)]
+        fn $set(&mut self, i: i32, v: i32) {
+            if let Some(w) = self.mem.heap.get_mut(i as usize) {
+                *w = v;
+            }
+        }
+    };
+}
+
 mod audio;
 mod gc;
 mod interp;
@@ -286,6 +310,20 @@ impl<'m, H: Host> Vm<'m, H> {
     pub fn boot(&mut self, bytecode: &[u8]) {
         self.vmem_init(0);
         self.load_external(bytecode);
+        self.run_main();
+    }
+
+    /// The same for a bytecode `fill` writes straight into the memory,
+    /// from its first byte: unpacked there, the boot bytecode is not
+    /// copied once more.
+    pub fn boot_with(&mut self, fill: impl FnOnce(&mut [u8])) {
+        self.vmem_init(0);
+        fill(self.bytes_mut());
+        self.load_heap(0);
+        self.run_main();
+    }
+
+    fn run_main(&mut self) {
         self.push(int(0));
         self.interp_go();
         self.pull();
@@ -358,38 +396,24 @@ impl<'m, H: Host> Vm<'m, H> {
 
     #[inline(never)]
     fn w(&self, i: i32) -> i32 {
-        match self.mem.heap.get(i as usize) {
-            Some(v) => *v,
-            None => 0,
-        }
+        self.w_in(i)
     }
 
     #[inline(never)]
     fn set(&mut self, i: i32, v: i32) {
-        if let Some(w) = self.mem.heap.get_mut(i as usize) {
-            *w = v;
-        }
+        self.set_in(i, v)
     }
 
-    /// [`Self::w`] and [`Self::set`] inline, for the collector's loops.
-    /// Copies rather than calls: the collector is ARM code, and the Thumb
-    /// accessors could not be inlined into it.
-    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
-    #[inline(always)]
-    fn wf(&self, i: i32) -> i32 {
-        match self.mem.heap.get(i as usize) {
-            Some(v) => *v,
-            None => 0,
-        }
-    }
-
-    #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
-    #[inline(always)]
-    fn setf(&mut self, i: i32, v: i32) {
-        if let Some(w) = self.mem.heap.get_mut(i as usize) {
-            *w = v;
-        }
-    }
+    // [`Self::w`] and [`Self::set`] inline: in Thumb as their callers,
+    // for the allocation and the stack, where the calls were a tenth of
+    // a program that allocates much (measured); in ARM code for the
+    // collector's loops, as Thumb accessors cannot be inlined into it.
+    accessors!(w_in, set_in);
+    accessors!(
+        #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+        wf,
+        setf
+    );
 
     /// `VSIZE`, inline.
     #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
@@ -517,7 +541,14 @@ impl<'m, H: Host> Vm<'m, H> {
     /// `loaderGetInt`.
     #[inline]
     fn int32(&self, off: i32) -> i32 {
-        (self.short(off.wrapping_add(2)) << 16) | self.short(off)
+        let bytes = self.bytes();
+        let o = off as usize;
+        // One check for the four bytes, as `short` for two.
+        if o < bytes.len() - 3 {
+            i32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
+        } else {
+            (self.short(off.wrapping_add(2)) << 16) | self.short(off)
+        }
     }
 
     /// The bytes from `off` up to the first zero, as C reads a string.
@@ -525,8 +556,27 @@ impl<'m, H: Host> Vm<'m, H> {
         natives::cstr(self.bytes(), off)
     }
 
-    /// Copy `len` bytes forward, one at a time, as `mystrcpy` does.
+    /// Copy `len` bytes forward, one at a time, as `mystrcpy` does: by
+    /// words inside the memory where that comes to the same.
     fn copy_bytes(&mut self, dst: i32, src: i32, len: i32) {
+        // Onto itself, every byte stays as it is (the boot bytecode,
+        // unpacked where the loader would copy it).
+        if dst == src {
+            return;
+        }
+        // Both ranges inside the memory: no check left for each byte
+        // (`copy_forward`).
+        let (d, s, l) = (
+            dst as u32 as usize,
+            src as u32 as usize,
+            len as u32 as usize,
+        );
+        let n = 4 * VMEM_LENGTH;
+        if len > 0 && d < n && s < n && l <= n - d.max(s) {
+            // SAFETY: both ranges are inside the memory.
+            unsafe { copy_forward(self.mem.heap.as_mut_ptr(), d, s, l) };
+            return;
+        }
         // Past twice the memory, every byte left is out of it.
         let len = len.min(2 * 4 * VMEM_LENGTH as i32);
         let mut i = 0;
@@ -534,6 +584,12 @@ impl<'m, H: Host> Vm<'m, H> {
             let v = self.b(src.wrapping_add(i));
             self.set_b(dst.wrapping_add(i), v);
             i += 1;
+            // Slow, this way, and up to 1.6 MB: fed now and then, where
+            // the C clears the watchdog before each instruction and
+            // copies as fast as it can.
+            if i & 0xFFFF == 0 {
+                self.host.watchdog();
+            }
         }
     }
 
@@ -567,6 +623,58 @@ impl<'m, H: Host> Vm<'m, H> {
     }
 }
 
+/// `l` bytes from byte `s` of the words at `heap` to byte `d`, forward,
+/// one at a time as the C, four at a time where that gives the same:
+/// unless `d` is in `(s, s + l)`, where the copy runs into what it
+/// wrote. Words are stored only where the destination is aligned; from
+/// a source that is not, they are made of two aligned loads, the next
+/// one read before the store that may cover it.
+///
+/// # Safety
+/// `[d, d + l)` and `[s, s + l)` are bytes of the words at `heap`.
+#[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
+#[inline(never)]
+unsafe fn copy_forward(heap: *mut i32, d: usize, s: usize, l: usize) {
+    let p = heap.cast::<u8>();
+    // SAFETY: every access is inside the two ranges the caller vouches
+    // for, or in an aligned word holding one of their bytes.
+    unsafe {
+        let mut i = 0;
+        // Running into itself, it goes byte by byte, below.
+        if d <= s || d >= s + l {
+            // The bytes up to the destination's first word.
+            while i < l && (d + i) & 3 != 0 {
+                *p.add(d + i) = *p.add(s + i);
+                i += 1;
+            }
+            let words = i + ((l - i) & !3);
+            let off = (s + i) & 3;
+            if off == 0 {
+                while i < words {
+                    *p.add(d + i).cast::<u32>() = *p.add(s + i).cast::<u32>();
+                    i += 4;
+                }
+            } else if i < words {
+                // 8, 16 or 24 both: the masks say they are under 32.
+                let (right, left) = ((8 * off as u32) & 31, (32 - 8 * off as u32) & 31);
+                let mut from = p.add(s + i - off).cast::<u32>();
+                let mut cur = *from;
+                while i < words {
+                    from = from.add(1);
+                    let next = *from;
+                    *p.add(d + i).cast::<u32>() = cur >> right | next << left;
+                    cur = next;
+                    i += 4;
+                }
+            }
+        }
+        while i < l {
+            *p.add(d + i) = *p.add(s + i);
+            i += 1;
+        }
+    }
+}
+
 fn bytes(heap: &[i32]) -> &[u8] {
     // SAFETY: any i32 is four valid bytes, and u8 has no alignment.
     unsafe { core::slice::from_raw_parts(heap.as_ptr().cast(), heap.len() * 4) }
@@ -585,7 +693,9 @@ pub fn fmt_dec(v: i32, buf: &mut [u8; 12]) -> &[u8] {
     loop {
         n -= 1;
         buf[n] = b'0' + (u % 10) as u8;
-        u /= 10;
+        // Hidden from the optimiser, which would unroll the loop ten
+        // times over (400 bytes) for text that waits on the serial port.
+        u = core::hint::black_box(u / 10);
         if u == 0 {
             break;
         }
@@ -595,4 +705,30 @@ pub fn fmt_dec(v: i32, buf: &mut [u8; 12]) -> &[u8] {
         buf[n] = b'-';
     }
     &buf[n..]
+}
+
+#[cfg(test)]
+mod tests {
+    /// [`super::copy_forward`] against the byte loop, at every alignment
+    /// and overlap.
+    #[test]
+    fn copy_forward_is_the_byte_loop() {
+        let start: [i32; 16] =
+            core::array::from_fn(|i| (i as i32).wrapping_mul(0x0405_0607) ^ 0x1234_5678);
+        for l in 0..40 {
+            for s in 0..=64 - l {
+                for d in 0..=64 - l {
+                    let mut want = start;
+                    let b = super::bytes_mut(&mut want);
+                    for i in 0..l {
+                        b[d + i] = b[s + i];
+                    }
+                    let mut got = start;
+                    // SAFETY: both ranges are inside `got`.
+                    unsafe { super::copy_forward(got.as_mut_ptr(), d, s, l) };
+                    assert_eq!(got, want, "{l} bytes from {s} to {d}");
+                }
+            }
+        }
+    }
 }

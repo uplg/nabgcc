@@ -26,11 +26,6 @@
       "owner": "lapin"
     },
     {
-      "family_id": "f9a07917f81b2d3f",
-      "reason": "The collector's ARM copies of the memory accessors: Thumb accessors cannot be inlined into ARM code, and the collector's speed is measured against the C.",
-      "owner": "lapin"
-    },
-    {
       "family_id": "f029880c0f3ce9ab",
       "reason": "The rescue core's own internet checksum against the emulator's LAN: the rescue core stays self-contained in its 20 KB, and the emulator never links firmware code.",
       "owner": "lapin"

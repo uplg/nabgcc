@@ -36,9 +36,9 @@ impl<H: Host> Vm<'_, H> {
     /// two cleared.
     #[inline(always)]
     fn header(&mut self, p: i32, first: i32) {
-        self.set(p, first);
-        self.set(p + HEADER_GC, 0);
-        self.set(p + HEADER_LIST, 0);
+        self.set_in(p, first);
+        self.set_in(p + HEADER_GC, 0);
+        self.set_in(p + HEADER_LIST, 0);
     }
 
     #[cfg_attr(target_arch = "arm", instruction_set(arm::a32))]
@@ -274,7 +274,7 @@ impl<H: Host> Vm<'_, H> {
         let p = self.heapindex;
         self.heapindex = self.heapindex.wrapping_add(wsize);
         self.header(p, first);
-        self.set(p.wrapping_add(wsize).wrapping_sub(1), 0);
+        self.set_in(p.wrapping_add(wsize).wrapping_sub(1), 0);
         p
     }
 
@@ -329,7 +329,7 @@ impl<H: Host> Vm<'_, H> {
     #[inline(never)]
     pub(crate) fn push(&mut self, v: i32) -> bool {
         self.stack = self.stack.wrapping_sub(1);
-        self.set_top(self.stack, v);
+        self.set_in((VMEM_LENGTH as i32).wrapping_add(self.stack), v);
         self.check(0)
     }
 
@@ -339,8 +339,9 @@ impl<H: Host> Vm<'_, H> {
         let q = p.wrapping_add(HEADER_LENGTH);
         while n > 0 {
             n -= 1;
-            let v = self.pull();
-            self.set(q.wrapping_add(n), v);
+            let v = self.w_in((VMEM_LENGTH as i32).wrapping_add(self.stack));
+            self.stack = self.stack.wrapping_add(1);
+            self.set_in(q.wrapping_add(n), v);
         }
         self.push(pnt(p));
     }
