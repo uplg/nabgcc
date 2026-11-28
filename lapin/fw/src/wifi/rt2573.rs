@@ -222,6 +222,9 @@ static ASSEMBLY: Assembly = Assembly(UnsafeCell::new([0; ASSEMBLY_SIZE]));
 static ASSEMBLED: Shared<usize> = Shared::new(0);
 /// The rest of a transfer is being thrown away, up to its end.
 static DISCARDING: Shared<bool> = Shared::new(false);
+/// The length of the transfer being put together, from the stick's
+/// descriptor at its start (0: not known yet).
+static EXPECTED: Shared<usize> = Shared::new(0);
 
 /// Called from the USB interrupt with each packet from the stick (`None`:
 /// one was lost). A frame ends on a packet shorter than the maximum.
@@ -234,8 +237,18 @@ fn on_packet(packet: Option<&[u8]>) {
     // SAFETY: see `Assembly`.
     let buffer = unsafe { &mut *ASSEMBLY.0.get() };
     let Some(packet) = packet else {
+        // The frame being put together is lost. Its descriptor, taken
+        // while in step with the stick, says how long the transfer is:
+        // if the packet lost was its last (short) one, nothing of it
+        // follows and the next frame is whole; otherwise what follows
+        // is dropped to the transfer's end. Lost before any descriptor
+        // was seen, the transfer's length is unknown: dropped to the
+        // next short packet, whichever transfer that ends.
+        let (at, expected) = (ASSEMBLED.get(), EXPECTED.get());
         ASSEMBLED.set(0);
-        DISCARDING.set(true);
+        EXPECTED.set(0);
+        let over = expected != 0 && at + PACKET >= expected && expected % PACKET != 0;
+        DISCARDING.set(!over);
         return;
     };
     let last = packet.len() < PACKET;
@@ -244,8 +257,13 @@ fn on_packet(packet: Option<&[u8]>) {
         return;
     }
     let at = ASSEMBLED.get();
+    if at == 0 && packet.len() >= 4 {
+        let len = (u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]) >> 16) & 0xFFF;
+        EXPECTED.set(24 + len as usize);
+    }
     if at + packet.len() > buffer.len() {
         ASSEMBLED.set(0);
+        EXPECTED.set(0);
         DISCARDING.set(!last);
         return;
     }
@@ -256,6 +274,7 @@ fn on_packet(packet: Option<&[u8]>) {
         return;
     }
     ASSEMBLED.set(0);
+    EXPECTED.set(0);
     if total < 24 {
         return;
     }

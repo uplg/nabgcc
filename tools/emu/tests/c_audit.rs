@@ -175,6 +175,27 @@ fn a_lost_usb_packet_merges_no_frames() {
     assert_eq!(arp_replies(&m), 1, "the next frame merged");
 }
 
+/// A packet lost in the middle of a frame: what is left of that frame
+/// is dropped to its end, whatever it holds (it might read as a
+/// descriptor), and the frame after it is heard. The ARP request is
+/// padded to three packets; its middle one is lost.
+#[test]
+fn a_packet_lost_mid_frame_drops_that_frame_to_its_end_only() {
+    let mut m = with_an_address(wpa2());
+    m.radio.borrow_mut().lose_rx_packet = Some(1);
+    m.air[0].uplink.clear();
+    let mut padded = eth_arp();
+    padded.resize(padded.len() + 120, 0);
+    m.air[0].send(&mut m.radio.borrow_mut(), &padded);
+    m.air[0].send(&mut m.radio.borrow_mut(), &eth_arp());
+    wait(&mut m, 1000);
+    assert_eq!(
+        arp_replies(&m),
+        1,
+        "the frame after it heard, the broken one not"
+    );
+}
+
 // ---- the stick on its port ---------------------------------------------
 
 /// A stick that does not answer its first requests after its reset: the
