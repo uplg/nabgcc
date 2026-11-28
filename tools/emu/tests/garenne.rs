@@ -1,6 +1,6 @@
 //! Garenne, the rabbit's real application bytecode, on the emulated
 //! rabbit. Garenne lives in another repository: the test runs when its
-//! build is found (`NABEMU_GARENNE`, or `../clapier` beside this
+//! build is found (`NABEMU_GARENNE`, or clapier beside this
 //! repository) and is skipped otherwise.
 
 mod common;
@@ -10,7 +10,6 @@ use common::{garenne, garenne_log, on_network, serve, wpa2};
 #[test]
 fn garenne_wakes_up_and_reports_every_two_seconds() {
     let Some(bytecode) = garenne() else {
-        eprintln!("skipped: no garenne build around");
         return;
     };
     let mut m = on_network(&nabemu::testing::image(), wpa2());

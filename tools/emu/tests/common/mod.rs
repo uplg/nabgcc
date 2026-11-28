@@ -75,15 +75,42 @@ pub fn lapin() -> Option<Vec<u8>> {
 }
 
 /// Garenne, the rabbit's real application bytecode. It lives in another
-/// repository: its build is found by `NABEMU_GARENNE`, or in
-/// `../clapier` beside this repository.
+/// repository: its build is `NABEMU_GARENNE` when that is set, else
+/// `garenne/build/garenne.bin` in the checkout of clapier beside this
+/// repository's main checkout (found from git's common directory, so
+/// that a worktree finds it too). Without either, the tests that want
+/// it skip, and say where they looked.
 pub fn garenne() -> Option<Vec<u8>> {
-    let default = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../clapier/garenne/build/garenne.bin"
-    );
-    let path = std::env::var("NABEMU_GARENNE").unwrap_or_else(|_| default.into());
-    std::fs::read(path).ok()
+    let path = match std::env::var_os("NABEMU_GARENNE") {
+        Some(path) => std::path::PathBuf::from(path),
+        None => main_checkout()
+            .parent()?
+            .join("clapier/garenne/build/garenne.bin"),
+    };
+    let found = std::fs::read(&path).ok();
+    if found.is_none() {
+        eprintln!("skipped: no garenne build at {}", path.display());
+    }
+    found
+}
+
+/// This repository's main checkout: where git's common directory (the
+/// `.git` a worktree points back to) lies, or, when git cannot say,
+/// the repository this test was built in.
+pub fn main_checkout() -> std::path::PathBuf {
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let here = std::fs::canonicalize(here).unwrap_or_else(|_| here.into());
+    let common = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&here)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    match common.as_deref().and_then(std::path::Path::parent) {
+        Some(main) => main.to_path_buf(),
+        None => here.join("../.."),
+    }
 }
 
 /// What garenne broadcast on its log port, UDP 9999, a line each.

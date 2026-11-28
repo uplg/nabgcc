@@ -30,7 +30,6 @@ fn pulses(log: &[String]) -> usize {
 #[test]
 fn garenne_runs_for_minutes_through_group_key_renewals() {
     let Some(bytecode) = garenne() else {
-        eprintln!("skipped: no garenne build around");
         return;
     };
     let minutes = minutes();
@@ -98,7 +97,6 @@ fn garenne_lives_through_everything() {
         return;
     }
     let Some(bytecode) = garenne() else {
-        eprintln!("skipped: no garenne build around");
         return;
     };
     let minutes = minutes();
