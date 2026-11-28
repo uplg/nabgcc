@@ -561,7 +561,9 @@ impl Gen<'_, '_> {
             }
             // The stack and the locals, by number.
             41 => {
-                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(_))) else {
+                // Not of an empty table: both machines would read the
+                // next block's header, and hand it on as a value.
+                let Some(t) = self.pick(|k| matches!(k, Kind::Tab(n) if n > 0)) else {
                     return;
                 };
                 self.get(t);
