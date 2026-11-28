@@ -975,6 +975,15 @@ impl Station {
     /// `netScan`: go through the fourteen channels, asking (for `ssid`,
     /// or anyone) and listening a while on each; `found` gets every
     /// beacon and probe response heard, as the C driver gave them.
+    ///
+    /// A link held before the scan is held after it: the station goes
+    /// back to its network's channel and address, keys and state as they
+    /// were. (The C driver left the state idle whatever it was, and
+    /// joined again only when the bytecode said so, with a second
+    /// handshake; the access point never heard it leave. With protected
+    /// management frames the access point keeps such a station's
+    /// association, and turns a fresh one away for a while: 802.11-2020
+    /// 11.13.)
     #[inline(never)]
     pub fn scan(
         &mut self,
@@ -986,6 +995,7 @@ impl Station {
         if self.mode != Mode::Managed {
             return;
         }
+        let held = self.state;
         self.state = State::Scan;
         link.set_bssid(&[0; 6]);
         let own = link.mac();
@@ -1029,7 +1039,18 @@ impl Station {
                 }
             }
         }
-        self.state = State::Idle;
+        self.state = held;
+        if held != State::Idle {
+            let bssid = self.bssid;
+            link.set_bssid(&bssid);
+            link.set_channel(self.channel);
+        }
+    }
+
+    /// The network the station is on or joining, if any: whose
+    /// announcements matter.
+    pub fn followed(&self) -> Option<&Mac> {
+        (self.mode == Mode::Managed && self.state != State::Idle).then_some(&self.bssid)
     }
 
     /// A beacon or probe response heard during a scan: what to tell the

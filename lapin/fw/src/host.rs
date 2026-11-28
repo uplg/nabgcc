@@ -376,6 +376,11 @@ impl Host for Board {
                     scan[slot] = heard;
                 }
             });
+        // Back on the network held before, only its announcements
+        // matter again.
+        if let Some(bss) = self.station.followed() {
+            crate::wifi::keep_announcements(Some(bss));
+        }
         self.scanned = n;
         n
     }
