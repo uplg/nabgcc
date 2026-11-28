@@ -172,6 +172,16 @@ fn refresh_ramcode() {
     crate::sync::barrier();
 }
 
+/// Before the flash is rewritten for good: interrupts off, never to
+/// come back, the watchdog's whole period ahead, the RAM routines
+/// fresh.
+#[inline(always)]
+fn stop_for_rewrite() {
+    irq::irq_disable();
+    watchdog::feed();
+    refresh_ramcode();
+}
+
 /// Replace the firmware with `image` and restart on it: the end of
 /// this firmware. `image` must be word aligned and lie outside the
 /// flash. An image that brings the rescue core in place rewrites the
@@ -182,9 +192,7 @@ pub fn write_firmware(image: &[u8]) -> ! {
         crate::watchdog::reset_now()
     };
     let len = part.len().min(SETTINGS - to);
-    irq::irq_disable();
-    watchdog::feed();
-    refresh_ramcode();
+    stop_for_rewrite();
     // SAFETY: interrupts are off for good, the routine runs from RAM
     // and never returns into the flash it rewrites; `to` is a sector
     // boundary and the length stops below the settings.
@@ -198,9 +206,7 @@ pub fn write_app(app: &[u8]) -> ! {
     let Some(len) = crate::boot::check_app(app) else {
         crate::watchdog::reset_now()
     };
-    irq::irq_disable();
-    watchdog::feed();
-    refresh_ramcode();
+    stop_for_rewrite();
     // SAFETY: as in `write_firmware`; the application's place starts on
     // a sector boundary and ends below the settings (checked).
     unsafe { flash_image_from_ram(app.as_ptr().cast(), len, crate::boot::APP_BASE) }

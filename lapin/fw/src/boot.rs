@@ -58,53 +58,48 @@ pub struct Slots;
 const SLOTS: usize = 0x1000_0000;
 const SLOT_MAGIC: u32 = 0x5A17_B007;
 
-fn slot(i: usize) -> *mut u32 {
-    (SLOTS + 4 * i) as *mut u32
+fn slot(i: usize) -> crate::reg::Reg<u32> {
+    // SAFETY: the four words below the linker's RAM, reserved for this
+    // (see common.x); like a register, they are only ever accessed
+    // volatile.
+    unsafe { crate::reg::Reg::at(SLOTS + 4 * i) }
+}
+
+/// The words meaningful, with `restarts` counted.
+fn mark(restarts: u32) {
+    slot(0).write(SLOT_MAGIC);
+    slot(1).write(restarts);
 }
 
 impl Slots {
     /// Count one more start; returns how many in a row the application
     /// has had without saying it was well (0 after a power cut).
     pub fn count_boot() -> u32 {
-        // SAFETY: the four words below the linker's RAM, reserved for
-        // this (see link.x and rescue.x).
-        unsafe {
-            if slot(0).read_volatile() != SLOT_MAGIC {
-                slot(0).write_volatile(SLOT_MAGIC);
-                slot(1).write_volatile(0);
-                return 0;
-            }
-            let n = slot(1).read_volatile().saturating_add(1);
-            slot(1).write_volatile(n);
-            n
+        if slot(0).read() != SLOT_MAGIC {
+            mark(0);
+            return 0;
         }
+        let n = slot(1).read().saturating_add(1);
+        slot(1).write(n);
+        n
     }
 
     /// Start afresh, as after a power cut: the next start counts 0 (the
     /// rescue core handing back to the application gives it its three
     /// tries again).
     pub fn fresh() {
-        // SAFETY: as above.
-        unsafe { slot(0).write_volatile(0) }
+        slot(0).write(0);
     }
 
     /// Have the rescue core take over at the next start (the gesture
     /// that asks for it, in the application).
     pub fn ask_rescue() {
-        // SAFETY: as above.
-        unsafe {
-            slot(0).write_volatile(SLOT_MAGIC);
-            slot(1).write_volatile(ASKED);
-        }
+        mark(ASKED);
     }
 
     /// The application runs well: forget the restarts.
     pub fn confirm() {
-        // SAFETY: as above.
-        unsafe {
-            slot(0).write_volatile(SLOT_MAGIC);
-            slot(1).write_volatile(0);
-        }
+        mark(0);
     }
 }
 
