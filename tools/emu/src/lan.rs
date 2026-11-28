@@ -92,6 +92,19 @@ impl TxToken for Tx<'_> {
     }
 }
 
+impl Wire {
+    /// An empty wire, and a network interface of address `mac` on it.
+    pub(crate) fn with_interface(mac: [u8; 6]) -> (Wire, Interface) {
+        let mut wire = Wire {
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+        };
+        let config = Config::new(EthernetAddress(mac).into());
+        let iface = Interface::new(config, &mut wire, Instant::from_millis(0));
+        (wire, iface)
+    }
+}
+
 impl Device for Wire {
     type RxToken<'a> = Rx;
     type TxToken<'a> = Tx<'a>;
@@ -148,6 +161,36 @@ impl Default for Lan {
     }
 }
 
+/// The IPv4 packet an Ethernet frame carries, if it carries UDP.
+fn udp_packet(frame: &[u8]) -> Option<&[u8]> {
+    if frame.get(12..14)? != [0x08, 0x00] || frame.get(23)? != &17 {
+        return None;
+    }
+    Some(&frame[14..])
+}
+
+/// An Ethernet frame from the gateway with a UDP datagram in it.
+fn udp_frame(to: ([u8; 6], [u8; 4]), ports: (u16, u16), payload: &[u8]) -> Vec<u8> {
+    let udp_len = (8 + payload.len()) as u16;
+    let mut packet = vec![0x45, 0];
+    packet.extend_from_slice(&(20 + udp_len).to_be_bytes());
+    packet.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
+    packet.extend_from_slice(&GATEWAY_IP);
+    packet.extend_from_slice(&to.1);
+    let sum = checksum(&packet);
+    packet[10..12].copy_from_slice(&sum.to_be_bytes());
+    packet.extend_from_slice(&ports.0.to_be_bytes());
+    packet.extend_from_slice(&ports.1.to_be_bytes());
+    packet.extend_from_slice(&udp_len.to_be_bytes());
+    packet.extend_from_slice(&[0, 0]);
+    packet.extend_from_slice(payload);
+    let mut eth = to.0.to_vec();
+    eth.extend_from_slice(&GATEWAY_MAC);
+    eth.extend_from_slice(&[0x08, 0x00]);
+    eth.extend_from_slice(&packet);
+    eth
+}
+
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     for pair in data.chunks(2) {
@@ -161,12 +204,7 @@ fn checksum(data: &[u8]) -> u16 {
 
 impl Lan {
     pub fn new() -> Self {
-        let mut wire = Wire {
-            rx: VecDeque::new(),
-            tx: VecDeque::new(),
-        };
-        let config = Config::new(EthernetAddress(GATEWAY_MAC).into());
-        let mut iface = Interface::new(config, &mut wire, Instant::from_millis(0));
+        let (wire, mut iface) = Wire::with_interface(GATEWAY_MAC);
         let [a, b, c, d] = GATEWAY_IP;
         iface.update_ip_addrs(|addrs| {
             addrs
@@ -220,10 +258,7 @@ impl Lan {
 
     /// Keep a copy of every UDP datagram the stations send.
     fn note_datagram(&mut self, frame: &[u8]) -> Option<()> {
-        if frame.get(12..14)? != [0x08, 0x00] || frame.get(23)? != &17 {
-            return None;
-        }
-        let ip = &frame[14..];
+        let ip = udp_packet(frame)?;
         let total = u16::from_be_bytes([*ip.get(2)?, *ip.get(3)?]) as usize;
         let udp = ip.get((ip[0] & 0xF) as usize * 4..total)?;
         self.datagrams.push(Datagram {
@@ -241,33 +276,14 @@ impl Lan {
         let Some(station) = self.leased_to else {
             return false;
         };
-        let udp_len = (8 + payload.len()) as u16;
-        let mut packet = vec![0x45, 0];
-        packet.extend_from_slice(&(20 + udp_len).to_be_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
-        packet.extend_from_slice(&GATEWAY_IP);
-        packet.extend_from_slice(&LEASE_IP);
-        let sum = checksum(&packet);
-        packet[10..12].copy_from_slice(&sum.to_be_bytes());
-        packet.extend_from_slice(&from_port.to_be_bytes());
-        packet.extend_from_slice(&to_port.to_be_bytes());
-        packet.extend_from_slice(&udp_len.to_be_bytes());
-        packet.extend_from_slice(&[0, 0]);
-        packet.extend_from_slice(payload);
-        let mut eth = station.to_vec();
-        eth.extend_from_slice(&GATEWAY_MAC);
-        eth.extend_from_slice(&[0x08, 0x00]);
-        eth.extend_from_slice(&packet);
+        let eth = udp_frame((station, LEASE_IP), (from_port, to_port), payload);
         self.wire.tx.push_back(eth);
         true
     }
 
     /// Answer a DHCP discover or request; `None` if the frame is not one.
     fn dhcp(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
-        if frame.get(12..14)? != [0x08, 0x00] || frame.get(23)? != &17 {
-            return None;
-        }
-        let ip = &frame[14..];
+        let ip = udp_packet(frame)?;
         let udp = ip.get((ip[0] & 0xF) as usize * 4..)?;
         if udp.get(2..4)? != [0, 67] {
             return None;
@@ -325,24 +341,7 @@ impl Lan {
         reply.extend_from_slice(&GATEWAY_IP);
         reply.push(255);
 
-        let udp_len = (8 + reply.len()) as u16;
-        let mut packet = vec![0x45, 0];
-        packet.extend_from_slice(&(20 + udp_len).to_be_bytes());
-        packet.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
-        packet.extend_from_slice(&GATEWAY_IP);
-        packet.extend_from_slice(&[255; 4]);
-        let sum = checksum(&packet);
-        packet[10..12].copy_from_slice(&sum.to_be_bytes());
-        packet.extend_from_slice(&[0, 67, 0, 68]);
-        packet.extend_from_slice(&udp_len.to_be_bytes());
-        packet.extend_from_slice(&[0, 0]);
-        packet.extend_from_slice(&reply);
-
-        let mut eth = vec![0xFF; 6];
-        eth.extend_from_slice(&GATEWAY_MAC);
-        eth.extend_from_slice(&[0x08, 0x00]);
-        eth.extend_from_slice(&packet);
-        Some(eth)
+        Some(udp_frame(([0xFF; 6], [255; 4]), (67, 68), &reply))
     }
 
     /// Let the host work: its network stack, then its servers.

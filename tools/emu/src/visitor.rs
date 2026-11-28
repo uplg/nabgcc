@@ -5,10 +5,10 @@
 
 use std::collections::VecDeque;
 
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
+use smoltcp::wire::{IpAddress, IpCidr};
 
 use crate::air::{Mac, element, mac_header};
 use crate::lan::Wire;
@@ -70,12 +70,7 @@ const RETRY_MS: u64 = 500;
 
 impl Visitor {
     pub fn new(mac: Mac, network_prefix: &str) -> Self {
-        let mut wire = Wire {
-            rx: VecDeque::new(),
-            tx: VecDeque::new(),
-        };
-        let config = Config::new(EthernetAddress(mac).into());
-        let iface = Interface::new(config, &mut wire, Instant::from_millis(0));
+        let (wire, iface) = Wire::with_interface(mac);
         let mut sockets = SocketSet::new(vec![]);
         let dhcp = sockets.add(dhcpv4::Socket::new());
         let buffer = || tcp::SocketBuffer::new(vec![0; 64 * 1024]);
