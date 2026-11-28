@@ -393,7 +393,7 @@ fn out_of_memory_breaks_both_the_same_way() {
         .jump(GOTO, top);
     end(&mut f);
     let c = run_both(World::quiet, &bytecode(&[], &[&f]), 2);
-    assert!(c.world.log.contains(&"reboot".to_string()));
+    assert!(c.world.log.iter().any(|call| call == "reboot"));
 }
 
 #[test]
