@@ -77,30 +77,27 @@ fn exponent(top: i32) -> i32 {
     }
 }
 
-fn alaw_encode(pcm: i16) -> u8 {
+/// The sign bit both laws keep, and the magnitude they encode, cut at
+/// 32635.
+fn sign_magnitude(pcm: i16) -> (i32, i32) {
     let mut pcm = pcm as i32;
     let sign = (pcm & 0x8000) >> 8;
     if sign != 0 {
         pcm = -pcm;
     }
-    if pcm > 32635 {
-        pcm = 32635;
-    }
+    (sign, pcm.min(32635))
+}
+
+fn alaw_encode(pcm: i16) -> u8 {
+    let (sign, pcm) = sign_magnitude(pcm);
     let e = exponent(pcm >> 8);
     let mantissa = (pcm >> if e == 0 { 4 } else { e + 3 }) & 0x0f;
     ((sign | e << 4 | mantissa) as u8) ^ 0xD5
 }
 
 fn mulaw_encode(pcm: i16) -> u8 {
-    let mut pcm = pcm as i32;
-    let sign = (pcm & 0x8000) >> 8;
-    if sign != 0 {
-        pcm = -pcm;
-    }
-    if pcm > 32635 {
-        pcm = 32635;
-    }
-    pcm += 0x84;
+    let (sign, pcm) = sign_magnitude(pcm);
+    let pcm = pcm + 0x84;
     let e = exponent(pcm >> 8);
     let mantissa = (pcm >> (e + 3)) & 0x0f;
     !((sign | e << 4 | mantissa) as u8)
@@ -137,15 +134,27 @@ impl Audio {
         self.vol = 0;
     }
 
+    /// The step the index points at. The C indexes its table with the
+    /// saved byte, unchecked: a bad block header reads past it.
+    fn step(&self) -> i32 {
+        STEPS.get(self.step_index as usize).copied().unwrap_or(0) as i32
+    }
+
+    /// What decoding and encoding share once a nibble's difference is
+    /// known: the new prediction, and the step index the nibble moves.
+    fn advance(&mut self, nibble: u32, diff: i32) -> i32 {
+        let p = self.predicted as i32;
+        let v = if nibble & 8 != 0 { p - diff } else { p + diff };
+        let v = v.clamp(-0x8000, 0x7fff);
+        self.predicted = v as i16;
+        let index = self.step_index as i32 + INDEX[(nibble & 7) as usize];
+        self.step_index = index.clamp(0, 88) as u8;
+        v
+    }
+
     /// `mydecode`: one IMA ADPCM nibble.
     fn decode(&mut self, adpcm: u32) -> i16 {
-        let mut index = self.step_index as i32;
-        // The C indexes its table with the saved byte, unchecked: a
-        // bad block header reads past it.
-        let step = STEPS.get(index as usize).copied().unwrap_or(0) as i32;
-        index += INDEX[(adpcm & 7) as usize];
-        index = index.clamp(0, 88);
-        self.step_index = index as u8;
+        let step = self.step();
         let mut diff = step >> 3;
         if adpcm & 4 != 0 {
             diff += step;
@@ -156,52 +165,27 @@ impl Audio {
         if adpcm & 1 != 0 {
             diff += step >> 2;
         }
-        let mut v = self.predicted as i32;
-        if adpcm & 8 != 0 {
-            v -= diff;
-        } else {
-            v += diff;
-        }
-        let v = v.clamp(-0x8000, 0x7fff);
-        self.predicted = v as i16;
+        let v = self.advance(adpcm, diff);
         self.vol = self.vol.wrapping_add((v * v) >> 16);
         v as i16
     }
 
     /// `myencode`.
     fn encode(&mut self, pcm: i16) -> u8 {
-        let mut predicted = self.predicted as i32;
-        let index = self.step_index as i32;
-        let mut delta = pcm as i32 - predicted;
+        let mut delta = pcm as i32 - self.predicted as i32;
         let mut value: u32 = if delta >= 0 { 0 } else { 8 };
-        if delta < 0 {
-            delta = -delta;
-        }
-        let mut step = STEPS.get(index as usize).copied().unwrap_or(0) as i32;
+        delta = delta.abs();
+        let mut step = self.step();
         let mut diff = step >> 3;
-        if delta > step {
-            value |= 4;
-            delta -= step;
-            diff += step;
+        for bit in [4, 2, 1] {
+            if delta > step {
+                value |= bit;
+                delta -= step;
+                diff += step;
+            }
+            step >>= 1;
         }
-        step >>= 1;
-        if delta > step {
-            value |= 2;
-            delta -= step;
-            diff += step;
-        }
-        step >>= 1;
-        if delta > step {
-            value |= 1;
-            diff += step;
-        }
-        if value & 8 != 0 {
-            predicted -= diff;
-        } else {
-            predicted += diff;
-        }
-        self.predicted = predicted.clamp(-0x8000, 0x7fff) as i16;
-        self.step_index = (index + INDEX[(value & 7) as usize]).clamp(0, 88) as u8;
+        self.advance(value, diff);
         (value & 15) as u8
     }
 }
@@ -291,22 +275,13 @@ impl<H: Host> Vm<'_, H> {
     /// `audioPlayTryFeed`: ask the bytecode for more until the ring holds
     /// `ask` bytes or it stops giving. True if it gave anything.
     fn play_try_feed(&mut self, ask: i32) -> bool {
-        let size = AUDIO_FIFOPLAY as i32;
         let w0 = self.audio.play_w;
-        let mut dispo = self.audio.play_w - self.audio.play_r;
-        if dispo < 0 {
-            dispo += size;
-        }
-        if dispo >= ask {
+        if self.fifo_level() >= ask {
             return false;
         }
         loop {
             let lastw = self.audio.play_w;
-            dispo = self.audio.play_w - self.audio.play_r;
-            if dispo < 0 {
-                dispo += size;
-            }
-            self.push(int(size - dispo));
+            self.push(int(AUDIO_FIFOPLAY as i32 - self.fifo_level()));
             self.push(self.cget(self.sys_start, SYS_CBPLAY));
             if self.sget(0) == NIL {
                 self.pull();
@@ -320,6 +295,16 @@ impl<H: Host> Vm<'_, H> {
             }
         }
         self.audio.play_w != w0
+    }
+
+    /// How many bytes the ring holds.
+    fn fifo_level(&self) -> i32 {
+        let level = self.audio.play_w - self.audio.play_r;
+        if level < 0 {
+            level + AUDIO_FIFOPLAY as i32
+        } else {
+            level
+        }
     }
 
     /// `audioPlayFetchByte`.
@@ -410,8 +395,7 @@ impl<H: Host> Vm<'_, H> {
         if self.audio.rec_state == 0 {
             return;
         }
-        self.host
-            .codec_write(VS1003_MODE, (MODE_H << 8) | MODE_L | SM_RESET);
+        self.codec_reset();
         self.host.amplifier(false);
         self.codec_reset();
         self.audio.rec_state = 0;
@@ -452,17 +436,7 @@ impl<H: Host> Vm<'_, H> {
         if start.wrapping_add(256) > len {
             return 0;
         }
-        let mut p = src + start;
-        let s0 = self.b(p) as i32 + ((self.b(p + 1) as i32) << 8);
-        let st = self.b(p + 2) as i32 + ((self.b(p + 3) as i32) << 8);
-        p += 4;
-        self.audio.decode_init(s0, st);
-        for _ in 0..252 {
-            let c = self.b(p) as u32;
-            p += 1;
-            self.audio.decode(c & 15);
-            self.audio.decode((c >> 4) & 15);
-        }
+        self.decode_block(src + start, None);
         self.audio.vol >> 8
     }
 
@@ -478,7 +452,7 @@ impl<H: Host> Vm<'_, H> {
         lsrc: i32,
         mut len: i32,
     ) {
-        if idst < 0 || isrc < 0 || idst >= ldst || isrc >= lsrc || len & 255 != 0 {
+        if !starts_inside(idst, ldst, isrc, lsrc) || len & 255 != 0 {
             return;
         }
         if len > lsrc - isrc || (len >> 8) * 505 * 2 > ldst - idst {
@@ -486,22 +460,29 @@ impl<H: Host> Vm<'_, H> {
         }
         let (mut s, mut d) = (src + isrc, dst + idst);
         while len > 0 {
-            let s0 = self.b(s) as i32 + ((self.b(s + 1) as i32) << 8);
-            let st = self.b(s + 2) as i32 + ((self.b(s + 3) as i32) << 8);
-            self.audio.decode_init(s0, st);
-            self.put16(d, s0 as i16);
-            let mut o = d + 2;
-            for i in 0..252 {
-                let c = self.b(s + 4 + i) as u32;
-                let a = self.audio.decode(c & 15);
-                self.put16(o, a);
-                let b = self.audio.decode((c >> 4) & 15);
-                self.put16(o + 2, b);
-                o += 4;
-            }
+            self.decode_block(s, Some(d));
             s += 256;
             d += 505 * 2;
             len -= 256;
+        }
+    }
+
+    /// A 256-byte ADPCM block: its first sample and step index, then 252
+    /// bytes of two nibbles. The 505 samples go to `dst` if there is one.
+    fn decode_block(&mut self, src: i32, dst: Option<i32>) {
+        let s0 = self.short(src);
+        self.audio.decode_init(s0, self.short(src + 2));
+        if let Some(d) = dst {
+            self.put16(d, s0 as i16);
+        }
+        for i in 0..252 {
+            let c = self.b(src + 4 + i) as u32;
+            let a = self.audio.decode(c & 15);
+            let b = self.audio.decode((c >> 4) & 15);
+            if let Some(d) = dst {
+                self.put16(d + 2 + 4 * i, a);
+                self.put16(d + 4 + 4 * i, b);
+            }
         }
     }
 
@@ -517,7 +498,7 @@ impl<H: Host> Vm<'_, H> {
         lsrc: i32,
         mut len: i32,
     ) {
-        if idst < 0 || isrc < 0 || idst >= ldst || isrc >= lsrc {
+        if !starts_inside(idst, ldst, isrc, lsrc) {
             return;
         }
         let mut n = 0;
@@ -580,7 +561,7 @@ impl<H: Host> Vm<'_, H> {
         len: i32,
         mu: bool,
     ) {
-        if idst < 0 || isrc < 0 || idst >= ldst || isrc >= lsrc || len & 1 != 0 {
+        if !starts_inside(idst, ldst, isrc, lsrc) || len & 1 != 0 {
             return;
         }
         if len > lsrc - isrc || (len >> 1) > ldst - idst {
@@ -606,7 +587,7 @@ impl<H: Host> Vm<'_, H> {
         len: i32,
         mu: bool,
     ) {
-        if idst < 0 || isrc < 0 || idst >= ldst || isrc >= lsrc {
+        if !starts_inside(idst, ldst, isrc, lsrc) {
             return;
         }
         if len > lsrc - isrc || len + len > ldst - idst {
@@ -635,4 +616,10 @@ impl<H: Host> Vm<'_, H> {
         self.set_b(at, v as u8);
         self.set_b(at + 1, (v >> 8) as u8);
     }
+}
+
+/// The check every conversion starts with: both indexes inside their
+/// strings.
+fn starts_inside(idst: i32, ldst: i32, isrc: i32, lsrc: i32) -> bool {
+    idst >= 0 && isrc >= 0 && idst < ldst && isrc < lsrc
 }
