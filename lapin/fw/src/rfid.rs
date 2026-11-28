@@ -110,7 +110,9 @@ fn select(chip_id: u8) -> Result<(), Error> {
 /// field is left on, so that the tags can be read or written next. The
 /// C's sequence (`check_rfid_devices`), with its pauses.
 fn scan_keeping_field(found: &mut [Tag]) -> Result<usize, Error> {
-    // Completion: any tag still selected lets go; field off, then on.
+    // A block written last still programming: its time first. Then
+    // completion: any tag still selected lets go; field off, then on.
+    programmed();
     send(&[0x0F])?;
     field(false)?;
     field(true)?;
@@ -197,7 +199,6 @@ pub fn settle() {
 
 /// The tags in front of the nose.
 pub fn scan(found: &mut [Tag]) -> Result<usize, Error> {
-    programmed();
     let result = scan_keeping_field(found);
     field_off();
     result
@@ -205,7 +206,6 @@ pub fn scan(found: &mut [Tag]) -> Result<usize, Error> {
 
 /// `f` with the tag `uid` selected, the field left on.
 fn with_tag_on<R>(uid: &Uid, f: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-    programmed();
     let mut found = [Tag::default(); 16];
     scan_keeping_field(&mut found).and_then(|count| {
         let tag = found[..count]

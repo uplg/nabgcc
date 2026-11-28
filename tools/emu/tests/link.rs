@@ -3,6 +3,7 @@
 
 mod common;
 
+use common::bc::{self, Global, op::GETGLOBALB};
 use common::{
     ap_count, arp_replies, arp_request, authorized, handshakes, on_network, terrier, until_every,
     wait, wpa, wpa2,
@@ -10,7 +11,7 @@ use common::{
 use nabemu::air::{ApEvent, Security};
 use nabemu::config::Wifi;
 use nabemu::lan::Lan;
-use nabemu::{DEFAULT_MAC, Machine};
+use nabemu::{DEFAULT_MAC, Machine, metal};
 
 /// A rabbit that joined, got its address, and keeps running the boot
 /// bytecode (the server has no bytecode for it), so its IP stack is up.
@@ -156,4 +157,42 @@ fn survives_wpa2_pairwise_key_renewals() {
 #[test]
 fn survives_wpa_tkip_pairwise_key_renewals() {
     survives_pairwise_key_renewals(wpa());
+}
+
+/// The access point switched off, the rabbit sending nothing: lapin
+/// notices its beacons are gone, asks it (probe requests), and gives
+/// the link up after about two and a half seconds; its program, which
+/// joins again whenever the link is idle, starts looking for it. Known
+/// defect: r3 stays "connected" to a vanished access point for two
+/// minutes (its timeout, refreshed by beacons), unless it sends.
+#[test]
+fn notices_the_access_point_switched_off() {
+    let key = nabemu::crypto::wpa_psk(common::PASSPHRASE, common::SSID);
+    let globals = [
+        Global::Word(u32::MAX),
+        Global::Str(&key),
+        Global::Str(common::SSID.as_bytes()),
+        Global::Str(&common::BSSID),
+    ];
+    let mut main = bc::main_with_home_network(0, 2, 3);
+    main.extend(bc::loop_callback(1));
+    let rejoin = bc::rejoin(0, &[GETGLOBALB, 1]);
+    let program = bc::assemble(&globals, &[&main, &rejoin]);
+    let mut m = on_network(&nabemu::testing::image(), wpa2());
+    common::serve(&mut m, metal::boot_response(&program));
+    until_every(&mut m, 50, 60_000, "on the network", authorized);
+    wait(&mut m, 2000);
+    m.air.clear();
+    m.radio.borrow_mut().tx.clear();
+    let sent = |m: &Machine, kind: u8| m.radio.borrow().tx.iter().any(|f| f.data[0] == kind);
+    let off = m.soc.millis();
+    let looking = |m: &Machine| sent(m, 0xB0);
+    if nabemu::testing::is_lapin() {
+        let at = until_every(&mut m, 10, 5000, "joining again", looking);
+        eprintln!("noticed after {} ms", at - off);
+        assert!(sent(&m, 0x40), "the access point asked first");
+    } else {
+        wait(&mut m, 20_000);
+        assert!(!looking(&m), "Known defect: r3 never noticed");
+    }
 }

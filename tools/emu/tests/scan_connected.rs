@@ -108,8 +108,8 @@ fn r3_drops_its_link_for_a_scan() {
 }
 
 /// The access point out of range for two minutes and more: the rabbit
-/// gives the link up (no beacon for 120 s), the access point, which
-/// heard nothing, still holds the protected association (hostapd lets
+/// gives the link up (no beacon, no answer to its probes), the access
+/// point, which heard nothing, still holds the protected association (hostapd lets
 /// an inactive station be for five minutes). Back in range, the
 /// rabbit's fresh association is turned away (status 30, come back) and
 /// the access point asks the holder of the old keys (SA Query); no one

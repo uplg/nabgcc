@@ -3,7 +3,7 @@
 
 use crate::hash::{Engine, Keyed, hasher};
 
-const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
+const S: [u8; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
 
 fn k(i: usize) -> u32 {
     const K: [u32; 64] = [
@@ -46,7 +46,7 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
         a = d;
         d = c;
         c = b;
-        b = b.wrapping_add(f.rotate_left(S[(i / 16) * 4 + i % 4]));
+        b = b.wrapping_add(f.rotate_left(S[(i / 16) * 4 + i % 4] as u32));
     }
     for (s, x) in state.iter_mut().zip([a, b, c, d]) {
         *s = s.wrapping_add(x);

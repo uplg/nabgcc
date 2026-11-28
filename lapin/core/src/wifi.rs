@@ -107,7 +107,6 @@ pub const CRYPT_UNSUPPORTED: u8 = 0xFF;
 
 const AUTH_TIMEOUT: u32 = 10;
 const ASSOC_TIMEOUT: u32 = 10;
-const RUN_TIMEOUT: u32 = 600;
 const EAPOL_TIMEOUT: u32 = 600;
 const STA_ASSOC_TIMEOUT: u32 = 200;
 const STA_MAX_IDLE: u32 = 3000;
@@ -374,6 +373,17 @@ const SA_QUERY_RETRY_MS: u32 = 206;
 const SA_QUERY_MAX_MS: u32 = 1024;
 const SA_QUERY_QUIET_MS: u32 = 10_000;
 
+/// Ticks (200 ms) of a running link without a frame from the access
+/// point, about ten of its beacons, before it is asked whether it is
+/// still there; then a probe request every other tick, [`LOSS_PROBES`]
+/// of them, and the link is given up if none is answered. mac80211's
+/// beacon loss (seven beacons, then probes before the disconnection,
+/// net/mac80211/mlme.c), counted in the main loop's ticks: a scan, or
+/// anything that keeps the loop from turning, is not taken for silence.
+/// (The C gave a running link up after two minutes without a beacon.)
+const LOSS_TICKS: u8 = 5;
+const LOSS_PROBES: u8 = 3;
+
 /// A password exchange under way.
 #[derive(Clone)]
 struct SaeRun {
@@ -510,6 +520,9 @@ pub struct Station {
     /// The cached key led to a checked message 3.
     pmksa_proven: bool,
     sa_query: SaQuery,
+    /// Ticks of the running link since the access point was last heard
+    /// (see [`LOSS_TICKS`]).
+    quiet: u8,
     tx: [u8; 2400],
 }
 
@@ -556,41 +569,25 @@ fn mac_at(b: &[u8], at: usize) -> Mac {
     m
 }
 
+/// The rates of the C driver's mask, bit by bit: in 500 kb/s units,
+/// and the stick's number for each.
+const MASK_UNITS: [u8; 12] = [2, 4, 11, 12, 18, 22, 24, 36, 48, 72, 96, 108];
+const MASK_STICK: [u8; 12] = [0, 1, 2, 4, 5, 3, 6, 7, 8, 9, 10, 11];
+
 /// Rate in 500 kb/s units to the rate mask of the C driver.
 fn rate_to_mask(rate: u8) -> u16 {
-    match rate {
-        2 => 1 << 0,
-        4 => 1 << 1,
-        11 => 1 << 2,
-        12 => 1 << 3,
-        18 => 1 << 4,
-        22 => 1 << 5,
-        24 => 1 << 6,
-        36 => 1 << 7,
-        48 => 1 << 8,
-        72 => 1 << 9,
-        96 => 1 << 10,
-        108 => 1 << 11,
-        _ => 0,
-    }
+    MASK_UNITS
+        .iter()
+        .position(|u| *u == rate)
+        .map_or(0, |i| 1 << i)
 }
 
-/// One rate of the mask to its 500 kb/s units and the stick's number.
+/// One rate of the mask to its 500 kb/s units and the stick's number
+/// (anything else: 1 Mb/s).
 fn mask_rate(mask: u16) -> (u8, u8) {
-    match mask {
-        0x001 => (2, 0),
-        0x002 => (4, 1),
-        0x004 => (11, 2),
-        0x008 => (12, 4),
-        0x010 => (18, 5),
-        0x020 => (22, 3),
-        0x040 => (24, 6),
-        0x080 => (36, 7),
-        0x100 => (48, 8),
-        0x200 => (72, 9),
-        0x400 => (96, 10),
-        0x800 => (108, 11),
-        _ => (2, 0),
+    match (0..12).find(|i| mask == 1 << i) {
+        Some(i) => (MASK_UNITS[i], MASK_STICK[i]),
+        None => (2, 0),
     }
 }
 
@@ -753,6 +750,7 @@ impl Station {
                 last: None,
             },
             next_offer: 0,
+            quiet: 0,
             tx: [0; 2400],
         }
     }
@@ -1317,7 +1315,9 @@ impl Station {
         i
     }
 
+    /// A frame from the access point: its signal, and it is still there.
     fn rssi_sample(&mut self, rssi: i16) {
+        self.quiet = 0;
         self.rssi[self.rssi_index] = rssi;
         self.rssi_index += 1;
         if self.rssi_index < RSSI_SAMPLES {
@@ -1327,18 +1327,24 @@ impl Station {
         let sum: i32 = self.rssi.iter().map(|r| *r as i32).sum();
         self.rssi_average = (sum / RSSI_SAMPLES as i32) as i16;
         let a = self.rssi_average;
-        let wanted = match a {
-            _ if a >= -65 => 1 << 11,
-            -66 => 1 << 10,
-            -70..=-67 => 1 << 9,
-            -74..=-71 => 1 << 8,
-            -77..=-75 => 1 << 7,
-            -79..=-78 => 1 << 6,
-            -81..=-80 => 1 << 5,
-            -84..=-82 => 1 << 2,
-            -85 => 1 << 1,
-            _ => 1,
-        };
+        // The fastest rate (its bit in the mask) the signal allows: the
+        // first threshold it reaches, the C driver's ladder as a table.
+        const LADDER: [(i8, u8); 9] = [
+            (-65, 11),
+            (-66, 10),
+            (-70, 9),
+            (-74, 8),
+            (-77, 7),
+            (-79, 6),
+            (-81, 5),
+            (-84, 2),
+            (-85, 1),
+        ];
+        let bit = LADDER
+            .iter()
+            .find(|(floor, _)| a >= *floor as i16)
+            .map_or(0, |(_, bit)| *bit);
+        let wanted = 1 << bit;
         self.txrate = self.closest_rate(wanted);
     }
 
@@ -1490,6 +1496,22 @@ impl Station {
                     self.sae_send_again(link);
                 }
             }
+            if self.state == State::Run {
+                // A running link is watched by what comes from the
+                // access point (the C gave it up after two minutes
+                // without a beacon): unheard, ask it, then give it up.
+                self.quiet += 1;
+                if self.quiet > LOSS_TICKS + 2 * LOSS_PROBES {
+                    self.state = State::Idle;
+                } else if self.quiet > LOSS_TICKS && (self.quiet - LOSS_TICKS) & 1 != 0 {
+                    let at = self.header_to_ap(link, 0x40, 0);
+                    let at = put_element(&mut self.tx, at, 0, &self.ssid[..self.ssid_len]);
+                    let at = put(&mut self.tx, at, &RATES);
+                    self.send_management(link, at, false);
+                }
+                return;
+            }
+            self.quiet = 0;
             if self.timeout > 0 {
                 self.timeout -= 1;
             }
@@ -1616,10 +1638,21 @@ impl Station {
                     link.transmit(&self.tx[..n], &tx);
                 }
             }
-            0x50 | 0x80 => {
-                if managed && self.state == State::Run && sent_by_ap && our_bss {
-                    self.timeout = RUN_TIMEOUT;
-                }
+            0x50 | 0x80
+                if managed
+                    && sent_by_ap
+                    && our_bss
+                    && self.state == State::Auth
+                    && self.timeout < AUTH_TIMEOUT
+                    && !self.shared_auth
+                    && !self.is_wpa3() =>
+            {
+                // Joining, unanswered for a tick (the access point was
+                // off, and is back): ask again now, not at the timeout,
+                // once a tick at most.
+                self.timeout = AUTH_TIMEOUT;
+                let ap = self.ap;
+                self.send_auth(link, &ap, 0, 1, 0);
             }
             0xB0 if len >= 30 => {
                 let algorithm = le16(frame, 24);
@@ -1701,7 +1734,6 @@ impl Station {
                     self.replay_active = false;
                 } else {
                     self.state = State::Run;
-                    self.timeout = RUN_TIMEOUT;
                 }
             }
             0xA0 | 0xC0 => {
@@ -2466,7 +2498,6 @@ impl Station {
             return;
         }
         self.state = State::Run;
-        self.timeout = RUN_TIMEOUT;
         self.install_group_keys(link, plain, Self::key_rsc(f));
         self.keys = KeyState::Run;
     }
@@ -2491,7 +2522,6 @@ impl Station {
         if !self.is_wpa1() {
             self.install_group_keys(link, plain, Self::key_rsc(f));
         }
-        self.timeout = RUN_TIMEOUT;
     }
 
     /// What a first message 3 and a rekey's have in common: the nonce,
@@ -2682,7 +2712,6 @@ impl Station {
         );
         self.keys = KeyState::Run;
         self.state = State::Run;
-        self.timeout = RUN_TIMEOUT;
     }
 
     // ---- WPA3: the password exchange --------------------------------------
@@ -3033,7 +3062,6 @@ mod tests {
         s.bssid = AP;
         s.security = security;
         s.state = State::Run;
-        s.timeout = RUN_TIMEOUT;
         s.keys = KeyState::Run;
         s
     }
@@ -3689,5 +3717,107 @@ mod tests {
         input(&mut s, &mut air, &f, false);
         assert_eq!(air.sent.len(), 1);
         assert_eq!(air.sent[0][26..30], [0, 0, 14, 0]);
+    }
+
+    /// A beacon of `AP`: timestamp, interval, capabilities, no element.
+    fn beacon() -> Vec<u8> {
+        frame([0x80, 0], &BROADCAST, &AP, &AP, &[0; 12])
+    }
+
+    /// The access point unheard on a running link: five quiet ticks,
+    /// then a probe request to it every other tick, three, and the link
+    /// given up at the next; anything from it starts the count again.
+    /// (The station kept a running link two minutes without a beacon.)
+    #[test]
+    fn a_running_link_is_given_up_when_its_access_point_is_gone() {
+        let mut s = running(WPA2);
+        let mut air = Air::default();
+        let probes = |air: &Air| air.sent.iter().filter(|f| f[0] == 0x40).count();
+        for _ in 0..5 {
+            s.tick(&mut air);
+        }
+        assert_eq!((s.state, probes(&air)), (State::Run, 0));
+        s.tick(&mut air);
+        assert_eq!(probes(&air), 1);
+        let probe = &air.sent[0];
+        assert_eq!((&probe[4..10], &probe[16..22]), (&AP[..], &AP[..]));
+        // A beacon: the count starts again.
+        input(&mut s, &mut air, &beacon(), false);
+        for _ in 0..5 {
+            s.tick(&mut air);
+        }
+        assert_eq!((s.state, probes(&air)), (State::Run, 1));
+        for _ in 0..6 {
+            s.tick(&mut air);
+        }
+        assert_eq!((s.state, probes(&air)), (State::Run, 4));
+        s.tick(&mut air);
+        assert_eq!(s.state, State::Idle);
+    }
+
+    /// Joining an access point that does not answer (it was off): its
+    /// beacon heard again, the authentication goes out again, once a
+    /// tick at most, without waiting out the two seconds of the attempt.
+    #[test]
+    fn an_unanswered_authentication_goes_again_when_the_beacon_comes_back() {
+        let mut s = running(WPA2);
+        s.state = State::Auth;
+        s.timeout = AUTH_TIMEOUT;
+        let mut air = Air::default();
+        let auths = |air: &Air| air.sent.iter().filter(|f| f[0] == 0xB0).count();
+        input(&mut s, &mut air, &beacon(), false);
+        assert_eq!(auths(&air), 0, "answered within a tick, maybe");
+        s.tick(&mut air);
+        input(&mut s, &mut air, &beacon(), false);
+        input(&mut s, &mut air, &beacon(), false);
+        assert_eq!(auths(&air), 1);
+        assert_eq!((s.state, s.timeout), (State::Auth, AUTH_TIMEOUT));
+    }
+
+    /// The rate tables as the C driver's cases had them.
+    #[test]
+    fn the_rates_of_the_mask_are_the_c_driver_s() {
+        let cases = [
+            (2, 0),
+            (4, 1),
+            (11, 2),
+            (12, 4),
+            (18, 5),
+            (22, 3),
+            (24, 6),
+            (36, 7),
+            (48, 8),
+            (72, 9),
+            (96, 10),
+            (108, 11),
+        ];
+        for (bit, (units, stick)) in cases.into_iter().enumerate() {
+            assert_eq!(rate_to_mask(units), 1 << bit);
+            assert_eq!(mask_rate(1 << bit), (units, stick));
+        }
+        assert_eq!(rate_to_mask(3), 0);
+        assert_eq!(mask_rate(0x003), (2, 0));
+        assert_eq!(mask_rate(0x1000), (2, 0));
+        // The signal's ladder: every average, against the C's cases.
+        let c = |a: i16| match a {
+            _ if a >= -65 => 1 << 11,
+            -66 => 1 << 10,
+            -70..=-67 => 1 << 9,
+            -74..=-71 => 1 << 8,
+            -77..=-75 => 1 << 7,
+            -79..=-78 => 1 << 6,
+            -81..=-80 => 1 << 5,
+            -84..=-82 => 1 << 2,
+            -85 => 1 << 1,
+            _ => 1,
+        };
+        for a in -128..=0i16 {
+            let mut s = running(WPA2);
+            s.rateset = 0xFFF;
+            for _ in 0..RSSI_SAMPLES {
+                s.rssi_sample(a);
+            }
+            assert_eq!(s.txrate, c(a), "{a}");
+        }
     }
 }

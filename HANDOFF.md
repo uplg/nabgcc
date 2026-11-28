@@ -295,6 +295,28 @@ What the bytecode sees:
   no longer once it works; r3 never says it (its host controller driver
   hands a failed transfer over as a short packet) and sees the link
   lost when its wait runs out.
+- **netState** says idle (1) about two and a half seconds after the
+  access point vanished (switched off, out of range), where r3 says
+  connected (4) for two minutes, its timeout refreshed by beacons,
+  unless the bytecode sends and the restarted access point throws it
+  out (Known defect, `tests/link.rs`,
+  `notices_the_access_point_switched_off`). Beacon loss as mac80211
+  has it (`net/mac80211/mlme.c`: seven beacons missed, then probe the
+  access point before the disconnection): five ticks of the main loop
+  (200 ms each) without a frame from the access point, about ten of
+  its beacons, then three unicast probe requests a tick apart, and the
+  link is given up if none is answered (any frame from the access
+  point, a beacon, a probe response, data, counts). Counted in ticks,
+  not on the clock: a scan, or a bytecode that keeps the loop from
+  turning, is not taken for silence; a band too busy to hear every
+  beacon still lets one through in a second (the scorecard's crowded,
+  WPA3 and two-minute scenarios keep their link). While the program
+  joins again, its authentication goes out once more as soon as the
+  access point's beacon is heard again, rather than at the end of the
+  two-second wait for an answer (open, WEP open system and WPA/WPA2
+  only; WPA3's exchange and shared keys keep their own retries): back
+  on the network 156 ms after the access point is on again (r3, thrown
+  out at its next frame, 221).
 - **Environment** across a change of bytecode: up to 32 KB, as r3
   effectively keeps (its 4 KB audio buffer and what follows, up to its
   USB heap); past that r3 corrupts its USB heap and restarts, lapin
