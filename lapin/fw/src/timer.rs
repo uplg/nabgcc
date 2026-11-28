@@ -32,6 +32,12 @@ pub fn millis() -> u32 {
     MILLIS.get()
 }
 
+/// Milliseconds gone by since `start`, an earlier [`millis`], across
+/// its wrapping.
+pub fn since(start: u32) -> u32 {
+    millis().wrapping_sub(start)
+}
+
 /// Wait at least `ms` milliseconds, feeding the watchdog. With
 /// interrupts held back (inside [`irq::free`]) the tick cannot come:
 /// the timer's overflow flag is counted here instead, and the clock
@@ -42,7 +48,7 @@ pub fn delay_ms(ms: u32) {
         irq::irq_enable();
         let start = millis();
         // One more than asked: `start` may be the end of a tick.
-        while millis().wrapping_sub(start) <= ms {
+        while since(start) <= ms {
             watchdog::feed();
         }
         return;

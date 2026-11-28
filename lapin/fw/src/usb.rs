@@ -345,7 +345,7 @@ pub fn attach(timeout_ms: u32) -> Result<(), Error> {
     let mut resetting = false;
     loop {
         watchdog::feed();
-        if timer::millis().wrapping_sub(start) > timeout_ms {
+        if timer::since(start) > timeout_ms {
             return Err(Error::Timeout);
         }
         if !PORT_CHANGED.get() {
@@ -433,7 +433,7 @@ pub fn control(
         if result != PENDING {
             break result;
         }
-        if broken() || timer::millis().wrapping_sub(start) > 500 {
+        if broken() || timer::since(start) > 500 {
             // Take the transfer back from the controller.
             irq::free(|| {
                 word(ED_CONTROL).write(word(ED_CONTROL).read() | ED_SKIP);

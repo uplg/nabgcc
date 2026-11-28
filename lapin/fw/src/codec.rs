@@ -27,7 +27,7 @@ const MODE_RECORD: u16 = 0x3000;
 /// rabbit without sound, not a frozen one.
 fn wait_ready() {
     let start = timer::millis();
-    while !board::codec_wants_data() && timer::millis().wrapping_sub(start) < 500 {
+    while !board::codec_wants_data() && timer::since(start) < 500 {
         watchdog::feed();
     }
 }

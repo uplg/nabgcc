@@ -77,7 +77,7 @@ impl Link for Radio<'_> {
                 return true;
             }
             watchdog::feed();
-            if timer::millis().wrapping_sub(start) > TX_WAIT_MS {
+            if timer::since(start) > TX_WAIT_MS {
                 TX_LOST.set(TX_LOST.get() + 1);
                 return false;
             }
@@ -131,7 +131,7 @@ impl Link for Radio<'_> {
         // air, retries included, at the lowest rate (the RT2573 reports
         // no transmit status over USB: the time is waited out).
         let start = timer::millis();
-        while usb::tx_busy() && timer::millis().wrapping_sub(start) <= TX_WAIT_MS {
+        while usb::tx_busy() && timer::since(start) <= TX_WAIT_MS {
             watchdog::feed();
         }
         timer::delay_ms(AIR_MS);

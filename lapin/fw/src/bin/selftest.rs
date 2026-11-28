@@ -46,13 +46,13 @@ fn teeth_per_turn(ear: usize) -> u16 {
     let mut last_at = start;
     let mut reference: Option<u16> = None;
     let mut result = 0;
-    while timer::millis().wrapping_sub(start) < 15_000 {
+    while timer::since(start) < 15_000 {
         watchdog::feed();
         let now = ears::teeth(ear);
         if now == last {
             continue;
         }
-        let waited = timer::millis().wrapping_sub(last_at);
+        let waited = timer::since(last_at);
         last = now;
         last_at = timer::millis();
         // A long wait between two teeth: the gap just went by.
@@ -188,7 +188,7 @@ extern "C" fn main() -> ! {
     codec::record_start(8000, 1024);
     let start = timer::millis();
     let mut words = 0;
-    while timer::millis().wrapping_sub(start) < 1000 {
+    while timer::since(start) < 1000 {
         watchdog::feed();
         words += codec::record_read(&mut tape[words..]);
     }

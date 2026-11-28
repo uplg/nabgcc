@@ -202,7 +202,7 @@ impl Rescue {
         options.ack = ack;
         let start = timer::millis();
         while !stick.transmit(&self.frame[..len], &options)
-            && timer::millis().wrapping_sub(start) < 50
+            && timer::since(start) < 50
         {
             watchdog::feed();
         }
@@ -224,7 +224,7 @@ impl Rescue {
             // for two seconds), do what it said.
             let through = self.tcp == Tcp::Listen
                 || (self.tcp == Tcp::Closing
-                    && (self.ends.ours_acked || timer::millis().wrapping_sub(self.sent_at) > 2000));
+                    && (self.ends.ours_acked || timer::since(self.sent_at) > 2000));
             if through && self.after != After::Nothing {
                 match self.after {
                     After::Flash(len) => {
@@ -250,7 +250,7 @@ impl Rescue {
             // application another try.
             if app_present
                 && self.tcp == Tcp::Listen
-                && timer::millis().wrapping_sub(self.last_visit) > IDLE_MS
+                && timer::since(self.last_visit) > IDLE_MS
             {
                 uart::write(b"secours: back to the application\n");
                 Slots::fresh();
@@ -482,7 +482,7 @@ impl Rescue {
         if matches!(self.tcp, Tcp::Established | Tcp::Closing)
             && !(self.tcp == Tcp::Closing && self.ends.ours_acked)
             && !self.answer.is_empty()
-            && timer::millis().wrapping_sub(self.sent_at) > RETRY_MS
+            && timer::since(self.sent_at) > RETRY_MS
         {
             self.send_next(stick);
         }
@@ -514,7 +514,7 @@ impl Rescue {
             // upload. One silent for ten seconds is given up.
             let busy = self.tcp != Tcp::Listen
                 && !ours
-                && timer::millis().wrapping_sub(self.heard_at) < 10_000;
+                && timer::since(self.heard_at) < 10_000;
             if busy {
                 return;
             }
