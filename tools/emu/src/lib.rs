@@ -181,7 +181,8 @@ impl Machine {
         let before = self.cpu.pc();
         let cycles = self.cpu.step(&mut self.soc);
         self.instructions += 1;
-        if self.skip_idle && self.cpu.pc() < before {
+        // The skip does not know the late line: none with it.
+        if self.skip_idle && !self.irq_lag && self.cpu.pc() < before {
             self.at_loop_head();
         }
         // Before the firmware sets a stack, the register holds anything.
