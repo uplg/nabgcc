@@ -100,13 +100,18 @@ impl Board {
     /// Take every frame from the stick: the station handles what is
     /// its own (management, handshakes), what is for the bytecode goes
     /// to the inbox. As the C driver did in the USB interrupt, whatever
-    /// the bytecode has not taken yet.
-    fn pump(&mut self) {
+    /// the bytecode has not taken yet. With `work`, the station's
+    /// pending work (a step of a password exchange) is done first: from
+    /// the main loop's turns, which feed the sound between steps, not
+    /// from a bytecode that asks the state in a loop.
+    fn pump(&mut self, work: bool) {
         let frame = &mut *self.frame;
         let Some(mut radio) = link(&mut self.stick, &mut self.pool) else {
             return;
         };
-        self.station.poll(&mut radio);
+        if work {
+            self.station.poll(&mut radio);
+        }
         while let Some(rx) = radio.receive(frame) {
             if let Some(d) = self.station.input(&mut radio, frame, rx) {
                 self.inbox.push(&frame[d.start..d.start + d.len], &d.source);
@@ -116,7 +121,7 @@ impl Board {
 
     /// Throw away everything received (`rt2501_setmode` does).
     fn flush(&mut self) {
-        self.pump();
+        self.pump(false);
         self.inbox.clear();
     }
 }
@@ -306,7 +311,7 @@ impl Host for Board {
         // The C driver handled management frames in the interrupt, so
         // the state moved while the bytecode ran: what has arrived is
         // taken into account first.
-        self.pump();
+        self.pump(false);
         self.station.net_state()
     }
 
@@ -440,7 +445,7 @@ impl Host for Board {
     }
 
     fn net_pending(&mut self) -> Option<usize> {
-        self.pump();
+        self.pump(true);
         self.inbox.front()
     }
 
