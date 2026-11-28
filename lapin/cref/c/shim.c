@@ -75,7 +75,7 @@ void __enable_interrupt(void) {}
 
 void putst_uart(uint8_t *str) { rs_console(str, strlen((char *)str)); sync(); }
 void putbin_uart(uint8_t *str, uint32_t len) { rs_console(str, len); sync(); }
-void putch_uart(uint8_t c) { rs_console(&c, 1); }
+void putch_uart(uint8_t c) { rs_console(&c, 1); sync(); }
 void putint_uart(int32_t v)
 {
   char buf[16];

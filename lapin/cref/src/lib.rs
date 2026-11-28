@@ -49,6 +49,14 @@ pub struct World {
     pub rebooted: bool,
     /// Set by the test to stop the run once the machine has printed it.
     pub stop_at: Option<Vec<u8>>,
+    /// The tags in front of the reader, whose blocks read and write.
+    pub tags: Vec<[u8; 8]>,
+    /// What `net_send` answers: 1, the frame went.
+    pub send_result: i32,
+    /// Board time each call that shows in the log, and each byte
+    /// printed, takes: the clock the machine reads moves between its
+    /// calls.
+    pub ms_per_call: u64,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -102,11 +110,25 @@ impl World {
             adc: 200,
             rebooted: false,
             stop_at: None,
+            tags: vec![
+                [0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F],
+                [0xD0, 0x02, 0x18, 0x01, 0x02, 0x03, 0x04, 0x05],
+            ],
+            send_result: 1,
+            ms_per_call: 1,
         }
     }
 
     fn note(&mut self, s: String) {
         self.log.push(s);
+        self.now_ms += self.ms_per_call;
+    }
+
+    /// What block `block` of tag `id` holds: made of both, so that a
+    /// read shows which tag and block it was.
+    fn block(id: &[u8; 8], block: i32) -> [u8; 4] {
+        let b = block as u8;
+        [id[7] ^ b, id[6].wrapping_add(b), b, id[0]]
     }
 
     /// Frames the network sent to the rabbit, as the driver hands them
@@ -145,6 +167,9 @@ impl World {
 impl Host for World {
     fn console(&mut self, text: &[u8]) {
         self.console.extend_from_slice(text);
+        // By the byte: the serial port carries bytes, and the two
+        // machines may cut the same text into different calls.
+        self.now_ms += self.ms_per_call * text.len() as u64;
     }
     fn time_ms(&mut self) -> u32 {
         self.now_ms as u32
@@ -170,21 +195,25 @@ impl Host for World {
         self.adc
     }
     fn rfid_first(&mut self) -> Option<[u8; 8]> {
-        None
+        self.tags.first().copied()
     }
     fn rfid_count(&mut self) -> i32 {
-        0
+        self.tags.len() as i32
     }
-    fn rfid_nth(&mut self, _: i32) -> [u8; 8] {
-        [0; 8]
+    fn rfid_nth(&mut self, i: i32) -> [u8; 8] {
+        self.tags.get(i as usize).copied().unwrap_or([0; 8])
     }
-    fn rfid_read(&mut self, id: &[u8; 8], block: i32, _: &mut [u8; 4]) -> i32 {
+    fn rfid_read(&mut self, id: &[u8; 8], block: i32, data: &mut [u8; 4]) -> i32 {
         self.note(format!("rfid read {} {block}", hex(id)));
-        1
+        if !self.tags.contains(id) {
+            return 1;
+        }
+        *data = Self::block(id, block);
+        0
     }
     fn rfid_write(&mut self, id: &[u8; 8], block: i32, data: &[u8; 4]) -> i32 {
         self.note(format!("rfid write {} {block} {}", hex(id), hex(data)));
-        1
+        if self.tags.contains(id) { 0 } else { 1 }
     }
     fn i2c_read(&mut self, address: u8, data: &mut [u8]) -> bool {
         self.note(format!("i2c read {address} {}", data.len()));
@@ -263,7 +292,7 @@ impl Host for World {
             self.lan.input(eth);
             self.collect();
         }
-        0
+        self.send_result
     }
     fn net_mac(&mut self) -> [u8; 6] {
         MAC

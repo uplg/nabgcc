@@ -905,3 +905,30 @@ fn a_bytecode_with_an_absurd_size_is_survived() {
     let bc = bytecode(&[], &[&m]);
     rust_within(&bc, 0, 10);
 }
+
+/// The board's clock moves with every call the machine makes to it
+/// (`World::ms_per_call`): both machines read the same milliseconds
+/// and seconds between prints and leds, across a second's boundary.
+#[test]
+fn the_clock_moves_between_calls() {
+    let mut f = Fun::new(0, 0);
+    for k in 0..6 {
+        f.op(TIME_MS).show();
+        f.op(TIME).show();
+        f.int(k).int(0x00FF00).op(LED).op(DROP);
+    }
+    f.op(NIL_).op(RET);
+    let bc = bytecode(&[], &[&f]);
+    let world = || {
+        let mut w = World::quiet();
+        w.now_ms = 994;
+        w
+    };
+    let c = run_both(world, &bc, 1);
+    let shown = String::from_utf8_lossy(&c.world.console).into_owned();
+    // A millisecond a byte printed, and one for the led.
+    assert!(
+        shown.starts_with("994\r\n0\r\n1003\r\n1\r\n1013\r\n"),
+        "{shown}"
+    );
+}
