@@ -528,9 +528,10 @@ fn net_pmk_of_a_name_too_long() {
         });
         assert_eq!(printed(&m), [0], "the same key");
     } else {
-        // Ninety seconds on, nothing more: the second key never comes
-        // (the first takes a few seconds).
-        let m = running_for(&strings, &program(&body), 90_000);
+        // Thirty seconds on, nothing more: the second key never comes
+        // (the first takes a few seconds; the hang is a busy loop, which
+        // the emulator cannot skip, so a longer wait only costs).
+        let m = running_for(&strings, &program(&body), 30_000);
         assert!(find(&m.soc.uart_tx, b"8880").is_none());
         assert_eq!(printed(&m), []);
     }

@@ -72,7 +72,11 @@ jobs:
           77ee88662552bdc885c1080c0172ff119d54db791bd73b21808cf1ff1fe5b40e  tests/roms/arm.gba
           b5cb2291df4ab314b31c598acd9bff2ccfa0b38efff29daadfe97422ce369b67  tests/roms/thumb.gba
           SUMS
-      - run: cargo nextest run --release --no-fail-fast
+      - name: Every test that follows the firmware under test, on r3
+        run: |
+          read -ra fixed < <(sed -n 's/^lapin_fixed: //p' ../../.github/lapin-suites)
+          filter="not ($(printf 'binary(%s) | ' "${fixed[@]}" | sed 's/ | $//'))"
+          cargo nextest run --release --no-fail-fast -E "$filter"
       - run: cargo test --release --doc
 
   on-lapin:
@@ -99,6 +103,8 @@ jobs:
           NABEMU_FIRMWARE: lapin
         run: |
           read -ra suites < <(sed -n 's/^lapin_suites: //p' ../../.github/lapin-suites)
+          read -ra fixed < <(sed -n 's/^lapin_fixed: //p' ../../.github/lapin-suites)
+          for t in "${fixed[@]}"; do suites+=(--test "$t"); done
           cargo nextest run --release --no-fail-fast "${suites[@]}"
       - uses: oven-sh/setup-bun@v2
       - name: Build for the browser and test that build under bun
