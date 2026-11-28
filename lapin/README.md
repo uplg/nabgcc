@@ -13,6 +13,7 @@ in this repository. It is developed against the emulator in
 | `core` | everything portable: the hashes and ciphers 802.11 uses (SHA-1, SHA-256, MD5, RC4, AES with CCM, CMAC and key wrap), CCMP and BIP, the WPA3 password exchange (SAE), and the 802.11 station and setup access point |
 | `metal` | the Metal virtual machine that runs the bytecode, as the C firmware runs it |
 | `cref` | tests only: the C firmware's machine built for the host, to check `metal` against word for word |
+| `pack` | for the build: `lapin-first.bin`, the application packed behind the rescue core |
 | `fw` | the firmware itself, for the ARM7TDMI (`thumbv4t-none-eabi`) |
 
 `p256`, `core` and `metal` have no dependency and no allocation, and
@@ -103,7 +104,11 @@ rewrite: a power cut during an update, or an image that keeps
 crashing, leaves a rabbit that raises "Nabaztag-secours" and takes a
 new image from a phone (`src/boot.rs`, `src/rescue.rs`); the button
 held 20 seconds from power-on asks for it too. `build.sh`
-makes `target/lapin-full.bin`, the image to flash or to send.
+makes `target/lapin-full.bin`, the image a lapin rabbit is sent to
+update, and `target/lapin-first.bin`, the one sent once to a rabbit
+that still runs the C firmware: the rescue core, then the application
+packed (`pack`, `core/src/pack.rs`), which the rescue core unpacks and
+writes at its first start (`docs/first-flash.md`).
 
 ## What is left
 

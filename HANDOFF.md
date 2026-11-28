@@ -55,16 +55,13 @@ fixed or documented, with tests (`tools/emu/tests/c_audit.rs`,
 Léonard rules out a first flash by JTAG: the C to lapin migration must
 be safe over the air by construction. In this order:
 
-1. **A packed first image.** r3 writes lapin-full.bin with the watchdog
-   unfed (its `flash_uc`): 1907 ms of the 2097 with typical flash
-   timings, a bite at the manual's slowest erase (`first_flash.rs`).
-   The first image r3 writes is to be the rescue core plus the
-   application LZ-packed (about 75 KB, under the watchdog even at the
-   manual's worst); the rescue core unpacks it into the external RAM,
-   checks its CRC and writes it, feeding the watchdog. The rescue core
-   has 432 bytes left of its budget. A power cut in the first ~0.35 s,
-   while r3 writes the rescue core itself, stays fatal (pinned as a
-   Known defect): nothing on the lapin side can change that.
+1. **A packed first image: done.** The server sends an r3 rabbit
+   `lapin-first.bin`, once (see "The first flash" below and
+   `docs/first-flash.md`): 1931 ms unfed at the manual's slowest flash,
+   166 ms to spare, where `lapin-full.bin` is bitten. A power cut in
+   the first ~0.35 s, while r3 writes the rescue core itself, stays
+   fatal (pinned as a Known defect): nothing on the lapin side can
+   change that.
 2. **The final nose pass** over the whole repository, the Svelte page
    included.
 3. **Review `docs/first-flash.md`** (no JTAG in it). Its largest open
@@ -73,8 +70,8 @@ be safe over the air by construction. In this order:
 4. **Measure the CI cold** (local and GitHub): the audits added about a
    hundred tests; nothing slow should be left that need not be.
 5. Leftovers: the flash command timing made explicit (manual 20.5.5)
-   and checked by the model; INTST.RSTSTATUS read before `arm()`;
-   tests that could not fail before (M11, A14 in the emulator, I1, the
+   and checked by the model; (INTST.RSTSTATUS read before `arm()`:
+   done, see the rescue core below); tests that could not fail before (M11, A14 in the emulator, I1, the
    data toggle after a take-back, the I2C STOP after a timeout, the
    receive overflow path); a quirk seen in `scan_connected.rs`: the last
    global of a test bytecode read empty in a loop callback, on r3 and
@@ -85,7 +82,7 @@ be safe over the air by construction. In this order:
 
 **Flash budget.** 124 KB below the settings sector. lapin takes 111.2
 KB (113 840 bytes), the boot bytecode's 27.6 KB included, packed to 16
-KB, and the rescue core's 20 KB (19 232 bytes used): 12.8 KB left. The curve and the
+KB, and the rescue core's 20 KB (19 380 bytes used of its 20 472, the first image's unpacker in them): 12.8 KB left. The curve and the
 machine are built at opt-level 2 for speed (about 7 KB between them).
 
 **Speed.** The interpreter outruns the C one: 1.0 s against 1.7 s on a
@@ -160,7 +157,13 @@ whole only when both its parts check (a power cut in its first 20 KB
 still kills the rabbit: there is one core); one that starts as lapin
 but is damaged or cut is refused. The C firmware's images are still
 written whole, unchecked, with the old risk (Léonard to decide whether
-to keep that way back).
+to keep that way back). The first image (`lapin-first.bin`, below) is
+for r3 only: lapin refuses it. The core tells a power-on from a
+watchdog restart by INTST.RSTSTATUS (manual table 11-2), read before
+its watchdog's start clears it: a power-on counts no failed start even
+if the RAM kept the counting words, a watchdog restart counts even if
+they were lost (a "start afresh" is now a word of its own, not a
+cleared one).
 
 **The review.** Three independent reviews (station and crypto, the
 machine against the C, the firmware and rescue core) found about forty
@@ -205,8 +208,14 @@ What the bytecode sees:
 - **Scan results**: one entry per network (BSSID and name), the
   strongest frame heard, up to 256 networks; r3 lists every frame it
   hears, as many as its heap holds, and loses some neighbours in a
-  crowded band (175 of 201 listed, `tests/crowded.rs`). The boot keeps
-  the strongest per name anyway (`filterscan`).
+  crowded band (175 of 201 listed, `tests/crowded.rs`). lapin loses
+  some too there: it takes about two frames a millisecond off the
+  stick, 240 of the 1400 that 200 neighbours beaconing every 20 ms send
+  in its 120 ms on a channel, and lists 119 to 201 of them depending on
+  where the beacons' rounds stand when it starts (the emulator's
+  beacons keep in step; it listed 201 until the rescue core's start got
+  15 ms faster). The boot keeps the strongest per name anyway
+  (`filterscan`).
 - **Scan codes**: a WPA element whose group cipher is WEP is reported
   0xFF (cannot join: neither handshake installs a WEP group key); r3
   says WPA. An RSN network offering SAE alone is WPA2 to lapin, which
@@ -306,8 +315,11 @@ wrong:
   the next channel (the C leaves it raised). Beacons and their slots
   are cleared at start, as Linux's rt73usb does (the C never cleared
   them: the rescue network kept beaconing after a restart). Radio types
-  other than RT2528 and RT2527 are refused by name; the C, finding no
-  synthesiser table, never tunes them, receiver on and deaf. The IVs
+  other than RT2528 and RT2527 are refused by name. (This used to say
+  the C has no table for the others: it has, `rt2501usb.c:153` and
+  `:173`, the RT5226's and the RT5225's, which the RT2527 shares; a
+  rabbit with one of the two 5 GHz radios would work on r3 and not on
+  lapin, see `docs/first-flash.md` item 14.) The IVs
   the replay check reads (descriptor words 2 and 3, as rt73usb reads
   them; the C never did) go to the serial port for the first frames.
 - USB wire: the root hub is served in the interrupt, as the C; the
@@ -360,14 +372,35 @@ wrong:
 - Self-test: what it writes (the settings' first bytes, a tag block) it
   puts back.
 
-**The first flash, measured.** `tests/first_flash.rs`: r3 writing
-`lapin-full.bin` over the air, unfed by its own routine, takes 1907 ms
-of the watchdog's 2097 with the flash's typical timings; with the
-manual's slowest (50 ms an erase) the watchdog bites after 21581 of
-28113 operations, the rescue core whole, which raises its network. A
-power cut anywhere after the rescue core's 20 KB leaves the rescue
-network; one during those (the first sixth of the write) leaves a dead
-rabbit. `docs/first-flash.md` is the checklist.
+**The first flash, measured.** `tests/first_flash.rs`. r3 writes
+the flash unfed by its own routine: `lapin-full.bin` takes 1951 ms of
+the watchdog's 2097 with the flash's typical timings, and with the
+manual's slowest (50 ms an erase, 40 µs a word) it is bitten after
+21577 of 28558 operations. So the first image, which the server sends
+an r3 rabbit once, is `lapin-first.bin` (81.7 KB, from `lapin/build.sh`
+through `lapin/pack`): the same rescue core, then the application
+packed to 64.6 % (`lapin/core/src/pack.rs`: LZ77 and an adaptive binary
+coder, rANS with 12-bit probabilities, after a filter that makes
+Thumb's BL offsets targets; copies reach back into the rescue core,
+which the application shares much code with; LZMA at its best does
+59.4 KB against these 61.2) behind a header "LAPP" (packed length,
+unpacked length, CRC-32 of each). r3 writes it with the watchdog unfed
+1371 ms typically, 1931 ms at the slowest: 166 ms to spare. That is
+thin: a sector more costs about 97 ms, the image is 211 bytes short of
+one, and `build.sh` prints that number. At its first start the rescue
+core finds no application but the packed one, unpacks it into the
+external RAM behind a copy of itself (2.5 s), checks its CRC and
+header, writes the 9 sectors past the packed ones (which leaves those
+whole), restarts, unpacks again, writes the rest over them, restarts
+into lapin: 6.4 s, the watchdog fed (54 ms unfed at most). Cuts at
+every 32nd of that: while the packed application is whole (the first
+5.2 s) the rabbit unpacks again and comes back on lapin; in the last
+step (it cannot keep the packed application: 92.6 KB and 60 KB do not
+both fit in 104) it comes back on the rescue network. Cuts at every
+16th of r3's write: past the rescue core's 20 KB, the rescue network;
+during them (the first 0.35 s) a dead rabbit, the one window left, a
+Known defect nothing on lapin's side can close. `docs/first-flash.md`
+is the checklist.
 
 **Harsher hardware.** The emulator can make the root hub's interrupt
 a level (`NABEMU_RHSC_LEVEL`), the USB interrupt line slow to fall
