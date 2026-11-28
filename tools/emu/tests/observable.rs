@@ -353,3 +353,88 @@ fn time_goes_on_across_the_wrap_of_the_milliseconds() {
     };
     assert!((5..=7).contains(&(after - before)), "{before} then {after}");
 }
+
+const STRLEN: u8 = 68;
+const STRGET: u8 = 69;
+const BYTECODE: u8 = 93;
+const ENVGET: u8 = 98;
+const ENVSET: u8 = 99;
+
+/// The environment a bytecode leaves (`len` bytes, byte `i` = i % 251)
+/// as the next one sees it: its length, and bytes along it (nil, not
+/// printed as a number, past its end).
+fn environment_carried(len: usize) -> Vec<i64> {
+    let mut next = metal::FUNCTION_HEADER.to_vec();
+    next.extend([ENVGET, STRLEN, IECHOLN, DROP]);
+    for at in [
+        0, 4095, 4096, 4500, 6999, 8191, 8192, 20_000, 32_767, 32_768,
+    ] {
+        next.extend([ENVGET]);
+        next.extend(metal::int(at));
+        next.extend([STRGET, IECHOLN, DROP]);
+    }
+    next.extend(metal::int(8880));
+    next.extend([IECHOLN, metal::OP_RET]);
+    let next = metal::bytecode(&[], &next);
+    let env: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut first = metal::FUNCTION_HEADER.to_vec();
+    first.extend(metal::int(7770));
+    first.extend([IECHOLN, DROP]);
+    first.extend([metal::OP_GETGLOBALB, 1, ENVSET, DROP]);
+    first.extend([metal::OP_GETGLOBALB, 0, BYTECODE, metal::OP_RET]);
+    let m = ran(&metal::bytecode(&[&next, &env], &first));
+    printed(&m)
+}
+
+/// An environment of more than 4 KB handed to the next bytecode: the
+/// C firmware copies it through its 4 KB audio buffer and on over what
+/// follows (another 4 KB buffer of scratch, then free memory), and the
+/// next bytecode gets it whole, up to the USB heap 32 KB on. lapin cut
+/// it to 4 KB. (A busy neighbourhood makes the boot's own large: it
+/// carries the scan.)
+#[test]
+fn an_environment_of_7000_bytes_goes_whole_to_the_next_bytecode() {
+    let at = |i: i64| i % 251;
+    let expected = [7000, at(0), at(4095), at(4096), at(4500), at(6999)];
+    assert_eq!(environment_carried(7000), expected);
+}
+
+#[test]
+fn an_environment_of_32_kb_goes_whole_to_the_next_bytecode() {
+    let at = |i: i64| i % 251;
+    let expected = [
+        32_768,
+        at(0),
+        at(4095),
+        at(4096),
+        at(4500),
+        at(6999),
+        at(8191),
+        at(8192),
+        at(20_000),
+        at(32_767),
+    ];
+    assert_eq!(environment_carried(32_768), expected);
+}
+
+/// Known defect of r3: an environment longer than 32 KB is copied over
+/// the USB heap that follows: the watchdog restarts the rabbit, again
+/// and again. lapin carries the first 32 KB, and runs on.
+#[test]
+fn an_environment_past_32_kb_is_cut() {
+    if nabemu::testing::is_lapin() {
+        let carried = environment_carried(40_000);
+        assert_eq!(carried[0], 32_768, "{carried:?}");
+        return;
+    }
+    let mut m = common::under_test();
+    let env = vec![0x41u8; 40_000];
+    let mut first = metal::FUNCTION_HEADER.to_vec();
+    first.extend([metal::OP_GETGLOBALB, 1, ENVSET, DROP]);
+    first.extend([metal::OP_GETGLOBALB, 0, BYTECODE, metal::OP_RET]);
+    let next = metal::print_number(8880);
+    m.serve(&metal::bytecode(&[&next, &env], &first));
+    wait(&mut m, 40_000);
+    // The watchdog restarts the rabbit, again and again.
+    assert!(m.events.len() >= 2, "{:?}", m.events);
+}

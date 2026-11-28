@@ -34,6 +34,12 @@ pub const VMEM_LENGTH: usize = 1024 * 200;
 const GC_THRESHOLD: i32 = 16;
 /// The ring buffer between the bytecode and the audio codec.
 pub const AUDIO_FIFOPLAY: usize = 4096;
+/// The most of an environment that goes to the next bytecode. The C
+/// firmware copies it into the audio buffer and on over what follows
+/// it in memory, a 4 KB scratch buffer then free space, up to its USB
+/// heap 32 KB from the start, which a longer one corrupts: this keeps
+/// as much, in the audio buffer and `Memory::env`, and no more.
+pub const ENV_MAX: usize = 32 * 1024;
 
 /// The machine's nil.
 pub const NIL: i32 = -1;
@@ -78,6 +84,9 @@ pub struct Memory {
     /// The audio ring buffer (`audioFifoPlay`), which also carries the
     /// environment across a change of bytecode.
     pub fifo: [u8; AUDIO_FIFOPLAY],
+    /// What of an environment does not fit the audio buffer, while a
+    /// new bytecode is loaded.
+    pub env: [u8; ENV_MAX - AUDIO_FIFOPLAY],
 }
 
 impl Memory {
@@ -85,6 +94,7 @@ impl Memory {
         Memory {
             heap: [0; VMEM_LENGTH],
             fifo: [0; AUDIO_FIFOPLAY],
+            env: [0; ENV_MAX - AUDIO_FIFOPLAY],
         }
     }
 }

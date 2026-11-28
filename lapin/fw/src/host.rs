@@ -16,8 +16,8 @@ use crate::{board, codec, flash, i2c, led, rfid, timer, uart, usb, watchdog};
 /// every frame it heard on the machine's stack, as many as the heap
 /// held; here frames of the same network (BSSID and name) are merged,
 /// the strongest kept, so this counts networks: a dense block of flats
-/// is heard as one or two hundred on 2.4 GHz. 256 of 52 bytes, 13 KB of
-/// the external RAM's 156 KB above the machine's memory.
+/// is heard as one or two hundred on 2.4 GHz. 256 of 52 bytes, 13 KB,
+/// in the external RAM above the machine's memory, where 128 KB are free.
 pub const SCAN_RESULTS: usize = 256;
 
 pub struct Board {

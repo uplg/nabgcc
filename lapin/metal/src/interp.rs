@@ -62,6 +62,15 @@ pub(crate) enum Flow {
 }
 
 impl<H: Host> Vm<'_, H> {
+    /// Byte `k` of an environment carried to the next bytecode: in the
+    /// audio buffer, as in the C, then beside it.
+    fn env_byte(&mut self, k: usize) -> &mut u8 {
+        match k.checked_sub(crate::AUDIO_FIFOPLAY) {
+            None => &mut self.mem.fifo[k],
+            Some(rest) => &mut self.mem.env[rest],
+        }
+    }
+
     /// `interpGo`: run the function on top of the stack, its arguments
     /// below it, until it returns.
     ///
@@ -809,12 +818,13 @@ impl<H: Host> Vm<'_, H> {
                     self.rec_stop();
                     if p != NIL {
                         // The C copies the whole environment into
-                        // the 4 KB audio buffer; this keeps what
-                        // fits.
-                        env = self.size_bin(p).min(crate::AUDIO_FIFOPLAY as i32);
+                        // the 4 KB audio buffer and past it: the first
+                        // 4 KB go there, the rest beside (`ENV_MAX`).
+                        env = self.size_bin(p).min(crate::ENV_MAX as i32);
                         let from = Self::start_bin(p);
                         for k in 0..env.max(0) {
-                            self.mem.fifo[k as usize] = self.b(from + k);
+                            let b = self.b(from + k);
+                            *self.env_byte(k as usize) = b;
                         }
                     }
                     let q = Self::start_bin(val(self.sget(0)));
@@ -822,7 +832,7 @@ impl<H: Host> Vm<'_, H> {
                     if env >= 0 {
                         let p = self.alloc_bin(env);
                         for k in 0..env {
-                            let v = self.mem.fifo[k as usize];
+                            let v = *self.env_byte(k as usize);
                             self.set_b(Self::start_bin(p) + k, v);
                         }
                         self.cset(self.sys_start, SYS_ENV, pnt(p));
