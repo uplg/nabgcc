@@ -96,16 +96,9 @@ jobs:
       - run: cargo test --release --doc
 
   on-lapin:
-    # The tests on lapin take the longest: three runners share them,
-    # each test run once (nextest's partition), and the browser build
-    # has its own.
-    name: the acceptance tests, on lapin (${{ matrix.shard }}/3)
+    name: the acceptance tests, on lapin
     needs: lapin
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
     defaults:
       run:
         working-directory: tools/emu
@@ -124,11 +117,10 @@ jobs:
       - name: The same acceptance tests, on the Rust firmware
         env:
           NABEMU_FIRMWARE: lapin
-          SHARD: ${{ matrix.shard }}
         run: |
           args=$(../../scripts/lapin-suites.sh lapin)
           read -ra suites <<<"$args"
-          cargo nextest run --release --no-fail-fast --partition "count:$SHARD/3" "${suites[@]}"
+          cargo nextest run --release --no-fail-fast "${suites[@]}"
 
   browser:
     name: the browser build
