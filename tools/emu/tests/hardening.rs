@@ -95,10 +95,7 @@ fn a_new_rescue_core_that_is_whole_is_written() {
         m.soc.flash[..other.len()] == other[..],
         "the new image in place"
     );
-    assert!(
-        m.soc.flash_erases > (RESCUE / 4096) as u64,
-        "the core rewritten too"
-    );
+    assert!(m.soc.flash_erases > 0, "the core rewritten too");
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -310,7 +307,13 @@ fn a_stick_that_stops_sending_is_got_going_again() {
 #[test]
 fn flash_routines_overwritten_in_ram_still_write_the_update() {
     let Some(image) = lapin() else { return };
-    let mut m = serving(&image, &metal::flash_firmware(&image));
+    // Another application than the one in place (the same one would
+    // leave every sector as it is).
+    let Some(image_after) = common::lapin_target("selftest-full.bin") else {
+        return;
+    };
+    let mut m = serving(&image, &metal::flash_firmware(&image_after));
+    let image = image_after;
     stick_up(&mut m);
     // Both routines, from the first word of the RAM after the slots.
     m.soc.iram[0x10..0x150].fill(0xA5);

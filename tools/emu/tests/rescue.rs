@@ -7,8 +7,8 @@
 mod common;
 
 use common::{
-    RESCUE, lapin, on_network, open, page, phone_on_the_rescue_network, rescue_network_up,
-    serve_first, until, wait, without_application,
+    RESCUE, lapin, lapin_target, on_network, open, page, phone_on_the_rescue_network,
+    rescue_network_up, serve, serve_first, until, wait, without_application,
 };
 use nabemu::soc::ResetCause;
 use nabemu::{Event, Machine, metal};
@@ -45,11 +45,9 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
         rescue[..],
         "the rescue core untouched"
     );
-    let app_sectors = (image.len() - RESCUE).div_ceil(4096) as u64;
-    assert_eq!(
-        m.soc.flash_erases, app_sectors,
-        "only the application's sectors erased"
-    );
+    // The same application as in place: not a sector erased (the flash
+    // is good for a hundred rewrites, manual 1.2).
+    assert_eq!(m.soc.flash_erases, 0, "sectors erased for nothing");
     until(&mut m, 60_000, "the new application running", |m| {
         m.console().contains("4242")
     });
@@ -58,9 +56,13 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
 #[test]
 fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
     let Some(image) = lapin() else { return };
-    let mut m = rabbit(&image, &metal::flash_firmware(&image));
-    // Halfway through the application.
-    m.soc.cut_power_after_flash_ops = Some(12_000);
+    // An update to another application (the self-test's, behind the
+    // same rescue core), cut halfway through.
+    let Some(other) = lapin_target("selftest-full.bin") else {
+        return;
+    };
+    let mut m = rabbit(&image, &metal::flash_firmware(&other));
+    m.soc.cut_power_after_flash_ops = Some(1000);
     until(&mut m, 60_000, "the power cut", |m| !m.events.is_empty());
     assert_eq!(m.events, [Event::Reset(ResetCause::PowerLoss)]);
     rescue_network_up(&mut m);

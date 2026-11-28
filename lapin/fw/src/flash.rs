@@ -19,6 +19,10 @@ const FLACON: *mut u8 = 0xB700_0100 as *mut u8;
 const COMMAND_1: *mut u8 = 0x0801_5554 as *mut u8;
 const COMMAND_2: *mut u8 = 0x0800_AAA8 as *mut u8;
 const WDTCON: *mut u8 = 0xB7E0_0000 as *mut u8;
+const TBGCON: *mut u8 = 0xB7E0_0004 as *mut u8;
+const INTST: *mut u8 = 0xB7E0_0008 as *mut u8;
+const OVFAST: *mut u8 = 0xB7E0_000C as *mut u8;
+const WDTCNT: *mut u16 = 0xB7E0_0010 as *mut u16;
 
 // What follows runs from RAM while the flash is busy: it is placed in
 // the initialised data (copied to RAM at reset), and must reach nothing
@@ -109,9 +113,34 @@ unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
     }
 }
 
+/// The word of `image` (`len` bytes) at `offset` as it goes in the
+/// flash: past the image's end, erased.
+///
+/// # Safety
+/// `image` is readable up to `len` rounded up to a word.
+#[inline(always)]
+unsafe fn image_word(image: *const u32, len: usize, offset: usize) -> u32 {
+    if offset >= len {
+        return u32::MAX;
+    }
+    // SAFETY: inside the image, as the caller says.
+    let mut word = unsafe { image.add(offset / 4).read_volatile() };
+    if len - offset < 4 {
+        // The rest of the last word stays erased.
+        word |= u32::MAX << (8 * (len - offset));
+    }
+    word
+}
+
 /// Rewrite the flash from the sector at `to` with the `len` bytes at
-/// `image`, feeding the watchdog after every word; then stop feeding
-/// it and wait: the watchdog restarts the board on the new image.
+/// `image`, feeding the watchdog after every word, then restart on the
+/// new image at once: the watchdog set to bite in a quarter of a
+/// millisecond, as the C's `flash_uc` does.
+///
+/// A sector that already holds what it would be given is left alone
+/// (the manual guarantees a hundred rewrites); the rest of the last
+/// sector past the image is erased (the C keeps the old bytes there;
+/// the header's length and CRC make them meaningless either way).
 ///
 /// # Safety
 /// Interrupts off for good; `image` is `len` readable bytes outside the
@@ -123,22 +152,44 @@ unsafe extern "C" fn flash_sector_from_ram(address: usize, data: *const u32) {
 unsafe extern "C" fn flash_image_from_ram(image: *const u32, len: usize, to: usize) -> ! {
     // SAFETY: interrupts are off for good, this runs from RAM.
     unsafe {
-        let mut offset = 0;
-        while offset < len {
-            if offset % SECTOR == 0 {
-                erase_sector((to + offset) as *mut u8);
+        let mut sector = 0;
+        while sector < len {
+            let at = (to + sector) as *mut u8;
+            let mut same = true;
+            let mut offset = sector;
+            while offset < sector + SECTOR {
+                let now = (at.add(offset - sector) as *const u32).read_volatile();
+                if now != image_word(image, len, offset) {
+                    same = false;
+                }
+                offset += 4;
             }
-            let mut word = image.add(offset / 4).read_volatile();
-            if len - offset < 4 {
-                // The rest of the last word stays erased.
-                word |= u32::MAX << (8 * (len - offset));
+            if !same {
+                erase_sector(at);
+                let mut offset = sector;
+                while offset < sector + SECTOR && offset < len {
+                    program_word(at.add(offset - sector), image_word(image, len, offset));
+                    WDTCON.write_volatile(0xC3);
+                    WDTCON.write_volatile(0x3C);
+                    offset += 4;
+                }
             }
-            program_word((to + offset) as *mut u8, word);
             WDTCON.write_volatile(0xC3);
             WDTCON.write_volatile(0x3C);
-            offset += 4;
+            sector += SECTOR;
         }
         FLACON.write_volatile(0x02);
+        // Restart now (watchdog::reset_now, which lives in the flash):
+        // each register's key, then a microsecond a count, the counter
+        // 256 counts from its end.
+        INTST.write_volatile(0x3C);
+        INTST.write_volatile(0x00);
+        TBGCON.write_volatile(0x5A);
+        TBGCON.write_volatile(0x40);
+        OVFAST.write_volatile(0x63);
+        WDTCON.write_volatile(0x3C);
+        WDTCNT.write_volatile(0x5A5A);
+        WDTCNT.write_volatile(0xFF00);
         // Nothing else may run: anything (even a spin hint) could be a
         // call into the flash just rewritten.
         #[allow(clippy::empty_loop)]
