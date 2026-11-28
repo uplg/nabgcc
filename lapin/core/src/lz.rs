@@ -42,45 +42,17 @@ pub fn unpack(packed: &[u8], out: &mut [u8]) -> usize {
     n
 }
 
+/// The compressor needs a heap, which this crate has not: the
+/// firmware's build takes its file in (`fw/build.rs`), the tests here.
+#[cfg(test)]
+#[path = "lz_pack.rs"]
+mod packer;
+
 #[cfg(test)]
 mod tests {
+    use super::packer::pack;
     use super::unpack;
     use std::vec::Vec;
-
-    /// A plain compressor for the tests (the firmware's build has its own).
-    fn pack(d: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < d.len() {
-            let at = out.len();
-            out.push(0);
-            for bit in 0..8 {
-                if i >= d.len() {
-                    break;
-                }
-                let (mut best, mut off) = (0, 0);
-                for j in i.saturating_sub(4096)..i {
-                    let mut k = 0;
-                    while k < 18 && i + k < d.len() && d[j + k] == d[i + k] {
-                        k += 1;
-                    }
-                    if k > best {
-                        (best, off) = (k, i - j);
-                    }
-                }
-                if best >= 3 {
-                    out[at] |= 1 << bit;
-                    out.push(((best - 3) << 4 | (off - 1) >> 8) as u8);
-                    out.push((off - 1) as u8);
-                    i += best;
-                } else {
-                    out.push(d[i]);
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
 
     #[test]
     fn round_trips() {

@@ -176,6 +176,9 @@ fn elements<'a>(mut list: &'a [u8], end: Option<u8>, mut each: impl FnMut(u8, &'
     }
 }
 
+/// `lapin_core::wifi::be16`, kept here: the rescue core's code grows by 36
+/// bytes with the other crate's copy (inlined otherwise), and it has
+/// less than a kilobyte to spare.
 fn be16(b: &[u8], at: usize) -> u16 {
     u16::from_be_bytes([b[at], b[at + 1]])
 }

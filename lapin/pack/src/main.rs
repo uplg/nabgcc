@@ -10,22 +10,6 @@ const RESCUE_SIZE: usize = 20 * 1024;
 /// The application's place: up to the settings sector.
 const AREA: usize = 124 * 1024 - RESCUE_SIZE;
 
-/// CRC-32 as zlib's (and `lapin_fw::boot::crc32`).
-fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                c >> 1 ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-        }
-    }
-    !c
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let [_, full, first] = &args[..] else {
@@ -57,8 +41,8 @@ fn main() {
         MAGIC,
         stream.len() as u32,
         app.len() as u32,
-        crc32(app),
-        crc32(&stream),
+        lapin_core::pack::crc32(app, || {}),
+        lapin_core::pack::crc32(&stream, || {}),
     ] {
         image.extend_from_slice(&word.to_le_bytes());
     }

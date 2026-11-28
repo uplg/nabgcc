@@ -118,37 +118,9 @@ impl Slots {
     }
 }
 
-/// CRC-32 (IEEE 802.3, as zlib's), four bits at a time.
+/// CRC-32 (`lapin_core::pack::crc32`), the watchdog fed on the way.
 pub fn crc32(data: &[u8]) -> u32 {
-    const T: [u32; 16] = [
-        0x0000_0000,
-        0x1DB7_1064,
-        0x3B6E_20C8,
-        0x26D9_30AC,
-        0x76DC_4190,
-        0x6B6B_51F4,
-        0x4DB2_6158,
-        0x5005_713C,
-        0xEDB8_8320,
-        0xF00F_9344,
-        0xD6D6_A3E8,
-        0xCB61_B38C,
-        0x9B64_C2B0,
-        0x86D3_D2D4,
-        0xA00A_E278,
-        0xBDBD_F21C,
-    ];
-    let mut c = !0u32;
-    for (i, &b) in data.iter().enumerate() {
-        // A whole application takes tens of milliseconds.
-        if i % 4096 == 0 {
-            crate::watchdog::feed();
-        }
-        c ^= b as u32;
-        c = (c >> 4) ^ T[(c & 15) as usize];
-        c = (c >> 4) ^ T[(c & 15) as usize];
-    }
-    !c
+    lapin_core::pack::crc32(data, crate::watchdog::feed)
 }
 
 fn word(image: &[u8], at: usize) -> Option<u32> {

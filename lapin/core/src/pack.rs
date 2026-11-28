@@ -171,6 +171,40 @@ pub fn thumb_calls(code: &mut [u8], back: bool) {
     }
 }
 
+/// CRC-32 (IEEE 802.3, as zlib's), four bits at a time, `tick` called
+/// every 4 KB (the firmware feeds its watchdog: a whole application
+/// takes tens of milliseconds).
+pub fn crc32(data: &[u8], mut tick: impl FnMut()) -> u32 {
+    const T: [u32; 16] = [
+        0x0000_0000,
+        0x1DB7_1064,
+        0x3B6E_20C8,
+        0x26D9_30AC,
+        0x76DC_4190,
+        0x6B6B_51F4,
+        0x4DB2_6158,
+        0x5005_713C,
+        0xEDB8_8320,
+        0xF00F_9344,
+        0xD6D6_A3E8,
+        0xCB61_B38C,
+        0x9B64_C2B0,
+        0x86D3_D2D4,
+        0xA00A_E278,
+        0xBDBD_F21C,
+    ];
+    let mut c = !0u32;
+    for (i, &b) in data.iter().enumerate() {
+        if i % 4096 == 0 {
+            tick();
+        }
+        c ^= b as u32;
+        c = (c >> 4) ^ T[(c & 15) as usize];
+        c = (c >> 4) ^ T[(c & 15) as usize];
+    }
+    !c
+}
+
 #[cfg(any(test, feature = "std"))]
 pub use packer::pack;
 
@@ -521,6 +555,15 @@ mod tests {
         }
         out.truncate(len);
         out
+    }
+
+    /// zlib's check values, and the watchdog fed every 4 KB.
+    #[test]
+    fn crc32_is_zlib_s() {
+        let mut ticks = 0;
+        assert_eq!(crc32(b"123456789", || ticks += 1), 0xCBF4_3926);
+        assert_eq!(crc32(&[0; 8193], || ticks += 1), 0x25B8_4C49);
+        assert_eq!(ticks, 4);
     }
 
     #[test]
