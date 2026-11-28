@@ -4,20 +4,14 @@
 
 mod common;
 
-use common::{ap_count, ap_saw, find, until, wait};
+use common::bc::{self, op::*};
+use common::{ap_count, ap_saw, find, printed, program_ended, program_started, until, wait};
 use nabemu::air::ApEvent;
 use nabemu::config::{Config, Wifi};
 use nabemu::{DEFAULT_MAC, Machine, metal};
 
-const NIL: u8 = 4;
-const DROP: u8 = 5;
-const IECHOLN: u8 = 95;
-const HD: u8 = 45;
-const NETSTATE: u8 = 105;
-const NETSETMODE: u8 = 108;
-const NETSCAN: u8 = 109;
-const NETAUTH: u8 = 110;
-const REBOOT: u8 = 136;
+/// Where `program` puts the body: 7 bytes into its function's code.
+const BODY_AT: usize = 7;
 
 /// A function that prints 7770, runs `body`, then prints 8880.
 fn program(body: &[u8]) -> Vec<u8> {
@@ -26,30 +20,24 @@ fn program(body: &[u8]) -> Vec<u8> {
     f.extend([IECHOLN, DROP]);
     f.extend_from_slice(body);
     f.extend(metal::int(8880));
-    f.extend([IECHOLN, metal::OP_RET]);
+    f.extend([IECHOLN, RET]);
     f
 }
 
 /// The rabbit on the open network "Terrier", served `bytecode`, run
-/// until it printed 8880.
-fn ran(bytecode: &[u8]) -> Machine {
+/// until it printed 7770.
+fn started(bytecode: &[u8]) -> Machine {
     let mut m = common::under_test();
     m.serve(bytecode);
-    until(&mut m, 40_000, "the program's end", |m| {
-        find(&m.soc.uart_tx, b"8880").is_some()
-    });
+    until(&mut m, 40_000, "the program", program_started);
     m
 }
 
-/// The numbers the program printed between 7770 and 8880.
-fn printed(m: &Machine) -> Vec<i64> {
-    let c = m.console();
-    let from = c.find("7770").expect("the program ran") + 4;
-    let to = c[from..].find("8880").map_or(c.len(), |i| from + i);
-    c[from..to]
-        .split_whitespace()
-        .filter_map(|w| w.parse().ok())
-        .collect()
+/// The same, run on until it printed 8880.
+fn ran(bytecode: &[u8]) -> Machine {
+    let mut m = started(bytecode);
+    until(&mut m, 40_000, "the program's end", program_ended);
+    m
 }
 
 /// `netState` pushed and printed.
@@ -183,39 +171,14 @@ fn reboots_asked_by_the_bytecode_are_not_failed_starts() {
     assert!(m.events.len() >= 5, "{:?}", m.events);
 }
 
-const DUP: u8 = 6;
-const ADD: u8 = 9;
-const EQ: u8 = 22;
-const GT: u8 = 25;
-const GOTO: u8 = 28;
-const ELSE: u8 = 29;
-const TIME_MS: u8 = 53;
-
-/// Where `body`'s byte `at` is for a jump (from the code after the
-/// function's header; `program` puts 7 bytes before the body).
-fn label(at: usize) -> [u8; 2] {
-    ((7 + at) as u16).to_le_bytes()
-}
-
 /// A loop of up to `ms` that asks `netState` all along, and stops as
-/// soon as the link is no longer up; then the state is printed.
+/// soon as the link is no longer up; then the state is printed. The
+/// whole body.
 fn while_connected(ms: i32) -> Vec<u8> {
-    let mut b = vec![TIME_MS];
-    b.extend(metal::int(ms));
-    b.push(ADD);
-    let top = b.len();
-    b.extend([DUP, TIME_MS, GT, ELSE, 0, 0]);
-    let exit_1 = b.len() - 2;
-    b.push(NETSTATE);
-    b.extend(metal::int(4));
-    b.extend([EQ, ELSE, 0, 0]);
-    let exit_2 = b.len() - 2;
-    b.push(GOTO);
-    b.extend(label(top));
-    let exit = label(b.len());
-    b[exit_1..exit_1 + 2].copy_from_slice(&exit);
-    b[exit_2..exit_2 + 2].copy_from_slice(&exit);
-    b.push(DROP);
+    let mut connected = vec![NETSTATE];
+    connected.extend(metal::int(4));
+    connected.push(EQ);
+    let mut b = bc::pause_while(BODY_AT, ms, &connected);
     b.extend(print_state());
     b
 }
@@ -226,38 +189,46 @@ fn while_connected(ms: i32) -> Vec<u8> {
 /// interrupt. lapin saw them only between two turns of its main loop.
 #[test]
 fn net_state_moves_while_the_bytecode_runs() {
-    let mut m = common::under_test();
-    m.serve(&metal::bytecode(&[], &program(&while_connected(8000))));
-    until(&mut m, 40_000, "the program", |m| {
-        find(&m.soc.uart_tx, b"7770").is_some()
-    });
-    wait(&mut m, 1000);
+    let mut m = running_for(&[], &program(&while_connected(8000)), 1000);
     m.air[0].kick(&mut m.radio.borrow_mut(), DEFAULT_MAC, 1);
     let kicked = m.soc.millis();
-    let done = until(&mut m, 10_000, "the program's end", |m| {
-        find(&m.soc.uart_tx, b"8880").is_some()
-    });
+    let done = until(&mut m, 10_000, "the program's end", program_ended);
     assert!(done - kicked < 1000, "{} ms", done - kicked);
     assert_ne!(printed(&m), [4]);
 }
 
-const NETCB: u8 = 103;
-
 /// A loop that keeps the bytecode busy `ms`, asking nothing of the
 /// network, placed at byte `base` of the body.
 fn busy(base: usize, ms: i32) -> Vec<u8> {
-    let mut b = vec![TIME_MS];
-    b.extend(metal::int(ms));
-    b.push(ADD);
-    let top = b.len();
-    b.extend([DUP, TIME_MS, GT, ELSE, 0, 0]);
-    let exit = b.len() - 2;
-    b.push(GOTO);
-    b.extend(label(base + top));
-    let end = label(base + b.len());
-    b[exit..exit + 2].copy_from_slice(&end);
-    b.push(DROP);
-    b
+    bc::pause(BODY_AT + base, ms)
+}
+
+/// `main`, a body that ends by giving the frame callback (function 1,
+/// which prints 6666), run; once it started, `meanwhile`, then
+/// `frames` frames for the bytecode, 20 ms apart. How many reached the
+/// callback after its end (within `limit_ms`), and two seconds more.
+fn delivered(
+    main: &[u8],
+    meanwhile: impl FnOnce(&mut Machine),
+    frames: usize,
+    limit_ms: u64,
+) -> usize {
+    let main = program(main);
+    // The callback: (frame, source), prints 6666.
+    let mut callback = metal::int(6666);
+    callback.extend([IECHOLN, RET]);
+    let callback = bc::function(2, 0, &callback);
+    let mut m = started(&metal::bytecode_functions(&[], &[&main, &callback]));
+    meanwhile(&mut m);
+    let eth = common::frame_for_the_bytecode(200);
+    for _ in 0..frames {
+        m.air[0].send(&mut m.radio.borrow_mut(), &eth);
+        wait(&mut m, 20);
+    }
+    until(&mut m, limit_ms, "the program's end", program_ended);
+    wait(&mut m, 2000);
+    let c = m.console();
+    c[c.find("8880").unwrap()..].matches("6666").count()
 }
 
 /// The bytecode busy for three seconds while forty frames come for it,
@@ -272,44 +243,22 @@ fn frames_that_come_while_the_bytecode_is_busy_are_kept() {
     let mut main = busy(0, 3000);
     main.extend(metal::int(1));
     main.extend([NETCB, DROP]);
-    let main = program(&main);
-    // The callback: (frame, source), prints 6666.
-    let mut callback = vec![2, 0, 0];
-    callback.extend(metal::int(6666));
-    callback.extend([IECHOLN, metal::OP_RET]);
-    let mut m = common::under_test();
-    m.serve(&metal::bytecode_functions(&[], &[&main, &callback]));
-    until(&mut m, 40_000, "the program", |m| {
-        find(&m.soc.uart_tx, b"7770").is_some()
-    });
-    for i in 0..20u8 {
-        let mut ap = nabemu::air::AccessPoint::new(
-            &format!("Voisin{i:02}"),
-            [2, 0, 0, 3, 0, i],
-            6,
-            nabemu::air::Security::Open,
-        );
-        ap.beacon_interval = 50;
-        m.air.push(ap);
-    }
-    wait(&mut m, 500);
-    let mut eth = DEFAULT_MAC.to_vec();
-    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
-    eth.extend_from_slice(&[0x5A; 200]);
-    for _ in 0..40 {
-        m.air[0].send(&mut m.radio.borrow_mut(), &eth);
-        wait(&mut m, 20);
-    }
-    until(&mut m, 10_000, "the program's end", |m| {
-        find(&m.soc.uart_tx, b"8880").is_some()
-    });
-    wait(&mut m, 2000);
-    let c = m.console();
-    let delivered = c[c.find("8880").unwrap()..].matches("6666").count();
+    let crowd = |m: &mut Machine| {
+        for i in 0..20u8 {
+            let mut ap = nabemu::air::AccessPoint::new(
+                &format!("Voisin{i:02}"),
+                [2, 0, 0, 3, 0, i],
+                6,
+                nabemu::air::Security::Open,
+            );
+            ap.beacon_interval = 50;
+            m.air.push(ap);
+        }
+        wait(m, 500);
+    };
+    let delivered = delivered(&main, crowd, 40, 10_000);
     assert!(delivered >= 40, "{delivered} delivered");
 }
-
-const TIME: u8 = 61;
 
 /// Where lapin keeps the static whose name ends so, from its ELF.
 fn lapin_static(suffix: &str) -> Option<u32> {
@@ -345,20 +294,12 @@ fn time_goes_on_across_the_wrap_of_the_milliseconds() {
     // Three seconds before the milliseconds wrap.
     let at = (millis - 0x1000_0000) as usize;
     m.soc.iram[at..at + 4].copy_from_slice(&(u32::MAX - 3000).to_le_bytes());
-    until(&mut m, 40_000, "the program's end", |m| {
-        find(&m.soc.uart_tx, b"8880").is_some()
-    });
+    until(&mut m, 40_000, "the program's end", program_ended);
     let [before, after] = printed(&m)[..] else {
         panic!("{:?}", printed(&m));
     };
     assert!((5..=7).contains(&(after - before)), "{before} then {after}");
 }
-
-const STRLEN: u8 = 68;
-const STRGET: u8 = 69;
-const BYTECODE: u8 = 93;
-const ENVGET: u8 = 98;
-const ENVSET: u8 = 99;
 
 /// The environment a bytecode leaves (`len` bytes, byte `i` = i % 251)
 /// as the next one sees it: its length, and bytes along it (nil, not
@@ -374,14 +315,14 @@ fn environment_carried(len: usize) -> Vec<i64> {
         next.extend([STRGET, IECHOLN, DROP]);
     }
     next.extend(metal::int(8880));
-    next.extend([IECHOLN, metal::OP_RET]);
+    next.extend([IECHOLN, RET]);
     let next = metal::bytecode(&[], &next);
     let env: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
     let mut first = metal::FUNCTION_HEADER.to_vec();
     first.extend(metal::int(7770));
     first.extend([IECHOLN, DROP]);
-    first.extend([metal::OP_GETGLOBALB, 1, ENVSET, DROP]);
-    first.extend([metal::OP_GETGLOBALB, 0, BYTECODE, metal::OP_RET]);
+    first.extend([GETGLOBALB, 1, ENVSET, DROP]);
+    first.extend([GETGLOBALB, 0, BYTECODE, RET]);
     let m = ran(&metal::bytecode(&[&next, &env], &first));
     printed(&m)
 }
@@ -430,8 +371,8 @@ fn an_environment_past_32_kb_is_cut() {
     let mut m = common::under_test();
     let env = vec![0x41u8; 40_000];
     let mut first = metal::FUNCTION_HEADER.to_vec();
-    first.extend([metal::OP_GETGLOBALB, 1, ENVSET, DROP]);
-    first.extend([metal::OP_GETGLOBALB, 0, BYTECODE, metal::OP_RET]);
+    first.extend([GETGLOBALB, 1, ENVSET, DROP]);
+    first.extend([GETGLOBALB, 0, BYTECODE, RET]);
     let next = metal::print_number(8880);
     m.serve(&metal::bytecode(&[&next, &env], &first));
     wait(&mut m, 40_000);
@@ -469,18 +410,10 @@ fn a_stick_that_reports_no_packet_numbers_still_carries_traffic() {
     assert!(!m.console().contains(NO_PN));
 }
 
-const NETSEND: u8 = 104;
-const NETPMK: u8 = 142;
-const STRCMP: u8 = 137;
-
 /// The rabbit on the open network running `function` with `strings`,
 /// for `ms` after it started.
 fn running_for(strings: &[&[u8]], function: &[u8], ms: u64) -> Machine {
-    let mut m = common::under_test();
-    m.serve(&metal::bytecode(strings, function));
-    until(&mut m, 40_000, "the program", |m| {
-        find(&m.soc.uart_tx, b"7770").is_some()
-    });
+    let mut m = started(&metal::bytecode(strings, function));
     wait(&mut m, ms);
     m
 }
@@ -491,10 +424,10 @@ fn running_for(strings: &[&[u8]], function: &[u8], ms: u64) -> Machine {
 #[test]
 fn net_send_of_a_frame_too_long() {
     let frame = vec![0x45u8; 3000];
-    let mut body = vec![metal::OP_GETGLOBALB, 0];
+    let mut body = vec![GETGLOBALB, 0];
     body.extend(metal::int(0));
     body.push(NIL);
-    body.extend([metal::OP_GETGLOBALB, 1]);
+    body.extend([GETGLOBALB, 1]);
     body.extend(metal::int(0));
     body.extend(metal::int(0));
     body.extend([NETSEND, IECHOLN, DROP]);
@@ -517,22 +450,20 @@ fn net_pmk_of_a_name_too_long() {
     let short = &long[..32];
     let mut body = Vec::new();
     for name in [1u8, 2] {
-        body.extend([metal::OP_GETGLOBALB, name, metal::OP_GETGLOBALB, 0, NETPMK]);
+        body.extend([GETGLOBALB, name, GETGLOBALB, 0, NETPMK]);
     }
     body.extend([STRCMP, IECHOLN, DROP]);
     let strings: [&[u8]; 3] = [b"carotte-violette", short, long];
     if nabemu::testing::is_lapin() {
         let mut m = running_for(&strings, &program(&body), 0);
-        until(&mut m, 60_000, "the keys", |m| {
-            find(&m.soc.uart_tx, b"8880").is_some()
-        });
+        until(&mut m, 60_000, "the keys", program_ended);
         assert_eq!(printed(&m), [0], "the same key");
     } else {
         // Thirty seconds on, nothing more: the second key never comes
         // (the first takes a few seconds; the hang is a busy loop, which
         // the emulator cannot skip, so a longer wait only costs).
         let m = running_for(&strings, &program(&body), 30_000);
-        assert!(find(&m.soc.uart_tx, b"8880").is_none());
+        assert!(!program_ended(&m));
         assert_eq!(printed(&m), []);
     }
 }
@@ -545,28 +476,7 @@ fn frames_that_came_before_a_scan_are_kept() {
     main.extend([NIL, NETSCAN, DROP]);
     main.extend(metal::int(1));
     main.extend([NETCB, DROP]);
-    let main = program(&main);
-    let mut callback = vec![2, 0, 0];
-    callback.extend(metal::int(6666));
-    callback.extend([IECHOLN, metal::OP_RET]);
-    let mut m = common::under_test();
-    m.serve(&metal::bytecode_functions(&[], &[&main, &callback]));
-    until(&mut m, 40_000, "the program", |m| {
-        find(&m.soc.uart_tx, b"7770").is_some()
-    });
-    let mut eth = DEFAULT_MAC.to_vec();
-    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
-    eth.extend_from_slice(&[0x5A; 200]);
-    for _ in 0..20 {
-        m.air[0].send(&mut m.radio.borrow_mut(), &eth);
-        wait(&mut m, 20);
-    }
-    until(&mut m, 20_000, "the program's end", |m| {
-        find(&m.soc.uart_tx, b"8880").is_some()
-    });
-    wait(&mut m, 2000);
-    let c = m.console();
-    let delivered = c[c.find("8880").unwrap()..].matches("6666").count();
+    let delivered = delivered(&main, |_| {}, 20, 20_000);
     assert!(delivered >= 20, "{delivered} delivered");
 }
 
@@ -584,20 +494,18 @@ fn frames_that_came_before_a_scan_are_kept() {
 /// callback keep a spare one last (`tests/scan_connected.rs`).
 #[test]
 fn the_last_global_lies_above_the_stack_once_main_returned() {
-    const SECHOLN: u8 = 96;
-    const LOOPCB: u8 = 94;
     // main: print the last global, then set the loop callback.
-    let mut main = vec![metal::OP_GETGLOBALB, 1, SECHOLN, DROP];
+    let mut main = vec![GETGLOBALB, 1, SECHOLN, DROP];
     main.extend(metal::int(1));
     main.extend([LOOPCB, DROP]);
     let main = program(&main);
     // The callback: both globals, the first a string still, the last
     // the callback's own saved program counter.
     let mut callback = metal::FUNCTION_HEADER.to_vec();
-    callback.extend([metal::OP_GETGLOBALB, 0, SECHOLN, DROP]);
-    callback.extend([metal::OP_GETGLOBALB, 1, IECHOLN, DROP]);
+    callback.extend([GETGLOBALB, 0, SECHOLN, DROP]);
+    callback.extend([GETGLOBALB, 1, IECHOLN, DROP]);
     callback.extend(metal::int(9990));
-    callback.extend([IECHOLN, metal::OP_RET]);
+    callback.extend([IECHOLN, RET]);
     let mut m = common::under_test();
     m.serve(&metal::bytecode_functions(
         &[b"first", b"last"],

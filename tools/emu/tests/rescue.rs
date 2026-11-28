@@ -7,8 +7,9 @@
 mod common;
 
 use common::{
-    RESCUE, lapin, lapin_target, on_network, open, page, phone_on_the_rescue_network,
-    rescue_network_up, serve_first, until, wait, without_application,
+    RESCUE, in_parallel, lapin, lapin_first, lapin_target, on_network, open, page,
+    phone_on_the_rescue_network, rescue_network_up, restarted, serve_first, until, wait,
+    without_application,
 };
 use nabemu::soc::ResetCause;
 use nabemu::{Event, Machine, metal};
@@ -20,6 +21,20 @@ fn rabbit(image: &[u8], first: &[u8]) -> Machine {
     let mut m = on_network(image, open());
     serve_first(&mut m, first);
     m
+}
+
+/// Wait for the application served after an update: it prints 4242.
+fn runs_the_next_bytecode(m: &mut Machine, what: &str) {
+    until(m, 60_000, what, |m| m.console().contains("4242"));
+}
+
+/// The rescue core takes over, after `from` bytes of console: the
+/// application kept restarting, `restarts` restarts in all.
+fn taken_over(m: &mut Machine, from: usize, restarts: usize) {
+    until(m, 200_000, "the rescue core taking over", |m| {
+        m.console()[from..].contains("secours: the application keeps restarting")
+    });
+    assert_eq!(m.events.len(), restarts, "{:?}", m.events);
 }
 
 /// Join the rescue network from a phone and load a page.
@@ -36,9 +51,7 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
     let Some(image) = lapin() else { return };
     let mut m = rabbit(&image, &metal::flash_firmware(&image));
     let rescue = m.soc.flash[..RESCUE].to_vec();
-    until(&mut m, 60_000, "the restart after the update", |m| {
-        !m.events.is_empty()
-    });
+    until(&mut m, 60_000, "the restart after the update", restarted);
     assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
     assert_eq!(
         m.soc.flash[..RESCUE],
@@ -48,9 +61,7 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
     // The same application as in place: not a sector erased (the flash
     // is good for a hundred rewrites, manual 1.2).
     assert_eq!(m.soc.flash_erases, 0, "sectors erased for nothing");
-    until(&mut m, 60_000, "the new application running", |m| {
-        m.console().contains("4242")
-    });
+    runs_the_next_bytecode(&mut m, "the new application running");
 }
 
 /// The first image is for r3 only: sent to a rabbit that runs lapin, it
@@ -58,15 +69,13 @@ fn an_update_that_brings_the_same_rescue_core_rewrites_the_application_alone() {
 /// rabbit goes on.
 #[test]
 fn the_first_image_sent_to_a_lapin_rabbit_is_refused() {
-    let (Some(image), Some(first)) = (lapin(), lapin_target("lapin-first.bin")) else {
+    let (Some(image), Some(first)) = (lapin(), lapin_first()) else {
         return;
     };
     let mut m = rabbit(&image, &metal::flash_firmware(&first));
-    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    until(&mut m, 60_000, "the restart", restarted);
     assert_eq!(m.soc.flash_erases, 0, "something written");
-    until(&mut m, 60_000, "the application back", |m| {
-        m.console().contains("4242")
-    });
+    runs_the_next_bytecode(&mut m, "the application back");
 }
 
 #[test]
@@ -79,7 +88,7 @@ fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
     };
     let mut m = rabbit(&image, &metal::flash_firmware(&other));
     m.soc.cut_power_after_flash_ops = Some(1000);
-    until(&mut m, 60_000, "the power cut", |m| !m.events.is_empty());
+    until(&mut m, 60_000, "the power cut", restarted);
     assert_eq!(m.events, [Event::Reset(ResetCause::PowerLoss)]);
     rescue_network_up(&mut m);
     assert!(
@@ -105,9 +114,7 @@ fn a_power_cut_during_an_update_is_survived_and_put_right_from_a_phone() {
     let rules = &m.soc.flash_rules;
     assert_eq!(rules.breaches, 0, "the manual's rules: {:?}", rules.log);
     m.visitor = None;
-    until(&mut m, 60_000, "the application back on its network", |m| {
-        m.console().contains("4242")
-    });
+    runs_the_next_bytecode(&mut m, "the application back on its network");
 }
 
 #[test]
@@ -116,13 +123,8 @@ fn an_application_that_keeps_restarting_is_taken_back() {
     // A stick that takes no frame to send: the application gives up on
     // it and restarts, every time, within its first minute. (A restart
     // the bytecode asks for does not count: tests/observable.rs.)
-    let mut m = on_network(&image, open());
-    m.radio.borrow_mut().tx_stuck = true;
-    until(&mut m, 200_000, "the rescue core taking over", |m| {
-        m.console()
-            .contains("secours: the application keeps restarting")
-    });
-    assert_eq!(m.events.len(), 3, "{:?}", m.events);
+    let mut m = restarting(&image);
+    taken_over(&mut m, 0, 3);
     m.radio.borrow_mut().tx_stuck = false;
     // From the phone: back to the application, the count forgotten.
     let answer = visit(&mut m, "/restart", None);
@@ -183,10 +185,7 @@ fn a_power_on_is_no_failed_start_even_if_the_ram_kept_its_words() {
     let after = &m.console()[said..];
     assert!(after.contains("lapin 0.1"), "taken back at once:\n{after}");
     // And it is counted from there: three more, then the rescue core.
-    until(&mut m, 200_000, "the rescue core taking over", |m| {
-        m.console()[said..].contains("secours: the application keeps restarting")
-    });
-    assert_eq!(m.events.len(), 2 + 3, "{:?}", m.events);
+    taken_over(&mut m, said, 2 + 3);
 }
 
 /// A restart by the watchdog counts as a failed start even when the RAM
@@ -200,11 +199,7 @@ fn a_watchdog_restart_counts_even_if_the_ram_lost_its_words() {
     to_next_reset(&mut m, 120_000);
     assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
     m.soc.iram[SLOT_WORDS].fill(0);
-    until(&mut m, 200_000, "the rescue core taking over", |m| {
-        m.console()
-            .contains("secours: the application keeps restarting")
-    });
-    assert_eq!(m.events.len(), 3, "{:?}", m.events);
+    taken_over(&mut m, 0, 3);
 }
 
 #[test]
@@ -229,33 +224,23 @@ fn a_power_cut_anywhere_in_an_update_leaves_a_rabbit_that_comes_back() {
     // One erase per sector, one program per word: about 25 000 steps.
     let steps = (image.len() - RESCUE).div_ceil(4096) + (image.len() - RESCUE) / 4;
     // Each cut on its own machine, all at once: one test, every core.
-    let outcomes: Vec<(u64, &str)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..=16)
-            .map(|i| {
-                let image = &image;
-                scope.spawn(move || {
-                    let at = (steps * i / 16).max(1) as u64;
-                    let mut m = rabbit(image, &metal::flash_firmware(image));
-                    m.soc.cut_power_after_flash_ops = Some(at);
-                    until(&mut m, 60_000, "the power cut", |m| !m.events.is_empty());
-                    let said = m.console().len();
-                    until(&mut m, 20_000, "the rabbit coming back", |m| {
-                        let after = &m.console()[said..];
-                        after.contains("secours: network up") || after.contains("lapin 0.1")
-                    });
-                    let rescued = m.console()[said..].contains("secours");
-                    (
-                        at,
-                        if rescued {
-                            "rescue network"
-                        } else {
-                            "application"
-                        },
-                    )
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let outcomes = in_parallel(0..=16, |i| {
+        let at = (steps * i / 16).max(1) as u64;
+        let mut m = rabbit(&image, &metal::flash_firmware(&image));
+        m.soc.cut_power_after_flash_ops = Some(at);
+        until(&mut m, 60_000, "the power cut", restarted);
+        let said = m.console().len();
+        until(&mut m, 20_000, "the rabbit coming back", |m| {
+            let after = &m.console()[said..];
+            after.contains("secours: network up") || after.contains("lapin 0.1")
+        });
+        let rescued = m.console()[said..].contains("secours");
+        let how = if rescued {
+            "rescue network"
+        } else {
+            "application"
+        };
+        (at, how)
     });
     for (at, how) in outcomes {
         eprintln!("cut after {at} of {steps} steps: {how}");

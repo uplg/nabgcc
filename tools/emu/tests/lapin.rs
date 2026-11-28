@@ -5,6 +5,18 @@
 mod common;
 
 use common::{AMBER, GREEN, PCM_8K, UID, lapin, lapin_target, machine, note, until_every, wait};
+use nabemu::Machine;
+
+/// Run `m` `step_ms` at a time, `each` looking at it after each step,
+/// until its console ends with "end": within a minute.
+fn to_the_end(m: &mut Machine, step_ms: u64, mut each: impl FnMut(&mut Machine)) {
+    while !m.console().ends_with("end\n") {
+        assert!(m.soc.millis() < 60_000, "never finished:\n{}", m.console());
+        wait(m, step_ms);
+        each(m);
+    }
+}
+
 /// The board comes up, finds its stick, and hands over to the boot
 /// bytecode, which keeps the watchdog fed and looks for a network.
 #[test]
@@ -111,15 +123,13 @@ fn the_wpa3_exchange_is_right_and_fast_enough_on_the_arm7() {
     let mut m = machine(&image);
     let mut marks: Vec<(String, f64)> = Vec::new();
     let mut seen = 0;
-    while !m.console().ends_with("end\n") {
-        assert!(m.soc.millis() < 60_000, "never finished:\n{}", m.console());
-        wait(&mut m, 1);
+    to_the_end(&mut m, 1, |m| {
         let console = m.console();
         while let Some(end) = console[seen..].find('\n') {
             marks.push((console[seen..seen + end].to_string(), m.soc.millis() as f64));
             seen += end + 1;
         }
-    }
+    });
     let console = m.console();
     for check in ["commit ok", "keys ok", "confirm ok", "hash-to-element ok"] {
         assert!(console.contains(check), "{console}");
@@ -181,15 +191,13 @@ fn every_driver_does_its_job() {
     m.soc.board.rfid.tags.push(tag);
     // Something to listen to: a 500 Hz note, as long as it takes.
     let mut sung = 0;
-    while !m.console().ends_with("end\n") {
-        assert!(m.soc.millis() < 60_000, "never finished:\n{}", m.console());
-        wait(&mut m, 10);
+    to_the_end(&mut m, 10, |m| {
         let microphone = &mut m.soc.board.codec.microphone;
         while microphone.len() < 800 {
             microphone.push_back(note(sung));
             sung += 1;
         }
-    }
+    });
     let console = m.console();
     assert_eq!(m.events, [], "{console}");
     assert!(m.soc.bus_faults.is_empty(), "{:x?}", m.soc.bus_faults);
@@ -255,13 +263,23 @@ fn every_driver_does_its_job() {
 /// point still holding the old association.
 mod wpa3 {
     use super::common::{
-        authorized, handshakes, ip_on_the_wire, lapin, on_wpa3_network, until_by, until_every,
+        authorized, handshakes, ip_on_the_wire, lapin, on_wpa3_network, sae_exchanges, until_by,
+        until_every,
     };
     use nabemu::air::ApEvent;
     use nabemu::{DEFAULT_MAC, Machine};
 
     fn rabbit() -> Option<Machine> {
         Some(on_wpa3_network(&lapin()?))
+    }
+
+    /// The rabbit a second after it first got on the network, and when
+    /// it got on.
+    fn joined() -> Option<(Machine, u64)> {
+        let mut m = rabbit()?;
+        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
+        m.run_until_ms(first + 1000);
+        Some((m, first))
     }
 
     #[test]
@@ -283,9 +301,7 @@ mod wpa3 {
     /// exchange (PMKSA caching): no password exchange the second time.
     #[test]
     fn comes_back_without_a_second_password_exchange() {
-        let Some(mut m) = rabbit() else { return };
-        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
-        m.run_until_ms(first + 1000);
+        let Some((mut m, _)) = joined() else { return };
         m.air[0].kick(&mut m.radio.borrow_mut(), DEFAULT_MAC, 3);
         let kicked = m.soc.millis();
         let back = until_every(&mut m, 5, 30_000, "back", |m| handshakes(m) == 2);
@@ -294,22 +310,16 @@ mod wpa3 {
             events.contains(&ApEvent::PmksaCacheUsed { sta: DEFAULT_MAC }),
             "{events:?}"
         );
-        assert_eq!(
-            events
-                .iter()
-                .filter(|e| matches!(e, ApEvent::SaeComplete { .. }))
-                .count(),
-            1
-        );
+        assert_eq!(sae_exchanges(&m), 1);
         eprintln!("back {} ms after being thrown out", back - kicked);
         assert_eq!(m.events, []);
     }
 
     #[test]
     fn after_a_power_cut_it_waits_out_the_old_association() {
-        let Some(mut m) = rabbit() else { return };
-        let first = until_every(&mut m, 5, 30_000, "authorized", authorized);
-        m.run_until_ms(first + 1000);
+        let Some((mut m, first)) = joined() else {
+            return;
+        };
         m.power_cycle();
         let again = until_by(&mut m, first + 40_000, 5, "back", |m| handshakes(m) == 2);
         assert!(authorized(&m));
@@ -357,17 +367,9 @@ fn the_interpreter_outruns_the_c_one() {
         7u8, 0, 2, 2, 24, 29, 11, 0, 7, 0, 1, 7, 0, 2, 1, 10, 2, 1, 0, 7, 0, 2, 2, 10, 2, 1, 0, 9,
         1,
     ];
-    let mut code = vec![0u8, 0, 0];
-    code.extend(main);
-    let second = code.len() as u32;
-    code.extend([1u8, 0, 0]);
-    code.extend(fib);
-    let mut fb = 4u32.to_le_bytes().to_vec();
-    fb.extend((code.len() as u32).to_le_bytes());
-    fb.extend(&code);
-    fb.extend(2u16.to_le_bytes());
-    fb.extend(0u32.to_le_bytes());
-    fb.extend(second.to_le_bytes());
+    let main = [&metal::FUNCTION_HEADER[..], &main].concat();
+    let fib = [&[1u8, 0, 0][..], &fib].concat();
+    let fb = metal::bytecode_functions(&[], &[&main, &fib]);
 
     let r3 = common::r3();
     let time = |image: &[u8], bytecode: &[u8]| {

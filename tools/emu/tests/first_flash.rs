@@ -12,7 +12,9 @@
 
 mod common;
 
-use common::{RESCUE, lapin, lapin_target, on_network, open, r3, serve_first};
+use common::{
+    RESCUE, in_parallel, lapin, lapin_first as first_image, on_network, open, r3, serve_first,
+};
 use nabemu::soc::{CLOCK_HZ, FLASH_ERASE_MAX_MS, FLASH_PROGRAM_US, ResetCause};
 use nabemu::{Event, Machine, metal};
 
@@ -29,12 +31,6 @@ enum After {
 
 /// The watchdog's period, in ms (lapin/fw/src/watchdog.rs).
 const WATCHDOG_MS: u64 = 2097;
-
-/// The image the server sends an r3 rabbit: the rescue core, then the
-/// application packed.
-fn first_image() -> Option<Vec<u8>> {
-    lapin_target("lapin-first.bin")
-}
 
 /// Where the packed application's stream ends, from its header (five
 /// words: magic, stream length, ...).
@@ -120,6 +116,38 @@ fn ops(image: &[u8]) -> u64 {
     sectors + words
 }
 
+/// The power cut at sixteen points of r3 writing `image` (typical
+/// timings), all at once: after the first `i` of `parts` of its flash
+/// operations, `i` from 1 to 16. Once the rescue core (its first 20 KB)
+/// is whole, every cut leaves a rabbit on its rescue network; a cut
+/// after the last operation, lapin; one in the rescue core, a rabbit
+/// that never runs lapin. Known defect (K3): the earliest cut kills
+/// the rabbit.
+fn cut_during_r3s_write(image: &[u8], parts: u64) {
+    let total = ops(image);
+    let core = ops(&image[..RESCUE]);
+    let results = in_parallel(1..=16, |i| {
+        let cut = total * i / parts;
+        let (_, after, _) = first_flash(image, nabemu::soc::FLASH_ERASE_MS, Some(cut));
+        (cut, after)
+    });
+    eprintln!("rescue core: the first {core} of {total} operations");
+    for (cut, after) in &results {
+        eprintln!("cut after {cut:6}: {after:?}");
+    }
+    for &(cut, after) in &results {
+        if cut == total {
+            assert_eq!(after, After::Lapin, "cut after {cut}");
+        } else if cut > core {
+            assert_eq!(after, After::Rescue, "cut after {cut}");
+        } else {
+            assert_ne!(after, After::Lapin, "cut after {cut}");
+        }
+    }
+    // The defect pinned: the early cuts kill the rabbit.
+    assert_eq!(results[0].1, After::Dead, "Known defect: a cut in the core");
+}
+
 /// With the timings the emulator takes by default (22 ms an erase):
 /// the whole image goes in within the watchdog's 2.1 s, and lapin runs.
 #[test]
@@ -160,35 +188,8 @@ fn with_the_slowest_flash_r3_is_bitten_mid_write_and_the_rescue_core_takes_over(
 #[test]
 fn a_power_cut_during_the_first_flash() {
     let Some(image) = lapin() else { return };
-    let total = ops(&image);
-    let core = ops(&image[..RESCUE]);
-    let cuts: Vec<u64> = (1..=16).map(|i| total * i / 17).collect();
-    let results: Vec<(u64, After)> = std::thread::scope(|s| {
-        let runs: Vec<_> = cuts
-            .iter()
-            .map(|&cut| {
-                let image = &image;
-                s.spawn(move || {
-                    let (_, after, _) = first_flash(image, nabemu::soc::FLASH_ERASE_MS, Some(cut));
-                    (cut, after)
-                })
-            })
-            .collect();
-        runs.into_iter().map(|r| r.join().unwrap()).collect()
-    });
-    eprintln!("rescue core: the first {core} of {total} operations");
-    for (cut, after) in &results {
-        eprintln!("cut after {cut:6}: {after:?}");
-    }
-    for &(cut, after) in &results {
-        if cut > core {
-            assert_eq!(after, After::Rescue, "cut after {cut}");
-        } else {
-            assert_ne!(after, After::Lapin, "cut after {cut}");
-        }
-    }
-    // The defect pinned: the early cuts kill the rabbit.
-    assert_eq!(results[0].1, After::Dead, "Known defect: a cut in the core");
+    // Seventeenths: none after the last operation.
+    cut_during_r3s_write(&image, 17);
 }
 
 /// The first image, with the typical flash timings and with the
@@ -201,39 +202,31 @@ fn r3_writes_the_first_image_within_the_watchdog_even_at_the_slowest_flash() {
     let (Some(first), Some(full)) = (first_image(), lapin()) else {
         return;
     };
-    let runs: Vec<R3> = std::thread::scope(|s| {
-        let runs: Vec<_> = [nabemu::soc::FLASH_ERASE_MS, FLASH_ERASE_MAX_MS]
-            .into_iter()
-            .map(|erase_ms| {
-                let (first, full) = (&first, &full);
-                s.spawn(move || {
-                    let (m, after, r3) = first_flash(first, erase_ms, None);
-                    eprintln!(
-                        "lapin-first.bin ({} bytes), {erase_ms} ms an erase: r3 writes it in \
-                         {} ms, {} operations, the watchdog unfed {} ms at most: {} ms to \
-                         spare of {WATCHDOG_MS}; then {after:?} after {:?}",
-                        first.len(),
-                        r3.write_ms,
-                        r3.ops,
-                        r3.unfed_ms,
-                        WATCHDOG_MS.saturating_sub(r3.unfed_ms),
-                        m.events
-                    );
-                    // r3 wrote it all and restarted itself, then the rescue
-                    // core's two steps restarted twice.
-                    assert!(r3.ops >= ops(first), "r3 did not write it all");
-                    assert_eq!(m.events.len(), 3, "{:?}", m.events);
-                    assert_eq!(after, After::Lapin);
-                    assert_eq!(
-                        m.soc.flash[..full.len()],
-                        full[..],
-                        "the flash is lapin-full.bin"
-                    );
-                    r3
-                })
-            })
-            .collect();
-        runs.into_iter().map(|r| r.join().unwrap()).collect()
+    let erase = [nabemu::soc::FLASH_ERASE_MS, FLASH_ERASE_MAX_MS];
+    let runs = in_parallel(erase, |erase_ms| {
+        let (m, after, r3) = first_flash(&first, erase_ms, None);
+        eprintln!(
+            "lapin-first.bin ({} bytes), {erase_ms} ms an erase: r3 writes it in \
+             {} ms, {} operations, the watchdog unfed {} ms at most: {} ms to \
+             spare of {WATCHDOG_MS}; then {after:?} after {:?}",
+            first.len(),
+            r3.write_ms,
+            r3.ops,
+            r3.unfed_ms,
+            WATCHDOG_MS.saturating_sub(r3.unfed_ms),
+            m.events
+        );
+        // r3 wrote it all and restarted itself, then the rescue
+        // core's two steps restarted twice.
+        assert!(r3.ops >= ops(&first), "r3 did not write it all");
+        assert_eq!(m.events.len(), 3, "{:?}", m.events);
+        assert_eq!(after, After::Lapin);
+        assert_eq!(
+            m.soc.flash[..full.len()],
+            full[..],
+            "the flash is lapin-full.bin"
+        );
+        r3
     });
     // At the slowest, 100 ms to spare at least (the application packed
     // into a sector more would take about 90 of them); typically, more
@@ -271,6 +264,16 @@ fn first_start(flash: &[u8]) -> Machine {
     m
 }
 
+/// Run the first start a millisecond at a time, `each` looking at it,
+/// to its second restart, into lapin: within 30 s.
+fn installed(m: &mut Machine, mut each: impl FnMut(&Machine)) {
+    while m.events.len() < 2 {
+        assert!(m.soc.millis() < 30_000, "not installed: {}", m.console());
+        m.run_until_ms(m.soc.millis() + 1);
+        each(m);
+    }
+}
+
 /// The first start, uncut: the rescue core unpacks, writes the sectors
 /// past the packed application, restarts, unpacks again, writes the
 /// rest, restarts into lapin. The watchdog is fed all along.
@@ -282,14 +285,12 @@ fn the_rescue_core_unpacks_the_first_image_and_writes_the_application() {
     let mut m = first_start(&after_r3(&first));
     let mut unfed = 0;
     let mut resets_at = Vec::new();
-    while m.events.len() < 2 {
-        assert!(m.soc.millis() < 30_000, "{}", m.console());
-        m.run_until_ms(m.soc.millis() + 1);
+    installed(&mut m, |m| {
         unfed = unfed.max(m.soc.watchdog_unfed() * 1000 / CLOCK_HZ);
         if m.events.len() > resets_at.len() {
             resets_at.push(m.soc.millis());
         }
-    }
+    });
     eprintln!(
         "restarts at {resets_at:?} ms, {} erases, the watchdog unfed {unfed} ms at most",
         m.soc.flash_erases
@@ -335,29 +336,18 @@ fn a_power_cut_anywhere_in_the_first_start_leaves_a_rabbit_that_comes_back() {
     let flash = after_r3(&first);
     // The uncut first start, to time it.
     let mut m = first_start(&flash);
-    while m.events.len() < 2 {
-        assert!(m.soc.millis() < 30_000, "not installed: {}", m.console());
-        m.run_until_ms(m.soc.millis() + 1);
-    }
+    installed(&mut m, |_| {});
     let span = m.soc.millis();
     let blob = RESCUE..packed_end(&first);
-    let results: Vec<(u64, bool, After)> = std::thread::scope(|s| {
-        let runs: Vec<_> = (1..=32)
-            .map(|i| {
-                let (flash, first, blob) = (&flash, &first, blob.clone());
-                s.spawn(move || {
-                    let at = span * i / 32;
-                    let mut m = first_start(flash);
-                    m.run_until_ms(at);
-                    let whole = m.soc.flash[blob.clone()] == first[blob];
-                    m.power_cycle();
-                    let said = m.soc.uart_tx.len();
-                    let after = comes_back(&mut m, said);
-                    (at, whole, after)
-                })
-            })
-            .collect();
-        runs.into_iter().map(|r| r.join().unwrap()).collect()
+    let results = in_parallel(1..=32, |i| {
+        let at = span * i / 32;
+        let mut m = first_start(&flash);
+        m.run_until_ms(at);
+        let whole = m.soc.flash[blob.clone()] == first[blob.clone()];
+        m.power_cycle();
+        let said = m.soc.uart_tx.len();
+        let after = comes_back(&mut m, said);
+        (at, whole, after)
     });
     eprintln!("the first start takes {span} ms");
     for (at, whole, after) in &results {
@@ -381,33 +371,5 @@ fn a_power_cut_anywhere_in_the_first_start_leaves_a_rabbit_that_comes_back() {
 #[test]
 fn a_power_cut_during_r3s_write_of_the_first_image() {
     let Some(first) = first_image() else { return };
-    let total = ops(&first);
-    let core = ops(&first[..RESCUE]);
-    let results: Vec<(u64, After)> = std::thread::scope(|s| {
-        let runs: Vec<_> = (1..=16)
-            .map(|i| {
-                let first = &first;
-                s.spawn(move || {
-                    let cut = total * i / 16;
-                    let (_, after, _) = first_flash(first, nabemu::soc::FLASH_ERASE_MS, Some(cut));
-                    (cut, after)
-                })
-            })
-            .collect();
-        runs.into_iter().map(|r| r.join().unwrap()).collect()
-    });
-    eprintln!("rescue core: the first {core} of {total} operations");
-    for (cut, after) in &results {
-        eprintln!("cut after {cut:6}: {after:?}");
-    }
-    for &(cut, after) in &results {
-        if cut == total {
-            assert_eq!(after, After::Lapin, "cut after {cut}");
-        } else if cut > core {
-            assert_eq!(after, After::Rescue, "cut after {cut}");
-        } else {
-            assert_ne!(after, After::Lapin, "cut after {cut}");
-        }
-    }
-    assert_eq!(results[0].1, After::Dead, "Known defect: a cut in the core");
+    cut_during_r3s_write(&first, 16);
 }

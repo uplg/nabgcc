@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{artifact, on_network, open, serve_first, until, until_by, wait};
+use common::{artifact, on_network, open, restarted, serve_first, until, until_by, wait};
 use nabemu::config;
 use nabemu::elf::decode_sim;
 use nabemu::soc::ResetCause;
@@ -28,9 +28,7 @@ fn flashes_a_new_firmware_over_the_air_and_boots_it() {
     let mut m = rabbit_about_to_flash(&new_image);
     let settings = m.soc.flash[config::OFFSET..].to_vec();
 
-    until(&mut m, 90_000, "reboot after the flash", |m| {
-        !m.events.is_empty()
-    });
+    until(&mut m, 90_000, "reboot after the flash", restarted);
     assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
     assert_eq!(
         m.soc.flash[..new_image.len()],
@@ -76,7 +74,7 @@ fn a_power_cut_during_the_flash_leaves_a_dead_rabbit() {
     let mut m = rabbit_about_to_flash(&new_image);
     // A third of the way through: sectors erased, the image half written.
     m.soc.cut_power_after_flash_ops = Some(8000);
-    until(&mut m, 90_000, "the power cut", |m| !m.events.is_empty());
+    until(&mut m, 90_000, "the power cut", restarted);
     // What the half-written image does next varies with the old image
     // left past the cut: it may never run, run into an undefined
     // instruction, or put a few stray bytes on the serial port. It

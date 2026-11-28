@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{PASSPHRASE, artifact, page, phone, phone_gets_an_address, until_by};
+use common::{PASSPHRASE, artifact, page, phone, phone_gets_an_address, restarted, until_by};
 use nabemu::config;
 use nabemu::crypto::wpa_psk;
 use nabemu::elf::decode_sim;
@@ -70,9 +70,7 @@ fn a_firmware_posted_to_the_update_page_is_flashed() {
     let sim = artifact("Nab0013.01ca89.sim");
     let image = decode_sim(&sim).unwrap();
     m.visitor.as_mut().unwrap().post("/c", &sim);
-    until_by(&mut m, 300_000, 20, "the reboot after the flash", |m| {
-        !m.events.is_empty()
-    });
+    until_by(&mut m, 300_000, 20, "the reboot after the flash", restarted);
     assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
     assert_eq!(m.soc.flash[..image.len()], image[..]);
 }

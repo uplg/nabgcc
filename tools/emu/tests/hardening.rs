@@ -4,7 +4,8 @@
 
 mod common;
 
-use common::{RESCUE, lapin, ms, on_network, open, serving, until, wait};
+use common::{RESCUE, lapin, ms, on_network, open, restarted, serving, until, wait};
+use nabemu::crypto::crc32;
 use nabemu::metal;
 use nabemu::soc::ResetCause;
 use nabemu::{Event, Machine};
@@ -25,6 +26,15 @@ fn with_another_core(image: &[u8]) -> Vec<u8> {
     let mut other = image.to_vec();
     other[RESCUE - 100] ^= 0x55;
     other
+}
+
+/// `image` served a bytecode that flashes `new`, run to its restart;
+/// and its flash before.
+fn flashed(image: &[u8], new: &[u8]) -> (Machine, Vec<u8>) {
+    let mut m = serving(image, &metal::flash_firmware(new));
+    let before = m.soc.flash.clone();
+    until(&mut m, 60_000, "the restart", restarted);
+    (m, before)
 }
 
 /// The stick gone from under a running rabbit: its control transfers
@@ -57,9 +67,7 @@ fn a_stick_that_stops_answering_never_freezes_the_rabbit() {
 fn an_image_cut_short_is_refused_with_nothing_erased() {
     let Some(image) = lapin() else { return };
     for cut in [8192, RESCUE, RESCUE + 4096] {
-        let mut m = serving(&image, &metal::flash_firmware(&image[..cut]));
-        let before = m.soc.flash.clone();
-        until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+        let (m, before) = flashed(&image, &image[..cut]);
         assert_eq!(
             m.events[0],
             Event::Reset(ResetCause::Watchdog),
@@ -75,9 +83,7 @@ fn an_image_cut_short_is_refused_with_nothing_erased() {
 #[test]
 fn a_new_rescue_core_that_is_damaged_is_refused() {
     let Some(image) = lapin() else { return };
-    let other = with_another_core(&image);
-    let mut m = serving(&image, &metal::flash_firmware(&other));
-    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    let (m, _) = flashed(&image, &with_another_core(&image));
     assert_eq!(m.soc.flash_erases, 0, "something erased");
 }
 
@@ -89,28 +95,12 @@ fn a_new_rescue_core_that_is_whole_is_written() {
     let mut other = with_another_core(&image);
     let crc = crc32(&other[..RESCUE - 8]);
     other[RESCUE - 4..RESCUE].copy_from_slice(&crc.to_le_bytes());
-    let mut m = serving(&image, &metal::flash_firmware(&other));
-    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    let (m, _) = flashed(&image, &other);
     assert!(
         m.soc.flash[..other.len()] == other[..],
         "the new image in place"
     );
     assert!(m.soc.flash_erases > 0, "the core rewritten too");
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut c = !0u32;
-    for &b in data {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = if c & 1 != 0 {
-                (c >> 1) ^ 0xEDB8_8320
-            } else {
-                c >> 1
-            };
-        }
-    }
-    !c
 }
 
 mod rescue_network {
@@ -297,7 +287,7 @@ fn a_stick_that_stops_sending_is_got_going_again() {
 
     // For good.
     m.radio.borrow_mut().tx_stuck = true;
-    until(&mut m, 40_000, "the restart", |m| !m.events.is_empty());
+    until(&mut m, 40_000, "the restart", restarted);
     assert_eq!(m.events, [Event::Reset(ResetCause::Watchdog)]);
 }
 
@@ -317,7 +307,7 @@ fn flash_routines_overwritten_in_ram_still_write_the_update() {
     stick_up(&mut m);
     // Both routines, from the first word of the RAM after the slots.
     m.soc.iram[0x10..0x150].fill(0xA5);
-    until(&mut m, 60_000, "the restart", |m| !m.events.is_empty());
+    until(&mut m, 60_000, "the restart", restarted);
     assert_eq!(m.events[0], Event::Reset(ResetCause::Watchdog));
     assert!(m.soc.flash_erases > 0, "nothing written");
     assert!(

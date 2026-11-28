@@ -6,36 +6,31 @@
 
 mod common;
 
+use common::bc::{self, Global, op::*};
 use common::{
-    BSSID, ap_count, authorized, machine, on_network, open, under_test, until, wait, wpa2,
+    APPLICATION_HEAD, BSSID, ap_count, arp_replies, authorized, lapin_under_test, machine,
+    on_network, open, under_test, until, wait, wpa2,
 };
 use nabemu::air::ApEvent;
 use nabemu::config::Wifi;
 use nabemu::lan::{GATEWAY_MAC, Lan};
-use nabemu::rt2573::RxFrame;
+use nabemu::rt2573::{Radio, RxFrame};
 use nabemu::testing::is_lapin;
 use nabemu::{DEFAULT_MAC, Machine, metal};
 
 // ---- the network ---------------------------------------------------
 
-/// An ARP request for the rabbit's address, after its LLC header.
-fn arp_request() -> Vec<u8> {
-    let mut b = vec![0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x06];
-    b.extend_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
-    b.extend_from_slice(&GATEWAY_MAC);
-    b.extend_from_slice(&[192, 168, 1, 1]);
-    b.extend_from_slice(&[0; 6]);
-    b.extend_from_slice(&[192, 168, 1, 100]);
-    b
+/// An ARP request for the rabbit's address, as an Ethernet frame for
+/// the access point to send on.
+fn eth_arp() -> Vec<u8> {
+    common::arp_request(DEFAULT_MAC)
 }
 
-/// The same as an Ethernet frame, for the access point to send on.
-fn eth_arp() -> Vec<u8> {
-    let mut e = DEFAULT_MAC.to_vec();
-    e.extend_from_slice(&GATEWAY_MAC);
-    e.extend_from_slice(&[0x08, 0x06]);
-    e.extend_from_slice(&arp_request()[8..]);
-    e
+/// The same after its LLC header, as in an 802.11 frame.
+fn arp_request() -> Vec<u8> {
+    let mut b = vec![0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x06];
+    b.extend_from_slice(&eth_arp()[14..]);
+    b
 }
 
 /// A data frame's header from the access point, `fc1` its flags.
@@ -48,35 +43,62 @@ fn header(fc1: u8, seq: u16) -> Vec<u8> {
     h
 }
 
-fn arp_replies(m: &Machine) -> usize {
-    m.air[0]
-        .uplink
-        .iter()
-        .filter(|e| e.len() >= 22 && e[12..14] == [0x08, 0x06] && e[20..22] == [0, 2])
-        .count()
+/// A server on the wire (the one there, or a new one) until the rabbit
+/// has an address from it, and three seconds more.
+fn leases_an_address(m: &mut Machine, what: &str) {
+    m.lan.get_or_insert_with(Lan::new);
+    until(m, 60_000, what, |m| {
+        m.lan.as_ref().unwrap().leased_to.is_some()
+    });
+    wait(m, 3000);
+    m.lan = None;
 }
 
 /// The rabbit on the home network (WPA2, or open), with an address.
 fn with_an_address(wifi: (Wifi, nabemu::air::Security)) -> Machine {
     let mut m = on_network(&nabemu::testing::image(), wifi);
-    m.lan = Some(Lan::new());
-    until(&mut m, 60_000, "an address", |m| {
-        m.lan.as_ref().unwrap().leased_to.is_some()
-    });
-    wait(&mut m, 3000);
-    m.lan = None;
+    leases_an_address(&mut m, "an address");
     m.air[0].uplink.clear();
     m
+}
+
+/// The access point sends `frames` one after the other: how many
+/// answers to an ARP request came within `ms`.
+fn arp_replies_to(m: &mut Machine, frames: &[&[u8]], ms: u64) -> usize {
+    m.air[0].uplink.clear();
+    for eth in frames {
+        m.air[0].send(&mut m.radio.borrow_mut(), eth);
+    }
+    wait(m, ms);
+    arp_replies(m)
 }
 
 /// The access point asks the rabbit for its address, properly: how
 /// many answers came within two seconds.
 fn answers_arp(m: &mut Machine) -> usize {
+    arp_replies_to(m, &[&eth_arp()], 2000)
+}
+
+/// A frame from a sender in radio range that the stick hands over as
+/// it is (`oversized`): none of what it carries gets in.
+fn forged_frame_kept_out(m: &mut Machine, len: usize, inner_at: usize) {
     m.air[0].uplink.clear();
-    let eth = eth_arp();
-    m.air[0].send(&mut m.radio.borrow_mut(), &eth);
+    m.radio
+        .borrow_mut()
+        .rx
+        .push_back(RxFrame::new(oversized(len, inner_at)));
     wait(m, 2000);
-    arp_replies(m)
+    assert_eq!(arp_replies(m), 0, "{len} bytes: the forged frame went in");
+}
+
+/// After an overrun lapin still hears; r3 is deaf.
+fn hears_after_an_overrun(m: &mut Machine) {
+    let replies = answers_arp(m);
+    if is_lapin() {
+        assert_eq!(replies, 1, "lapin still hears");
+    } else {
+        assert_eq!(replies, 0, "Known defect: r3 deaf after an overrun");
+    }
 }
 
 /// A frame from a sender in radio range, in clear, `len` bytes long,
@@ -115,20 +137,9 @@ fn oversized(len: usize, inner_at: usize) -> Vec<u8> {
 fn a_frame_longer_than_2_kb_slips_nothing_in_and_deafens_nobody() {
     let mut m = with_an_address(wpa2());
     for (len, at) in [(2172, 2112), (4095, 2112), (4095, 4032)] {
-        m.air[0].uplink.clear();
-        m.radio
-            .borrow_mut()
-            .rx
-            .push_back(RxFrame::new(oversized(len, at)));
-        wait(&mut m, 2000);
-        assert_eq!(arp_replies(&m), 0, "{len} bytes: the forged frame went in");
+        forged_frame_kept_out(&mut m, len, at);
     }
-    let replies = answers_arp(&mut m);
-    if is_lapin() {
-        assert_eq!(replies, 1, "lapin still hears");
-    } else {
-        assert_eq!(replies, 0, "Known defect: r3 deaf after an overrun");
-    }
+    hears_after_an_overrun(&mut m);
 }
 
 /// A stick that hands over a transfer longer than any frame it should
@@ -142,18 +153,8 @@ fn a_transfer_past_the_reassembly_buffer_is_dropped_to_its_end() {
     m.radio.borrow_mut().rx_any_length = true;
     // lapin's buffer ends at 4160, a whole packet: the forged
     // descriptor starts the packet after the one that overflows.
-    m.radio
-        .borrow_mut()
-        .rx
-        .push_back(RxFrame::new(oversized(4500, 4224)));
-    wait(&mut m, 2000);
-    assert_eq!(arp_replies(&m), 0, "the forged frame went in");
-    let replies = answers_arp(&mut m);
-    if is_lapin() {
-        assert_eq!(replies, 1, "lapin still hears");
-    } else {
-        assert_eq!(replies, 0, "Known defect: r3 deaf after an overrun");
-    }
+    forged_frame_kept_out(&mut m, 4500, 4224);
+    hears_after_an_overrun(&mut m);
 }
 
 /// A receive packet the USB controller gives up on: lapin glued what
@@ -164,15 +165,12 @@ fn a_lost_usb_packet_merges_no_frames() {
     let mut m = with_an_address(wpa2());
     // The ARP request arrives in two packets: its second is lost.
     m.radio.borrow_mut().lose_rx_packet = Some(1);
-    m.air[0].uplink.clear();
     let eth = eth_arp();
     // The same again right behind it: the very next frame the stick
     // hands over. Glued to the packet before the lost one, it would be
     // the tail of a broken frame, and lost too.
-    m.air[0].send(&mut m.radio.borrow_mut(), &eth);
-    m.air[0].send(&mut m.radio.borrow_mut(), &eth);
-    wait(&mut m, 1000);
-    assert_eq!(arp_replies(&m), 1, "the next frame merged");
+    let replies = arp_replies_to(&mut m, &[&eth, &eth], 1000);
+    assert_eq!(replies, 1, "the next frame merged");
 }
 
 /// A packet lost in the middle of a frame: what is left of that frame
@@ -183,29 +181,28 @@ fn a_lost_usb_packet_merges_no_frames() {
 fn a_packet_lost_mid_frame_drops_that_frame_to_its_end_only() {
     let mut m = with_an_address(wpa2());
     m.radio.borrow_mut().lose_rx_packet = Some(1);
-    m.air[0].uplink.clear();
     let mut padded = eth_arp();
     padded.resize(padded.len() + 120, 0);
-    m.air[0].send(&mut m.radio.borrow_mut(), &padded);
-    m.air[0].send(&mut m.radio.borrow_mut(), &eth_arp());
-    wait(&mut m, 1000);
-    assert_eq!(
-        arp_replies(&m),
-        1,
-        "the frame after it heard, the broken one not"
-    );
+    let replies = arp_replies_to(&mut m, &[&padded, &eth_arp()], 1000);
+    assert_eq!(replies, 1, "the frame after it heard, the broken one not");
 }
 
 // ---- the stick on its port ---------------------------------------------
+
+/// `image` on the open home network with a stick that `is` so: it
+/// still joins.
+fn brought_up(image: &[u8], is: impl FnOnce(&mut Radio)) {
+    let mut m = on_network(image, open());
+    is(&mut m.radio.borrow_mut());
+    until(&mut m, 40_000, "on the network", authorized);
+}
 
 /// A stick that does not answer its first requests after its reset: the
 /// C asks for its descriptor three times, 20 ms apart (A11); lapin gave
 /// up at once and had no network.
 #[test]
 fn a_stick_slow_to_answer_is_still_brought_up() {
-    let mut m = on_network(&nabemu::testing::image(), open());
-    m.radio.borrow_mut().refuse_requests = 2;
-    until(&mut m, 40_000, "on the network", authorized);
+    brought_up(&nabemu::testing::image(), |r| r.refuse_requests = 2);
 }
 
 /// The request that starts the stick's own firmware answering late (K2):
@@ -213,9 +210,7 @@ fn a_stick_slow_to_answer_is_still_brought_up() {
 /// half a second and gave the stick up.
 #[test]
 fn a_stick_slow_to_start_its_firmware_is_still_brought_up() {
-    let mut m = on_network(&nabemu::testing::image(), open());
-    m.radio.borrow_mut().firmware_start_nak_ms = 800;
-    until(&mut m, 40_000, "on the network", authorized);
+    brought_up(&nabemu::testing::image(), |r| r.firmware_start_nak_ms = 800);
 }
 
 /// A stick that refuses requests for a while, longer than the
@@ -223,32 +218,10 @@ fn a_stick_slow_to_start_its_firmware_is_still_brought_up() {
 /// and tries again (K2), and comes up.
 #[test]
 fn a_stick_that_fails_its_bring_up_once_gets_another_try() {
-    if !is_lapin() {
+    let Some(image) = lapin_under_test() else {
         return;
-    }
-    let mut m = on_network(&nabemu::testing::image(), open());
-    m.radio.borrow_mut().refuse_requests = 5;
-    until(&mut m, 40_000, "on the network", authorized);
-}
-
-/// The stick unplugged and plugged back (a loose contact, A11): the C
-/// enumerates it again and the bytecode joins anew (Known defect: after
-/// a watchdog restart the unplugging causes); lapin brought it up once
-/// only, at boot.
-/// The bytecode's body: wait `ms` on the rabbit's clock, from `base`.
-fn pause(base: usize, ms: i32) -> Vec<u8> {
-    let mut b = vec![TIME_MS];
-    b.extend(metal::int(ms));
-    b.push(ADD);
-    let top = (base + b.len()) as u16;
-    b.extend([DUP, TIME_MS, GT, ELSE, 0, 0]);
-    let exit = b.len() - 2;
-    b.push(GOTO);
-    b.extend(top.to_le_bytes());
-    let end = (base + b.len()) as u16;
-    b[exit..exit + 2].copy_from_slice(&end.to_le_bytes());
-    b.push(DROP);
-    b
+    };
+    brought_up(&image, |r| r.refuse_requests = 5);
 }
 
 /// The stick stops taking a frame after its first packet, for longer
@@ -275,7 +248,7 @@ fn the_toggle_after_a_transfer_taken_back_is_the_sticks() {
     let mut body = metal::int(7770);
     body.extend([IECHOLN, DROP]);
     for (frame, ms) in [(0, 500), (1, 1100), (2, 300)] {
-        body.extend(pause(body.len(), ms));
+        body.extend(bc::pause(body.len(), ms));
         send(&mut body, frame);
     }
     body.extend(metal::int(7771));
@@ -314,6 +287,10 @@ fn the_toggle_after_a_transfer_taken_back_is_the_sticks() {
     }
 }
 
+/// The stick unplugged and plugged back (a loose contact, A11): the C
+/// enumerates it again and the bytecode joins anew (Known defect: after
+/// a watchdog restart the unplugging causes); lapin brought it up once
+/// only, at boot.
 #[test]
 fn a_stick_plugged_back_in_is_brought_up_again() {
     let mut m = with_an_address(open());
@@ -325,11 +302,7 @@ fn a_stick_plugged_back_in_is_brought_up_again() {
     until(&mut m, 60_000, "a new association", |m| {
         ap_count(m, &ApEvent::Associated { sta: DEFAULT_MAC }) > associations
     });
-    until(&mut m, 60_000, "an address again", |m| {
-        m.lan.as_ref().unwrap().leased_to.is_some()
-    });
-    wait(&mut m, 3000);
-    m.lan = None;
+    leases_an_address(&mut m, "an address again");
     assert!(answers_arp(&mut m) >= 1, "on the network again");
     if is_lapin() {
         assert_eq!(m.events, []);
@@ -359,12 +332,12 @@ fn a_level_root_hub_interrupt_is_served() {
 /// interrupt it still raises its network.
 #[test]
 fn the_rescue_core_serves_a_level_root_hub_interrupt() {
-    if !is_lapin() {
+    let Some(image) = lapin_under_test() else {
         return;
-    }
-    let mut m = machine(&nabemu::testing::image());
+    };
+    let mut m = machine(&image);
     m.soc.ohci.rhsc_level = true;
-    m.soc.flash[common::RESCUE..common::RESCUE + 4096].fill(0xFF);
+    m.soc.flash[APPLICATION_HEAD].fill(0xFF);
     common::rescue_network_up(&mut m);
     assert_eq!(m.events, []);
 }
@@ -455,80 +428,26 @@ fn pins_and_watchdog_are_set_up_before_the_application_is_checked() {
 
 // ---- sound ----------------------------------------------------------------
 
-fn fun(narg: u8, nloc: u16, code: &[u8]) -> Vec<u8> {
-    let mut out = vec![narg];
-    out.extend(nloc.to_le_bytes());
-    out.extend_from_slice(code);
-    out
+/// The main function of the players below: prints 7770, then starts the
+/// sound fed by function 1.
+fn start_playing() -> Vec<u8> {
+    let mut main = metal::int(7770);
+    main.extend([IECHOLN, DROP]);
+    main.extend(metal::int(1));
+    main.extend(metal::int(1));
+    main.extend([PLAYSTART, DROP, NIL, RET]);
+    bc::function(0, 4, &main)
 }
 
-/// A bytecode with globals (an empty one is the integer 0) and several
-/// functions, the first run when loaded.
-fn bytecode(globals: &[&[u8]], funs: &[Vec<u8>]) -> Vec<u8> {
-    let mut g = Vec::new();
-    for s in globals {
-        if s.is_empty() {
-            g.extend(0u32.to_le_bytes());
-            continue;
-        }
-        g.extend(((s.len() as u32) << 2 | 1).to_le_bytes());
-        g.extend_from_slice(s);
-    }
-    let mut bc = (g.len() as u32 + 4).to_le_bytes().to_vec();
-    bc.extend(g);
-    let mut code: Vec<u8> = Vec::new();
-    let mut starts = Vec::new();
-    for f in funs {
-        starts.push(code.len() as u32);
-        code.extend(f);
-    }
-    bc.extend((code.len() as u32).to_le_bytes());
-    bc.extend(code);
-    bc.extend((funs.len() as u16).to_le_bytes());
-    for s in starts {
-        bc.extend(s.to_le_bytes());
-    }
-    bc
-}
-
-const NIL: u8 = 4;
-const DROP: u8 = 5;
-const ADD: u8 = 9;
-const AND: u8 = 14;
-const SUB: u8 = 10;
-const NEG: u8 = 19;
-const GOTO: u8 = 28;
-const ELSE: u8 = 29;
-const GETGLOBALB: u8 = 36;
-const SETGLOBAL: u8 = 42;
-const PLAYSTART: u8 = 79;
-const PLAYFEED: u8 = 80;
-const GC: u8 = 87;
-const IECHOLN: u8 = 95;
-const RET: u8 = 1;
-
-/// A WAV header for 16-bit sound at `rate` hertz on `channels`, of
-/// `len` bytes of samples.
-fn wav_header_at(rate: u32, channels: u16, len: u32) -> Vec<u8> {
-    let mut h = Vec::new();
-    h.extend(b"RIFF");
-    h.extend((len + 36).to_le_bytes());
-    h.extend(b"WAVEfmt ");
-    h.extend(16u32.to_le_bytes());
-    h.extend(1u16.to_le_bytes());
-    h.extend(channels.to_le_bytes());
-    h.extend(rate.to_le_bytes());
-    h.extend((rate * 2 * channels as u32).to_le_bytes());
-    h.extend((2 * channels).to_le_bytes());
-    h.extend(16u16.to_le_bytes());
-    h.extend(b"data");
-    h.extend(len.to_le_bytes());
-    h
-}
-
-/// The same for 16-bit mono at 8 kHz.
-fn wav_header(len: u32) -> Vec<u8> {
-    wav_header_at(8000, 1, len)
+/// A player's bytecode: `start_playing`, then `callback`, with the
+/// stream as global 0, then `counters` globals that start at 0, then
+/// four spare ones.
+fn playing(stream: &[u8], counters: usize, callback: &[u8]) -> Vec<u8> {
+    let spare = [0u8; 4];
+    let mut globals = vec![Global::Str(stream)];
+    globals.extend((0..counters).map(|_| Global::Word(0)));
+    globals.extend((0..4).map(|_| Global::Str(&spare)));
+    bc::assemble(&globals, &[&start_playing(), &bc::function(1, 0, callback)])
 }
 
 /// Bytes the play callback hands over at a time.
@@ -541,17 +460,9 @@ const CHUNK: usize = 1000;
 /// the stream is said once it is all in.
 fn player(stream: &[u8], eof: bool) -> Vec<u8> {
     assert_eq!(stream.len() % CHUNK, 0);
-    let mut main = metal::int(7770);
-    main.extend([IECHOLN, DROP]);
-    main.extend(metal::int(1));
-    main.extend(metal::int(1));
-    main.extend([PLAYSTART, DROP, NIL, RET]);
     // callback(free): global 2 counts the calls; on the odd ones,
     // global 1 += playFeed stream (global 1) CHUNK, then gc.
-    let mut cb = metal::int(2);
-    cb.extend([GETGLOBALB, 2]);
-    cb.extend(metal::int(1));
-    cb.extend([ADD, SETGLOBAL]);
+    let mut cb = next_phase();
     cb.extend(metal::int(1));
     cb.extend([AND, ELSE, 0, 0]);
     let to_skip = cb.len() - 2;
@@ -566,20 +477,13 @@ fn player(stream: &[u8], eof: bool) -> Vec<u8> {
         let to_eof = cb.len() - 2;
         cb.extend([GOTO, 0, 0]);
         let to_end = cb.len() - 2;
-        let eof_at = cb.len() as u16;
-        cb[to_eof..to_eof + 2].copy_from_slice(&eof_at.to_le_bytes());
+        bc::land_here(&mut cb, to_eof, 0);
         cb.extend([NIL, NIL, NIL, PLAYFEED, DROP]);
-        let end = cb.len() as u16;
-        cb[to_end..to_end + 2].copy_from_slice(&end.to_le_bytes());
+        bc::land_here(&mut cb, to_end, 0);
     }
-    let skip = cb.len() as u16;
-    cb[to_skip..to_skip + 2].copy_from_slice(&skip.to_le_bytes());
+    bc::land_here(&mut cb, to_skip, 0);
     cb.extend([NIL, RET]);
-    let spare = [0u8; 4];
-    bytecode(
-        &[stream, &[], &[], &spare, &spare, &spare, &spare],
-        &[fun(0, 4, &main), fun(1, 0, &cb)],
-    )
+    playing(stream, 2, &cb)
 }
 
 /// Global 1 += playFeed stream (global 0) from global 1, `chunk` bytes.
@@ -607,15 +511,7 @@ fn next_phase() -> Vec<u8> {
 /// refill, sets the volume. Global 2 is the phase of the four calls,
 /// global 3 when the next two are due.
 fn streamer(stream: &[u8], chunk: usize, period_ms: i32) -> Vec<u8> {
-    let mut main = metal::int(7770);
-    main.extend([IECHOLN, DROP]);
-    main.extend(metal::int(1));
-    main.extend(metal::int(1));
-    main.extend([PLAYSTART, DROP, NIL, RET]);
-    let label = |cb: &mut Vec<u8>, at: usize| {
-        let here = cb.len() as u16;
-        cb[at..at + 2].copy_from_slice(&here.to_le_bytes());
-    };
+    let label = |cb: &mut Vec<u8>, at: usize| bc::land_here(cb, at, 0);
     // Phase 0 (global 2 & 3 is 0) to P0, phase 2 to P2.
     let mut cb = vec![GETGLOBALB, 2];
     cb.extend(metal::int(3));
@@ -655,11 +551,7 @@ fn streamer(stream: &[u8], chunk: usize, period_ms: i32) -> Vec<u8> {
     cb.extend(feed(chunk));
     cb.extend(next_phase());
     cb.extend([DROP, NIL, RET]);
-    let spare = [0u8; 4];
-    bytecode(
-        &[stream, &[], &[], &[], &spare, &spare, &spare, &spare],
-        &[fun(0, 4, &main), fun(1, 0, &cb)],
-    )
+    playing(stream, 3, &cb)
 }
 
 /// What the codec received of the last stream played.
@@ -673,7 +565,7 @@ fn played(m: &Machine) -> Vec<u8> {
 /// zero byte in it.
 fn a_pcm_stream(samples: usize) -> Vec<u8> {
     let len = (44 + 2 * samples).div_ceil(CHUNK) * CHUNK - 44;
-    let mut s = wav_header(len as u32);
+    let mut s = common::pcm_8k_header(len as u32);
     for i in 0..len {
         let v = common::note(i / 2).to_le_bytes()[i % 2];
         s.push(v.max(1));
@@ -693,21 +585,26 @@ fn a_wav_stream(
     chunk: usize,
 ) -> Vec<u8> {
     let len = (44 + len).div_ceil(chunk) * chunk - 44;
-    let mut s = Vec::new();
-    s.extend(b"RIFF");
-    s.extend((len as u32 + 36).to_le_bytes());
-    s.extend(b"WAVEfmt ");
-    s.extend(16u32.to_le_bytes());
-    s.extend(tag.to_le_bytes());
-    s.extend(1u16.to_le_bytes());
-    s.extend(rate.to_le_bytes());
-    s.extend(byte_rate.to_le_bytes());
-    s.extend(1u16.to_le_bytes());
-    s.extend(bits.to_le_bytes());
-    s.extend(b"data");
-    s.extend((len as u32).to_le_bytes());
+    let mut s = common::wav_header(tag, bits, rate, byte_rate, 1, len as u32);
     s.extend((0..len).map(|i| (i % 251) as u8 + 1));
     s
+}
+
+/// The firmware under test playing `bytecode`: what the codec received
+/// `ms` after the sound began.
+fn played_for(bytecode: &[u8], ms: u64) -> (Machine, Vec<u8>) {
+    let mut m = common::serving(&nabemu::testing::image(), bytecode);
+    until(&mut m, 60_000, "the sound", |m| played(m).len() > 1000);
+    wait(&mut m, ms);
+    let got = played(&m);
+    (m, got)
+}
+
+/// Every byte the codec received is the stream's.
+fn assert_none_lost(got: &[u8], stream: &[u8]) {
+    let n = got.len().min(stream.len());
+    let first_wrong = (0..n).find(|&i| got[i] != stream[i]);
+    assert_eq!(first_wrong, None, "{} bytes played", got.len());
 }
 
 /// The C writes the byte it took from the ring whatever happened in the
@@ -717,14 +614,9 @@ fn a_wav_stream(
 #[test]
 fn no_byte_of_a_stream_is_lost_to_a_slow_play_callback() {
     let stream = a_pcm_stream(24_000);
-    let mut m = common::serving(&nabemu::testing::image(), &player(&stream, false));
-    until(&mut m, 60_000, "the sound", |m| played(m).len() > 1000);
-    wait(&mut m, 6000);
-    let got = played(&m);
+    let (_, got) = played_for(&player(&stream, false), 6000);
     assert!(got.len() > stream.len() / 2, "{} bytes played", got.len());
-    let n = got.len().min(stream.len());
-    let first_wrong = (0..n).find(|&i| got[i] != stream[i]);
-    assert_eq!(first_wrong, None, "{} bytes played", got.len());
+    assert_none_lost(&got, &stream);
 }
 
 /// The same end to end with a codec that is slow to take its last
@@ -741,14 +633,9 @@ fn no_byte_of_a_stream_is_lost_to_a_codec_still_busy_after_the_refill() {
     // in 150 ms of the 200.
     let chunk = 1200;
     let stream = a_wav_stream(1, 16, 8000, 16_000, 4 * chunk, chunk);
-    let mut m = common::serving(&nabemu::testing::image(), &streamer(&stream, chunk, 200));
-    until(&mut m, 60_000, "the sound", |m| played(m).len() > 1000);
-    wait(&mut m, 500);
-    let got = played(&m);
+    let (_, got) = played_for(&streamer(&stream, chunk, 200), 500);
     assert!(got.len() >= 3 * chunk, "{} bytes played", got.len());
-    let n = got.len().min(stream.len());
-    let first_wrong = (0..n).find(|&i| got[i] != stream[i]);
-    assert_eq!(first_wrong, None, "{} bytes played", got.len());
+    assert_none_lost(&got, &stream);
 }
 
 /// Known defect (B40): at the end of a stream r3 sends the codec nothing
@@ -758,10 +645,7 @@ fn no_byte_of_a_stream_is_lost_to_a_codec_still_busy_after_the_refill() {
 #[test]
 fn the_end_of_a_stream_is_flushed_and_the_amplifier_switched_off() {
     let stream = a_pcm_stream(4000);
-    let mut m = common::serving(&nabemu::testing::image(), &player(&stream, true));
-    until(&mut m, 60_000, "the sound", |m| played(m).len() > 1000);
-    wait(&mut m, 3000);
-    let got = played(&m);
+    let (m, got) = played_for(&player(&stream, true), 3000);
     assert!(got.len() >= stream.len());
     assert_eq!(got[..stream.len()], stream[..]);
     let tail = &got[stream.len()..];
@@ -779,8 +663,6 @@ fn the_end_of_a_stream_is_flushed_and_the_amplifier_switched_off() {
 }
 
 // ---- the tag reader -------------------------------------------------------
-
-const TIME_MS: u8 = 53;
 
 /// Milliseconds `calls` of `call` take on `image` with a tag in front
 /// of the nose, as the bytecode times them.
@@ -849,13 +731,6 @@ fn a_transfer_that_timed_out_leaves_the_bus_free() {
 }
 
 // ---- more of r3's defects --------------------------------------------------
-
-const WAV2ALAW: u8 = 141;
-const SNDVOL: u8 = 100;
-const LT: u8 = 24;
-const GT: u8 = 25;
-const DUP: u8 = 6;
-const NETSEND: u8 = 104;
 
 /// Known defect (B36): wav2alaw with a negative length writes over the
 /// heap and r3 restarts, and restarts again as the server gives it the
@@ -927,11 +802,10 @@ fn a_dead_codec_costs_half_a_second_once() {
 /// rescue network's beacons. They stop at the application's start.
 #[test]
 fn the_rescue_networks_beacons_stop_with_the_application() {
-    if !is_lapin() {
+    let Some(image) = lapin_under_test() else {
         return;
-    }
-    let image = nabemu::testing::image();
-    let app = image[common::RESCUE..common::RESCUE + 4096].to_vec();
+    };
+    let app = image[APPLICATION_HEAD].to_vec();
     let mut m = common::without_application(&image);
     wait(&mut m, 2000);
     let beacons = |m: &Machine| {
@@ -945,7 +819,7 @@ fn the_rescue_networks_beacons_stop_with_the_application() {
     assert!(beacons(&m) > 0, "the rescue network beacons");
     // The application back in its place, and a restart (the watchdog's,
     // the stick keeps its power and its registers).
-    m.soc.flash[common::RESCUE..common::RESCUE + 4096].copy_from_slice(&app);
+    m.soc.flash[APPLICATION_HEAD].copy_from_slice(&app);
     m.soc.pending_reset = Some(nabemu::soc::ResetCause::Watchdog);
     until(&mut m, 20_000, "the application", |m| {
         m.console().contains("lapin 0.1")
@@ -988,9 +862,7 @@ fn an_illegal_interrupt_is_no_millisecond() {
     });
     let before = m.soc.illegal_irqs;
     // Meanwhile, a frame for the rabbit every 5 ms: USB interrupts.
-    let mut eth = DEFAULT_MAC.to_vec();
-    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
-    eth.extend_from_slice(&[0x5A; 100]);
+    let eth = common::frame_for_the_bytecode(100);
     let mut ms = 0;
     while !m.console().contains("\n937937") {
         assert!(ms < 6000, "13 s on the rabbit's clock not by {ms} ms on");

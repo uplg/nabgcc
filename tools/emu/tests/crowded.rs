@@ -52,10 +52,7 @@ fn listed(m: &Machine) -> Vec<String> {
 /// network among them, each network once.
 fn setup_mode_lists(neighbours: usize) -> Vec<String> {
     let mut m = crowded(neighbours);
-    common::press(&mut m, 2000, 0);
-    until(&mut m, 30_000, "the scan listed", |m| {
-        m.console().contains("-------------gomaster")
-    });
+    common::scan_in_setup_mode(&mut m);
     listed(&m)
 }
 

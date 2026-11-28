@@ -50,6 +50,14 @@ impl World {
         self.run(50);
     }
 
+    /// Join, and be left `state` (`why`), the access point having
+    /// reported `event`.
+    fn join_ends(&mut self, state: State, why: &str, event: ApEvent) {
+        self.join();
+        assert_eq!(self.sta.state, state, "{why}");
+        assert!(self.ap.events.contains(&event), "{:?}", self.ap.events);
+    }
+
     /// A frame on the air from the station's side, for the access point.
     fn station_sends(&mut self, data: Vec<u8>) {
         self.radio.tx.push_back(TxFrame { data, channel: 6 });
@@ -146,16 +154,14 @@ fn a_network_can_insist_on_hashing_to_the_curve() {
 #[test]
 fn a_wrong_password_gets_no_further_than_the_confirm() {
     let mut w = World::new(Wpa3::Only, "pas-la-bonne");
-    w.join();
-    assert_eq!(
-        w.sta.state,
+    w.join_ends(
         State::Confirmed,
-        "left waiting: the access point says nothing"
+        "left waiting: the access point says nothing",
+        ApEvent::SaeRejected {
+            sta: STA,
+            why: "confirm does not match",
+        },
     );
-    assert!(w.ap.events.contains(&ApEvent::SaeRejected {
-        sta: STA,
-        why: "confirm does not match"
-    }));
     assert!(
         !w.ap
             .events
@@ -167,30 +173,28 @@ fn a_wrong_password_gets_no_further_than_the_confirm() {
 #[test]
 fn a_network_without_wpa3_refuses_the_exchange() {
     let mut w = World::new(Wpa3::Off, PASSWORD);
-    w.join();
-    assert_eq!(
-        w.sta.state,
-        State::Failed("the access point refused the commit")
+    w.join_ends(
+        State::Failed("the access point refused the commit"),
+        "where the exchange ended",
+        ApEvent::AuthRejected {
+            sta: STA,
+            status: 13,
+        },
     );
-    assert!(w.ap.events.contains(&ApEvent::AuthRejected {
-        sta: STA,
-        status: 13
-    }));
 }
 
 #[test]
 fn a_station_that_will_not_protect_management_frames_is_refused() {
     let mut w = World::new(Wpa3::Only, PASSWORD);
     w.sta.protect_management = false;
-    w.join();
-    assert_eq!(
-        w.sta.state,
-        State::Failed("refused: management frame protection policy")
+    w.join_ends(
+        State::Failed("refused: management frame protection policy"),
+        "where the exchange ended",
+        ApEvent::AssocRejected {
+            sta: STA,
+            status: 31,
+        },
     );
-    assert!(w.ap.events.contains(&ApEvent::AssocRejected {
-        sta: STA,
-        status: 31
-    }));
 }
 
 #[test]

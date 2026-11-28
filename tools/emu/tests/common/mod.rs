@@ -3,9 +3,11 @@
 //! Each test binary compiles this on its own and uses a part of it.
 #![allow(dead_code)]
 
+pub mod bc;
+
 use nabemu::air::{AccessPoint, ApEvent, Security, Wpa3};
 use nabemu::config::{Config, Wifi};
-use nabemu::lan::{Lan, Response};
+use nabemu::lan::{GATEWAY_IP, GATEWAY_MAC, LEASE_IP, Lan, Response};
 use nabemu::visitor::Visitor;
 use nabemu::vs1003::Format;
 use nabemu::{DEFAULT_MAC, Machine, metal};
@@ -23,6 +25,9 @@ pub const UID: [u8; 8] = [0xD0, 0x02, 0x1A, 0x03, 0x52, 0xC4, 0x66, 0x7F];
 
 /// lapin's rescue core: the first 20 KB of its image.
 pub const RESCUE: usize = 20 * 1024;
+/// The first sector of lapin's application, right after its rescue
+/// core: erased, the application is gone.
+pub const APPLICATION_HEAD: std::ops::Range<usize> = RESCUE..RESCUE + 4096;
 
 /// Top of the internal RAM, where both stacks start (`lapin/fw/link.x`).
 pub const STACK_TOP: u32 = 0x1000_4000;
@@ -72,6 +77,18 @@ pub fn lapin_target(file: &str) -> Option<Vec<u8>> {
 /// lapin's whole image: the rescue core, then the application.
 pub fn lapin() -> Option<Vec<u8>> {
     lapin_target("lapin-full.bin")
+}
+
+/// The image the server sends an r3 rabbit, once: the rescue core, then
+/// the application packed.
+pub fn lapin_first() -> Option<Vec<u8>> {
+    lapin_target("lapin-first.bin")
+}
+
+/// The image of the firmware under test when that is lapin: the tests
+/// of what r3 does not have skip on r3.
+pub fn lapin_under_test() -> Option<Vec<u8>> {
+    nabemu::testing::is_lapin().then(nabemu::testing::image)
 }
 
 /// Garenne, the rabbit's real application bytecode. It lives in another
@@ -262,6 +279,11 @@ pub fn until_by(
     m.soc.millis()
 }
 
+/// Whether the rabbit restarted, for whatever reason.
+pub fn restarted(m: &Machine) -> bool {
+    !m.events.is_empty()
+}
+
 /// Whether the access point lets the rabbit's traffic through.
 pub fn authorized(m: &Machine) -> bool {
     m.air[0].is_authorized(DEFAULT_MAC)
@@ -282,15 +304,116 @@ pub fn handshakes(m: &Machine) -> usize {
     ap_count(m, &ApEvent::HandshakeComplete { sta: DEFAULT_MAC })
 }
 
+/// How many WPA3 password exchanges the access point completed.
+pub fn sae_exchanges(m: &Machine) -> usize {
+    m.air[0]
+        .events
+        .iter()
+        .filter(|e| matches!(e, ApEvent::SaeComplete { .. }))
+        .count()
+}
+
 /// Whether the rabbit's IP traffic reached the wire: its DHCP request
 /// went through the access point, encryption working both ways.
 pub fn ip_on_the_wire(m: &Machine) -> bool {
     m.air[0].uplink.iter().any(|f| f[12..14] == [0x08, 0x00])
 }
 
+/// An ARP request from the gateway for the rabbit's address, an
+/// Ethernet frame sent to `to`.
+pub fn arp_request(to: [u8; 6]) -> Vec<u8> {
+    let mut f = to.to_vec();
+    f.extend_from_slice(&GATEWAY_MAC);
+    f.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+    f.extend_from_slice(&GATEWAY_MAC);
+    f.extend_from_slice(&GATEWAY_IP);
+    f.extend_from_slice(&[0; 6]);
+    f.extend_from_slice(&LEASE_IP);
+    f
+}
+
+/// How many ARP replies the rabbit sent up through the access point.
+pub fn arp_replies(m: &Machine) -> usize {
+    m.air[0]
+        .uplink
+        .iter()
+        .filter(|e| e.len() >= 22 && e[12..14] == [0x08, 0x06] && e[20..22] == [0, 2])
+        .count()
+}
+
 /// Where `needle` first is in `hay`.
 pub fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Whether a program that prints 7770 first, then 8880 last, started.
+pub fn program_started(m: &Machine) -> bool {
+    find(&m.soc.uart_tx, b"7770").is_some()
+}
+
+/// Whether it ended.
+pub fn program_ended(m: &Machine) -> bool {
+    find(&m.soc.uart_tx, b"8880").is_some()
+}
+
+/// The numbers it printed between 7770 and 8880, in its last run.
+pub fn printed(m: &Machine) -> Vec<i64> {
+    let c = m.console();
+    let from = c.rfind("7770").expect("the program ran") + 4;
+    let to = c[from..].find("8880").map_or(c.len(), |i| from + i);
+    c[from..to]
+        .split_whitespace()
+        .filter_map(|w| w.parse().ok())
+        .collect()
+}
+
+/// An Ethernet frame for the rabbit of a kind no one handles (0x88B5),
+/// `len` bytes of payload: for the bytecode's frame callback.
+pub fn frame_for_the_bytecode(len: usize) -> Vec<u8> {
+    let mut eth = DEFAULT_MAC.to_vec();
+    eth.extend_from_slice(&[2, 0, 0, 0, 0, 0x55, 0x88, 0xB5]);
+    eth.extend(std::iter::repeat_n(0x5A, len));
+    eth
+}
+
+/// A WAV header for one channel: format `tag` (1 PCM, 0x11 IMA ADPCM),
+/// `bits` a sample at `rate` hertz, `byte_rate` bytes a second, `align`
+/// bytes a block, then `len` bytes of samples (`u32::MAX`: no end).
+pub fn wav_header(tag: u16, bits: u16, rate: u32, byte_rate: u32, align: u16, len: u32) -> Vec<u8> {
+    let mut h = b"RIFF".to_vec();
+    h.extend(len.saturating_add(36).to_le_bytes());
+    h.extend(b"WAVEfmt ");
+    h.extend(16u32.to_le_bytes());
+    h.extend(tag.to_le_bytes());
+    h.extend(1u16.to_le_bytes());
+    h.extend(rate.to_le_bytes());
+    h.extend(byte_rate.to_le_bytes());
+    h.extend(align.to_le_bytes());
+    h.extend(bits.to_le_bytes());
+    h.extend(b"data");
+    h.extend(len.to_le_bytes());
+    h
+}
+
+/// The same for 16-bit samples at 8 kHz: 16 KB a second.
+pub fn pcm_8k_header(len: u32) -> Vec<u8> {
+    wav_header(1, 16, 8000, 16_000, 2, len)
+}
+
+/// `run` for each of `items`, each on its own thread, all at once: one
+/// test, every core. What each gave, in their order.
+pub fn in_parallel<T: Send, R: Send>(
+    items: impl IntoIterator<Item = T>,
+    run: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let run = &run;
+    std::thread::scope(|s| {
+        let runs: Vec<_> = items
+            .into_iter()
+            .map(|item| s.spawn(move || run(item)))
+            .collect();
+        runs.into_iter().map(|r| r.join().unwrap()).collect()
+    })
 }
 
 /// The last time a bytecode measured and printed: `time_ms` before,
@@ -315,7 +438,7 @@ pub fn note(i: usize) -> i16 {
 /// `heard` is the note again: loud, and sixteen samples to a period,
 /// so each sample the opposite of the one 8 before.
 pub fn assert_the_note(heard: &[i16]) {
-    let loud = heard.iter().filter(|s| s.abs() > 6000).count();
+    let loud = heard.iter().filter(|s| s.unsigned_abs() > 6000).count();
     assert!(
         loud > heard.len() / 4,
         "the note is there: {loud} loud samples of {}",
@@ -346,6 +469,15 @@ pub fn in_factory_test(image: &[u8]) -> Machine {
     let mut m = machine(image);
     press(&mut m, 8000, 500);
     m
+}
+
+/// The rabbit started with its button held, in setup mode, until its
+/// scan of the networks around is listed.
+pub fn scan_in_setup_mode(m: &mut Machine) {
+    press(m, 2000, 0);
+    until(m, 30_000, "the scan listed", |m| {
+        m.console().contains("-------------gomaster")
+    });
 }
 
 /// A rabbit started with its button held, in setup mode, and a phone
@@ -384,7 +516,7 @@ pub fn set_up_from_the_page(image: &[u8]) -> (Machine, String) {
 /// it, on its rescue network.
 pub fn without_application(image: &[u8]) -> Machine {
     let mut m = machine(image);
-    m.soc.flash[RESCUE..RESCUE + 4096].fill(0xFF);
+    m.soc.flash[APPLICATION_HEAD].fill(0xFF);
     rescue_network_up(&mut m);
     m
 }
