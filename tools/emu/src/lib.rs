@@ -53,6 +53,8 @@ pub struct Machine {
     next_air: u64,
     pub events: Vec<Event>,
     pub resets: u32,
+    /// Instructions executed since the machine was made.
+    pub instructions: u64,
     /// The lowest stack pointer seen in each processor mode (indexed by
     /// the mode's low five bits), since power-on, inside the internal RAM:
     /// how deep the stacks went.
@@ -103,6 +105,7 @@ impl Machine {
             next_air: 0,
             events: Vec::new(),
             resets: 0,
+            instructions: 0,
             stack_low: [u32::MAX; 32],
             stack_low_pc: [0; 32],
             stack_low_words: Vec::new(),
@@ -164,6 +167,7 @@ impl Machine {
         self.cpu.irq_line = self.soc.irq_asserted();
         let before = self.cpu.pc();
         let cycles = self.cpu.step(&mut self.soc);
+        self.instructions += 1;
         if self.skip_idle && self.cpu.pc() < before {
             self.at_loop_head();
         }

@@ -87,4 +87,61 @@ impl Config {
     pub fn install(&self, flash: &mut [u8]) {
         flash[OFFSET..OFFSET + LENGTH].copy_from_slice(&self.to_bytes());
     }
+
+    /// The settings a flash image holds, if the setup page saved any.
+    pub fn read(flash: &[u8]) -> Option<Self> {
+        let c = flash.get(OFFSET..OFFSET + LENGTH)?;
+        if c[MAGIC] != 0x47 {
+            return None;
+        }
+        let text = |at: usize, room: usize| {
+            let field = &c[at..at + room];
+            let end = field.iter().position(|&b| b == 0).unwrap_or(room);
+            String::from_utf8_lossy(&field[..end]).into_owned()
+        };
+        let key = text(KEY, 64);
+        let wifi = match c[CRYPT] {
+            0 => Wifi::Open,
+            16 => Wifi::Wep {
+                key,
+                shared_auth: c[AUTH] != 0,
+            },
+            32 => Wifi::Wpa { passphrase: key },
+            64 => Wifi::Wpa2 { passphrase: key },
+            _ => return None,
+        };
+        Some(Config {
+            server: text(SERVER_URL, 41),
+            ssid: text(SSID, 32),
+            wifi,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_read_back_as_they_were_written() {
+        let mut flash = vec![0xFF; OFFSET + LENGTH];
+        assert_eq!(Config::read(&flash), None, "a blank sector");
+        for wifi in [
+            Wifi::Open,
+            Wifi::Wep {
+                key: "abcde".into(),
+                shared_auth: true,
+            },
+            Wifi::Wpa {
+                passphrase: "carotte-violette".into(),
+            },
+            Wifi::Wpa2 {
+                passphrase: "carotte-violette".into(),
+            },
+        ] {
+            let config = Config::new("Terrier", wifi);
+            config.install(&mut flash);
+            assert_eq!(Config::read(&flash), Some(config));
+        }
+    }
 }

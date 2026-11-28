@@ -56,6 +56,9 @@ pub struct TxFrame {
     pub channel: u8,
 }
 
+/// The RSSI byte frames arrive with unless the sender says otherwise.
+pub const DEFAULT_RSSI: u8 = 0x79 + 50;
+
 /// A frame arriving at the stick's antenna.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RxFrame {
@@ -68,7 +71,7 @@ impl RxFrame {
     pub fn new(data: Vec<u8>) -> Self {
         RxFrame {
             data,
-            rssi: 0x79 + 50,
+            rssi: DEFAULT_RSSI,
         }
     }
 }

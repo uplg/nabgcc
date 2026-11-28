@@ -36,6 +36,17 @@ pub struct Ear {
     progress: u32,
 }
 
+impl Ear {
+    /// One slot on (`step` 1) or back (-1).
+    fn turn(&mut self, step: i32) {
+        self.slot = (self.slot as i32 + step).rem_euclid(EAR_SLOTS as i32) as u32;
+        if self.slot < EAR_TEETH {
+            // A tooth passes the sensor and clocks the counter.
+            self.pulses += 1;
+        }
+    }
+}
+
 pub struct Board {
     /// Red, green, blue of each led, indexed by bytecode led number.
     /// Each is the driver's 7-bit current setting, 0 (off) to 127.
@@ -156,11 +167,16 @@ impl Board {
                 continue;
             }
             ear.progress = 0;
-            ear.slot = (ear.slot as i32 + ear.direction as i32).rem_euclid(EAR_SLOTS as i32) as u32;
-            if ear.slot < EAR_TEETH {
-                // A tooth passes the sensor and clocks the counter.
-                ear.pulses += 1;
-            }
+            ear.turn(ear.direction as i32);
+        }
+    }
+
+    /// Someone turns an ear by hand, by `slots` (backwards when
+    /// negative): the encoder counts the teeth that pass, as when the
+    /// motor turns it.
+    pub fn turn_ear_by_hand(&mut self, ear: usize, slots: i32) {
+        for _ in 0..slots.unsigned_abs() {
+            self.ears[ear].turn(slots.signum());
         }
     }
 

@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::crypto::{self, Cipher, Key};
-use crate::rt2573::{Radio, RxFrame};
+use crate::rt2573::{DEFAULT_RSSI, Radio, RxFrame};
 use crate::sae;
 
 pub type Mac = [u8; 6];
@@ -276,6 +276,9 @@ pub struct AccessPoint {
     /// When set, beacons carry an empty network name and only probes
     /// naming the network are answered.
     pub hidden: bool,
+    /// The raw RSSI byte the stick reports for this network's frames
+    /// (the firmwares take 0x79 off for dBm).
+    pub rssi: u8,
     pub events: Vec<ApEvent>,
     /// Ethernet frames from authorised stations.
     pub uplink: VecDeque<Vec<u8>>,
@@ -466,6 +469,7 @@ impl AccessPoint {
             security,
             beacon_interval: 100,
             hidden: false,
+            rssi: DEFAULT_RSSI,
             wpa3: Wpa3::Off,
             events: Vec::new(),
             uplink: VecDeque::new(),
@@ -617,7 +621,10 @@ impl AccessPoint {
 
     fn emit(&self, radio: &mut Radio, frame: Vec<u8>) {
         if radio.channel == self.channel {
-            radio.rx.push_back(RxFrame::new(frame));
+            radio.rx.push_back(RxFrame {
+                data: frame,
+                rssi: self.rssi,
+            });
         }
     }
 
