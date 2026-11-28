@@ -85,7 +85,14 @@ pub(crate) fn enable_system_timer() {
 #[unsafe(no_mangle)]
 extern "C" fn irq_dispatch(source: u32) {
     match source {
-        SYSTEM_TIMER => crate::timer::on_tick(),
+        // IRN reads 0 too when the source that interrupted went away
+        // before it was read (manual 6.5.6, an "illegal interrupt"):
+        // the tick only when the timer did overflow.
+        SYSTEM_TIMER => {
+            if crate::timer::TMOVF.read() & 1 != 0 {
+                crate::timer::on_tick();
+            }
+        }
         USB => crate::usb::on_interrupt(),
         _ => {}
     }
