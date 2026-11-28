@@ -8,7 +8,7 @@
 //! for integrity, SHA-256 for derivation), then exchanges CCMP data.
 //! Frames go straight on a [`Radio`]: no emulated processor involved.
 
-use crate::air::{Mac, element};
+use crate::air::{Mac, eapol_key_data, element, mac_header, random_bytes, seal_ccmp};
 use crate::crypto::{self, Cipher, Key};
 use crate::rt2573::{Radio, TxFrame};
 use crate::sae;
@@ -139,12 +139,7 @@ impl Supplicant {
     }
 
     fn random(&mut self) -> [u8; 32] {
-        std::array::from_fn(|_| {
-            self.rng ^= self.rng << 13;
-            self.rng ^= self.rng >> 7;
-            self.rng ^= self.rng << 17;
-            (self.rng >> 24) as u8
-        })
+        random_bytes(&mut self.rng)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -175,22 +170,10 @@ impl Supplicant {
         body: &[u8],
         protect: bool,
     ) {
-        let mut f = vec![fc0, fc1, 0, 0];
-        f.extend_from_slice(&self.bssid);
-        f.extend_from_slice(&self.mac);
-        f.extend_from_slice(&a3);
-        f.extend_from_slice(&(self.seq << 4).to_le_bytes());
-        self.seq = (self.seq + 1) & 0xFFF;
+        let mut f = mac_header(fc0, fc1, self.bssid, self.mac, a3, &mut self.seq);
         f.extend_from_slice(body);
         if protect {
-            self.tx_pn += 1;
-            let iv = (self.tx_pn as u32 & 0xFFFF) | 0x2000_0000;
-            let key = Key {
-                cipher: Cipher::Ccmp,
-                key: &self.ptk[32..48],
-                mic: &[0; 8],
-            };
-            f = crypto::protect(&key, &f, iv, (self.tx_pn >> 16) as u32);
+            f = seal_ccmp(&self.ptk, &mut self.tx_pn, &f);
         }
         radio.tx.push_back(TxFrame {
             data: f,
@@ -561,8 +544,7 @@ impl Supplicant {
         }
         let info = u16::from_be_bytes([eapol[5], eapol[6]]);
         let replay = eapol[9..17].to_vec();
-        let data_len = u16::from_be_bytes([eapol[97], eapol[98]]) as usize;
-        let Some(data) = eapol.get(99..99 + data_len) else {
+        let Some(data) = eapol_key_data(eapol) else {
             return;
         };
         if info & 7 != 0 || info & INFO_ACK == 0 {
@@ -601,7 +583,7 @@ impl Supplicant {
             return self.send_key(radio, INFO_PAIRWISE | INFO_MIC, &replay, &snonce, &own);
         }
 
-        let mut unsigned = eapol[..99 + data_len].to_vec();
+        let mut unsigned = eapol[..99 + data.len()].to_vec();
         unsigned[81..97].fill(0);
         if crypto::aes_cmac(self.ptk[..16].try_into().unwrap(), &unsigned) != eapol[81..97] {
             self.state = State::Failed("message integrity check of the handshake");

@@ -410,6 +410,49 @@ fn pn_of(cipher: Cipher, iv: u32, eiv: u32) -> u64 {
     }
 }
 
+/// A MAC header from `a1`, `a2` and `a3`, numbered with the next value
+/// of `seq`.
+pub(crate) fn mac_header(fc0: u8, fc1: u8, a1: Mac, a2: Mac, a3: Mac, seq: &mut u16) -> Vec<u8> {
+    let mut f = vec![fc0, fc1, 0, 0];
+    f.extend_from_slice(&a1);
+    f.extend_from_slice(&a2);
+    f.extend_from_slice(&a3);
+    f.extend_from_slice(&(*seq << 4).to_le_bytes());
+    *seq = (*seq + 1) & 0xFFF;
+    f
+}
+
+/// Bytes from a xorshift generator. The emulated ends draw their nonces
+/// from one seeded by their address, so that runs repeat.
+pub(crate) fn random_bytes<const N: usize>(rng: &mut u64) -> [u8; N] {
+    std::array::from_fn(|_| {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        (*rng >> 24) as u8
+    })
+}
+
+/// A unicast frame sealed with CCMP under the temporal key of `ptk`,
+/// at key index 0, its packet number counted up first.
+pub(crate) fn seal_ccmp(ptk: &[u8], pn: &mut u64, frame: &[u8]) -> Vec<u8> {
+    *pn += 1;
+    let (iv, eiv) = iv_words(Cipher::Ccmp, *pn, 0);
+    let key = Key {
+        cipher: Cipher::Ccmp,
+        key: &ptk[32..48],
+        mic: &[0; 8],
+    };
+    crypto::protect(&key, frame, iv, eiv)
+}
+
+/// The key data of an EAPOL-Key frame at least 99 bytes long, `None`
+/// if its length runs past the frame.
+pub(crate) fn eapol_key_data(eapol: &[u8]) -> Option<&[u8]> {
+    let data_len = u16::from_be_bytes([eapol[97], eapol[98]]) as usize;
+    eapol.get(99..99 + data_len)
+}
+
 impl AccessPoint {
     pub fn new(ssid: &str, bssid: Mac, channel: u8, security: Security) -> Self {
         let psk = match &security {
@@ -462,12 +505,7 @@ impl AccessPoint {
     }
 
     fn random<const N: usize>(&mut self) -> [u8; N] {
-        std::array::from_fn(|_| {
-            self.rng ^= self.rng << 13;
-            self.rng ^= self.rng >> 7;
-            self.rng ^= self.rng << 17;
-            (self.rng >> 24) as u8
-        })
+        random_bytes(&mut self.rng)
     }
 
     /// Whether this station completed everything the network demands.
@@ -536,13 +574,7 @@ impl AccessPoint {
     }
 
     fn header(&mut self, fc0: u8, fc1: u8, a1: Mac, a2: Mac, a3: Mac) -> Vec<u8> {
-        let mut f = vec![fc0, fc1, 0, 0];
-        f.extend_from_slice(&a1);
-        f.extend_from_slice(&a2);
-        f.extend_from_slice(&a3);
-        f.extend_from_slice(&(self.seq << 4).to_le_bytes());
-        self.seq = (self.seq + 1) & 0xFFF;
-        f
+        mac_header(fc0, fc1, a1, a2, a3, &mut self.seq)
     }
 
     fn mgmt(&mut self, subtype: u8, to: Mac) -> Vec<u8> {
@@ -590,25 +622,9 @@ impl AccessPoint {
     }
 
     fn deauth(&mut self, radio: &mut Radio, sta: Mac, reason: u16) {
-        let mut f = self.mgmt(MGMT_DEAUTH, sta);
-        f.extend_from_slice(&reason.to_le_bytes());
         // A station that protects its management frames only believes
         // a deauthentication encrypted with its pairwise key.
-        if let Some(s) = self
-            .stations
-            .get_mut(&sta)
-            .filter(|s| s.pmf && s.keys_installed)
-        {
-            s.tx_pn += 1;
-            let (iv, eiv) = iv_words(Cipher::Ccmp, s.tx_pn, 0);
-            let key = Key {
-                cipher: Cipher::Ccmp,
-                key: &s.ptk[32..48],
-                mic: &[0; 8],
-            };
-            f = crypto::protect(&key, &f, iv, eiv);
-        }
-        self.emit(radio, f);
+        self.send_management(radio, MGMT_DEAUTH, sta, &reason.to_le_bytes());
         self.stations.remove(&sta);
         self.events.push(ApEvent::Deauthenticated {
             sta,
@@ -1001,27 +1017,20 @@ impl AccessPoint {
         s.sa_query.push(id);
         s.sa_query_next = now + retry.max(1);
         // Category 8 (SA Query), action 0 (request).
-        self.send_action(radio, sta, &[8, 0, id[0], id[1]]);
+        self.send_management(radio, MGMT_ACTION, sta, &[8, 0, id[0], id[1]]);
     }
 
-    /// An action frame to a station, protected when its management
+    /// A management frame to a station, protected when its management
     /// frames are.
-    fn send_action(&mut self, radio: &mut Radio, sta: Mac, body: &[u8]) {
-        let mut f = self.mgmt(MGMT_ACTION, sta);
+    fn send_management(&mut self, radio: &mut Radio, subtype: u8, sta: Mac, body: &[u8]) {
+        let mut f = self.mgmt(subtype, sta);
         f.extend_from_slice(body);
         if let Some(s) = self
             .stations
             .get_mut(&sta)
             .filter(|s| s.pmf && s.keys_installed)
         {
-            s.tx_pn += 1;
-            let (iv, eiv) = iv_words(Cipher::Ccmp, s.tx_pn, 0);
-            let key = Key {
-                cipher: Cipher::Ccmp,
-                key: &s.ptk[32..48],
-                mic: &[0; 8],
-            };
-            f = crypto::protect(&key, &f, iv, eiv);
+            f = seal_ccmp(&s.ptk, &mut s.tx_pn, &f);
         }
         self.emit(radio, f);
     }
@@ -1096,7 +1105,7 @@ impl AccessPoint {
         match body[..] {
             [8, 0, a, b, ..] => {
                 // Somebody checks that we still hold their association.
-                self.send_action(radio, sta, &[8, 1, a, b]);
+                self.send_management(radio, MGMT_ACTION, sta, &[8, 1, a, b]);
             }
             [8, 1, a, b, ..] => {
                 let Some(s) = self.stations.get_mut(&sta) else {
@@ -1707,10 +1716,15 @@ impl AccessPoint {
 
     fn send_message_1(&mut self, radio: &mut Radio, sta: Mac) {
         let (_, pairwise, _) = self.psk_params().unwrap();
+        self.stations.get_mut(&sta).unwrap().phase = Phase::Msg2;
+        self.send_anonce(radio, sta, pairwise);
+    }
+
+    /// Message 1 of a pairwise handshake, with a fresh nonce.
+    fn send_anonce(&mut self, radio: &mut Radio, sta: Mac, pairwise: Cipher) {
         let anonce = self.random();
         let s = self.stations.get_mut(&sta).unwrap();
         s.anonce = anonce;
-        s.phase = Phase::Msg2;
         // After SAE, message 1 names the key both ends just derived.
         let mut data = Vec::new();
         if let Some((_, pmkid)) = s.sae_key.filter(|_| s.akm == 8) {
@@ -1901,24 +1915,7 @@ impl AccessPoint {
             return;
         }
         s.rekey = Some(Rekey { next_ptk: None });
-        let anonce = self.random();
-        let s = self.stations.get_mut(&sta).unwrap();
-        s.anonce = anonce;
-        let mut data = Vec::new();
-        if let Some((_, pmkid)) = s.sae_key.filter(|_| s.akm == 8) {
-            data.extend_from_slice(&[0xDD, 20, 0x00, 0x0F, 0xAC, 0x04]);
-            data.extend_from_slice(&pmkid);
-        }
-        self.send_key_frame(
-            radio,
-            sta,
-            KEY_INFO_PAIRWISE | KEY_INFO_ACK,
-            Self::key_len(pairwise),
-            &anonce,
-            &[0; 16],
-            0,
-            &data,
-        );
+        self.send_anonce(radio, sta, pairwise);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1974,8 +1971,7 @@ impl AccessPoint {
         };
         let info = u16::from_be_bytes([eapol[5], eapol[6]]);
         let replay = u64::from_be_bytes(eapol[9..17].try_into().unwrap());
-        let data_len = u16::from_be_bytes([eapol[97], eapol[98]]) as usize;
-        let Some(data) = eapol.get(99..99 + data_len) else {
+        let Some(data) = eapol_key_data(eapol) else {
             return;
         };
         let version = self.key_version(sta);

@@ -10,7 +10,7 @@ use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr};
 
-use crate::air::{Mac, element};
+use crate::air::{Mac, element, mac_header};
 use crate::lan::Wire;
 use crate::rt2573::{Radio, RxFrame};
 
@@ -131,12 +131,7 @@ impl Visitor {
 
     fn send_frame(&mut self, radio: &mut Radio, fc0: u8, fc1: u8, a3: Mac, body: &[u8]) {
         let bssid = self.bssid();
-        let mut f = vec![fc0, fc1, 0, 0];
-        f.extend_from_slice(&bssid);
-        f.extend_from_slice(&self.mac);
-        f.extend_from_slice(&a3);
-        f.extend_from_slice(&(self.seq << 4).to_le_bytes());
-        self.seq = (self.seq + 1) & 0xFFF;
+        let mut f = mac_header(fc0, fc1, bssid, self.mac, a3, &mut self.seq);
         f.extend_from_slice(body);
         radio.rx.push_back(RxFrame::new(f));
     }

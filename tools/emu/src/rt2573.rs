@@ -73,6 +73,17 @@ impl RxFrame {
     }
 }
 
+/// The key in an entry of a key table: the key, then the Michael keys
+/// of the transmit and of the receive direction.
+fn entry_key(entry: &[u8], cipher: Cipher, key_len: usize, rx: bool) -> Key<'_> {
+    let mic = if rx { &entry[24..32] } else { &entry[16..24] };
+    Key {
+        cipher,
+        key: &entry[..key_len],
+        mic: mic.try_into().unwrap(),
+    }
+}
+
 /// What the chip calls its cipher algorithms, as our cipher and key length.
 fn cipher_of(alg: u32) -> Option<(Cipher, usize)> {
     match alg {
@@ -317,6 +328,22 @@ impl Rt2573 {
         }
     }
 
+    /// Give a frame the chip's next sequence number.
+    fn number(&mut self, frame: &mut [u8]) {
+        frame[22..24].copy_from_slice(&(self.tx_seq << 4).to_le_bytes());
+        self.tx_seq = (self.tx_seq + 1) & 0xFFF;
+    }
+
+    /// Put a frame on the air, on the channel the radio is tuned to.
+    fn send(&self, frame: Vec<u8>) {
+        let mut radio = self.radio.borrow_mut();
+        let channel = radio.channel;
+        radio.tx.push_back(TxFrame {
+            data: frame,
+            channel,
+        });
+    }
+
     /// A complete bulk OUT transfer: descriptor, then the frame. The chip
     /// numbers the frame, encrypts it if asked to, and sends it.
     fn transmit(&mut self) {
@@ -332,8 +359,7 @@ impl Rt2573 {
         };
         let mut frame = data.to_vec();
         if w1 & (1 << 28) != 0 && frame.len() >= crypto::HEADER_LEN {
-            frame[22..24].copy_from_slice(&(self.tx_seq << 4).to_le_bytes());
-            self.tx_seq = (self.tx_seq + 1) & 0xFFF;
+            self.number(&mut frame);
         }
         if let Some((cipher, key_len)) = cipher_of(w0 >> 29)
             && frame.len() >= crypto::HEADER_LEN
@@ -347,19 +373,10 @@ impl Rt2573 {
             let Some(entry) = self.mem.get(entry..entry + KEY_ENTRY_SIZE) else {
                 return;
             };
-            let key = Key {
-                cipher,
-                key: &entry[..key_len],
-                mic: entry[16..24].try_into().unwrap(),
-            };
+            let key = entry_key(entry, cipher, key_len, false);
             frame = crypto::protect(&key, &frame, word(3), word(4));
         }
-        let mut radio = self.radio.borrow_mut();
-        let channel = radio.channel;
-        radio.tx.push_back(TxFrame {
-            data: frame,
-            channel,
-        });
+        self.send(frame);
     }
 
     /// The pairwise key entry for frames from this transmitter, when
@@ -408,11 +425,7 @@ impl Rt2573 {
             return (mpdu, 0, 3, index as u32, 0, 0);
         };
         let entry = &self.mem[base + index * KEY_ENTRY_SIZE..][..KEY_ENTRY_SIZE];
-        let key = Key {
-            cipher,
-            key: &entry[..key_len],
-            mic: entry[24..32].try_into().unwrap(),
-        };
+        let key = entry_key(entry, cipher, key_len, true);
         match crypto::unprotect(&key, &mpdu) {
             Ok((clear, iv, eiv)) => (clear, alg, 0, index as u32, iv, eiv),
             Err(CipherError::Mic) => (mpdu, alg, 2, index as u32, 0, 0),
@@ -517,16 +530,10 @@ impl UsbDevice for Rt2573 {
             return;
         };
         let mut frame = frame.to_vec();
-        frame[22..24].copy_from_slice(&(self.tx_seq << 4).to_le_bytes());
-        self.tx_seq = (self.tx_seq + 1) & 0xFFF;
+        self.number(&mut frame);
         self.beacons += 1;
         frame[24..32].copy_from_slice(&(self.beacons * interval as u64 * 1024).to_le_bytes());
-        let mut radio = self.radio.borrow_mut();
-        let channel = radio.channel;
-        radio.tx.push_back(TxFrame {
-            data: frame,
-            channel,
-        });
+        self.send(frame);
     }
 
     fn address(&self) -> u8 {
