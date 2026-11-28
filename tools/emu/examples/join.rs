@@ -1,14 +1,15 @@
 //! Join an access point and print what both sides saw.
 //! usage: join <firmware> <open|wep|wepshared|wpa|wpa2|mixed> [ms]
-use nabemu::Machine;
+mod common;
+
 use nabemu::air::{AccessPoint, Security};
 use nabemu::config::{Config, Wifi};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let path = args.next().expect("firmware path");
-    let kind = args.next().unwrap_or_else(|| "wpa2".into());
-    let ms = args.next().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let mut args = common::Args::new();
+    let mut m = args.machine();
+    let kind = args.word().unwrap_or_else(|| "wpa2".into());
+    let ms = args.number(10_000);
     let pass = "carotte-violette";
     let (wifi, security) = match kind.as_str() {
         "open" => (Wifi::Open, Security::Open),
@@ -51,7 +52,6 @@ fn main() {
             Security::wpa2(pass),
         ),
     };
-    let (mut m, _) = Machine::from_file(&std::fs::read(path).expect("readable firmware"));
     Config::new("Terrier", wifi).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(
         "Terrier",

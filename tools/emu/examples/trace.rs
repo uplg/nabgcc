@@ -1,13 +1,12 @@
 //! Run a firmware and print each line of its serial output with the
 //! board time it was completed at, and the time since the line before.
 //! usage: trace <firmware> [seconds]
-use nabemu::Machine;
+mod common;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let firmware = std::fs::read(args.next().expect("firmware path")).expect("readable firmware");
-    let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60);
-    let (mut m, _) = Machine::from_file(&firmware);
+    let mut args = common::Args::new();
+    let mut m = args.machine();
+    let seconds = args.number(60);
     let (mut seen, mut last) = (0, 0.0);
     let mut line = Vec::new();
     while m.soc.millis() < seconds * 1000 {

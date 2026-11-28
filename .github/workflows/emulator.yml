@@ -49,6 +49,19 @@ jobs:
         with:
           workspaces: tools/emu
       - run: rustup target add wasm32-unknown-unknown
+      - name: No duplication but what nose.ignore.json says must stay
+        working-directory: .
+        env:
+          NOSE: v0.22.1
+        run: |
+          base="https://github.com/corca-ai/nose/releases/download/$NOSE"
+          file=nose-cli-x86_64-unknown-linux-gnu.tar.xz
+          curl -sSLf --proto '=https' -o "$file" "$base/$file"
+          curl -sSLf --proto '=https' -o "$file.sha256" "$base/$file.sha256"
+          sha256sum -c "$file.sha256"
+          tar -xJf "$file"
+          export PATH="$PWD/${file%.tar.xz}:$PATH"
+          scripts/nose.sh
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings
       - run: cargo clippy --release --lib --target wasm32-unknown-unknown -- -D warnings

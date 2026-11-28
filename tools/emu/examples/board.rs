@@ -1,13 +1,12 @@
 //! Boot a firmware and print the state of the board once a second.
 //! usage: board <firmware> [seconds] [button]
-use nabemu::Machine;
+mod common;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let firmware = std::fs::read(args.next().expect("firmware path")).expect("readable firmware");
-    let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
-    let (mut m, _) = Machine::from_file(&firmware);
-    m.soc.board.button = args.next().is_some();
+    let mut args = common::Args::new();
+    let mut m = args.machine();
+    let seconds = args.number(10);
+    m.soc.board.button = args.word().is_some();
     for s in 1..=seconds {
         m.run_until_ms(s * 1000);
         if s == 2 {

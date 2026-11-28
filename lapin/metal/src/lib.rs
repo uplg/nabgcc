@@ -577,8 +577,9 @@ fn bytes_mut(heap: &mut [i32]) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(heap.as_mut_ptr().cast(), heap.len() * 4) }
 }
 
-/// `%ld`.
-fn fmt_dec(v: i32, buf: &mut [u8; 12]) -> &[u8] {
+/// `%ld`: `v` in decimal, at the end of `buf` (the self-test prints its
+/// counts with it too).
+pub fn fmt_dec(v: i32, buf: &mut [u8; 12]) -> &[u8] {
     let mut n = buf.len();
     let mut u = v.unsigned_abs();
     loop {

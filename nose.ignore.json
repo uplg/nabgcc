@@ -1,0 +1,384 @@
+{
+  "ignores": [
+    {
+      "family_id": "9343ebfb1a20adfc",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (SAE types and setup)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "d63b28ff046a6440",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (each SAE's own test vectors)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "0d2ce4430135e3ca",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (SAE confirm)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "98b9665e63eb6ab3",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (RC4)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "e2f13863e5f47e82",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (each SAE's own test vectors)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "f9a07917f81b2d3f",
+      "reason": "The collector's ARM copies of the memory accessors: Thumb accessors cannot be inlined into ARM code, and the collector's speed is measured against the C.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "b5505eea305720b1",
+      "reason": "The rescue core's own internet checksum against the emulator's LAN: the rescue core stays self-contained in its 20 KB, and the emulator never links firmware code.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "1c7571639ad04608",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (P-256 arithmetic)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "5b72bd2a17151fe7",
+      "reason": "Two implementations of the machine's Host trait for different purposes (the differential board against the C, the fuzzer's board): only the trait's signatures are shared.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "88b302592261f6cd",
+      "reason": "The cipher mapped onto two different enums: the RT2573 driver's and the test link's.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "fbc7ffd77a64ce32",
+      "reason": "The IMA ADPCM encoder and decoder mirror each other; the encoder already reuses the decoder's state step.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "331d1b2ae58dd6b7",
+      "reason": "The firmware's RSN element against the one a WPA3 test forges by hand; no shared whole line.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "a899b6cb76641a96",
+      "reason": "The two callers of the shared size computation (the C's loaderSizeBC), one reading a slice, one the machine's memory.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "a1adc2a4dc262de0",
+      "reason": "The fuzzing harness's AES key wrap against the emulator's: the harness does not depend on the emulator (built with fuzzer instrumentation); no shared whole line.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "4ef432f23bc21ade",
+      "reason": "MD5's and SHA-256's constant tables: different values; no shared whole line.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "0d3eb2acfccb32d4",
+      "reason": "mp3_frame calls mpeg_rates; only a closing brace is shared.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "14f29d93f6d27d96",
+      "reason": "A xorshift in two test harnesses of different crates, with no shared test-support crate; no shared whole line.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "a53911c6e669ffcd",
+      "reason": "sign_magnitude is the shared helper; what remains is each law's own formula (A-law, mu-law), as the C has them.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "10a1b7aea10ddb56",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (BIP check; no shared whole line)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "be0b936e2c9a3da6",
+      "reason": "Walks of a bytecode's globals with different contracts: what the C loader takes (cref) and what the fuzzer may feed (bounded); no shared whole line.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "9b640ab8d9ea2d51",
+      "reason": "Each crate's own hex helper for its tests. Separate crates that may not depend on each other (the emulator never links firmware code; the fuzzer is built instrumented).",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "52c7507e9ddee35c",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (SAE)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "18085613de5341f7",
+      "reason": "The firmware's VS1003 driver against the emulator's model of the chip. Separate crates that may not depend on each other (the emulator never links firmware code; the fuzzer is built instrumented).",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "db559614199e450c",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (hunting and pecking)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "0432a6f05bff679a",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (CCMP nonce and AAD)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "af94e22352eb4f1d",
+      "reason": "Each audio conversion's own early return on the shared starts_inside check: a function cannot return from its caller.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "2beb38e4f6bb1689",
+      "reason": "The firmware's and the emulator's protocol and crypto code are independent on purpose: the tests set one implementation against the other. (CCM)",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "cbdfeeedeb903e65",
+      "reason": "The two-line address preamble of two frame parsers; a helper would only rename it, and any firmware change reshuffles lapin-first.bin.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "99c0d328b586fd5a",
+      "reason": "Two FFI pointer-to-slice helpers in separate crates. Separate crates that may not depend on each other (the emulator never links firmware code; the fuzzer is built instrumented).",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "e756dfb7f9e5de41",
+      "reason": "The fuzzing harness's access point builds its own frames. Separate crates that may not depend on each other (the emulator never links firmware code; the fuzzer is built instrumented).",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "4e25bdd0d117b81c",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "fa93075f449f36b9",
+      "reason": "The configuration descriptor read twice (its header, then all of it), as the C does; a loop costs firmware bytes.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "0bcb37c2cf82a412",
+      "reason": "One-statement methods of the Link trait in the fuzzing harness.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "5368c9e514404b0d",
+      "reason": "strgetword and strputword: the C's two-line bounds guard, each returning in its own way (-1 or nothing).",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "fc0349bc279cce51",
+      "reason": "A one-line bytecode emitter in two crates; cref is only an optional dependency of the fuzzer.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "52d7a35e33d47f0d",
+      "reason": "Each audio conversion's own early return on the shared starts_inside check, with its own length condition.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "94832d13cefd0949",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "9fc63cccd9f94ab5",
+      "reason": "The read and write sides of the SoC's register dispatch: each register reads and writes in its own way; only the match heads repeat.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "bfb2dbe408856d4d",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "4fef90ad2e58ef00",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "3a875c3cbbd7d1a5",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "76c35526a735dad5",
+      "reason": "Typed bindings, one per WebAssembly export, each with its own signature: the worker protocol is typed by these methods.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "8bbd991404f83350",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "ae9bd5d3d5bca1a9",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "dbc64ca8c4cbe15f",
+      "reason": "Typed bindings, one per WebAssembly export, each with its own signature: the worker protocol is typed by these methods.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "61e369ccde2f47c0",
+      "reason": "The Bus trait's required read and write methods, one line each over the generic access.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "ed40d34d4c5b9e8b",
+      "reason": "The Bus trait's required read and write methods, one line each over the generic access.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "5dc917d4941f0b26",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "7494656b69faa3cb",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "201dcb5f3d0d7153",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "e7d51d9bc4ea05e3",
+      "reason": "Typed bindings, one per WebAssembly export, each with its own signature: the worker protocol is typed by these methods.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "048c00eb1ba28797",
+      "reason": "Typed bindings, one per WebAssembly export, each with its own signature: the worker protocol is typed by these methods.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "d8e04c4d6ae69360",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "7f9e0e7de9818508",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "3d8ac7d103322b3f",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "be3b4308feead0ab",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "c1f64ab0b99cc0e2",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "50a80a77f5ca6f17",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "1bc6c860d138c0fd",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "69e55ae37a5646b8",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "92668b3a5709ef89",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "8108e41b8e1f7317",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "3b5c913944ac2e7b",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "c4d09da53d594bf0",
+      "reason": "Typed bindings, one per WebAssembly export, each with its own signature: the worker protocol is typed by these methods.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "b0e1236d3939f92e",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "cb68169765fb75ca",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "e2e8647ae48589fd",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "21022b9054c0ece6",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "fd05162bbc6cf867",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "b4cb32328716aeed",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "2edf8d141e909e32",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "e6fbc87f438dc629",
+      "reason": "One-line C HAL entry points of the differential harness: the C sources link against these names, each with its own signature.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "8cd3b424e3153a89",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "8337713bac2bd2db",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "5318eceed19f2557",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    },
+    {
+      "family_id": "d99f75777ce7c979",
+      "reason": "At most one shared whole line: single statements or a matching token run; nothing to extract.",
+      "owner": "lapin"
+    }
+  ]
+}

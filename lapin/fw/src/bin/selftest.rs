@@ -26,18 +26,8 @@ fn hex(bytes: &[u8]) {
     }
 }
 
-fn number(mut n: u32) {
-    let mut digits = [0u8; 10];
-    let mut at = digits.len();
-    loop {
-        at -= 1;
-        digits[at] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
-    uart::write(&digits[at..]);
+fn number(n: u32) {
+    uart::write(lapin_metal::fmt_dec(n as i32, &mut [0; 12]));
 }
 
 /// Turn an ear until its reference gap has gone by twice, and count

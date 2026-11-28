@@ -19,6 +19,9 @@ if [ ! -f tests/roms/arm.gba ] || [ ! -f tests/roms/thumb.gba ]; then
     echo "the instruction test ROMs are missing from tools/emu/tests/roms (see the README)" >&2
     exit 1
 fi
+step "no duplication but what nose.ignore.json says must stay"
+"$root/scripts/nose.sh" > /dev/null || { "$root/scripts/nose.sh"; exit 1; }
+cd "$root/tools/emu"
 step "emulator: format and lints"
 cargo fmt --check
 cargo clippy --release --all-targets -- -D warnings

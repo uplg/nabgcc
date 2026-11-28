@@ -2,17 +2,17 @@
 //! bytecode file (already in its `amber...Mind` envelope), and show
 //! what the rabbit says and asks for.
 //! usage: garenne <firmware> <bc.jsp content> [ms]
-use nabemu::Machine;
+mod common;
+
 use nabemu::air::{AccessPoint, Security};
 use nabemu::config::{Config, Wifi};
 use nabemu::lan::{Lan, Response};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let firmware = std::fs::read(args.next().expect("firmware path")).expect("readable firmware");
-    let bytecode = std::fs::read(args.next().expect("bytecode path")).expect("readable bytecode");
-    let ms = args.next().and_then(|s| s.parse().ok()).unwrap_or(60_000);
-    let (mut m, _) = Machine::from_file(&firmware);
+    let mut args = common::Args::new();
+    let mut m = args.machine();
+    let bytecode = args.file("bytecode");
+    let ms = args.number(60_000);
     Config::new("Terrier", Wifi::Open).install(&mut m.soc.flash);
     m.air.push(AccessPoint::new(
         "Terrier",
