@@ -2018,11 +2018,16 @@ impl Station {
                     // clear, message 4 lost, is let in and answered.)
                     return None;
                 }
-                if eapol && self.mode == Mode::Managed {
-                    let mut copy = [0u8; 400];
-                    let n = (len - 24).min(copy.len());
-                    copy[..n].copy_from_slice(&frame[24..24 + n]);
-                    self.input_eapol(link, &mut copy[..n], decrypted);
+                // EAPOL is the firmware's, never the bytecode's, in any
+                // mode (`rt2501_receive`); and answered only on a link
+                // that has keys to agree on.
+                if eapol {
+                    if self.mode == Mode::Managed && keyed {
+                        let mut copy = [0u8; 400];
+                        let n = (len - 24).min(copy.len());
+                        copy[..n].copy_from_slice(&frame[24..24 + n]);
+                        self.input_eapol(link, &mut copy[..n], decrypted);
+                    }
                     return None;
                 }
                 Some(Delivery {
@@ -3256,6 +3261,52 @@ mod tests {
         msg2[81..97].fill(0);
         assert_eq!(mic, hmac_md5(&s.ptk[..16], &[&msg2]));
         assert_eq!(s.keys, KeyState::Msg3);
+    }
+
+    /// Message 1 on an open or a WEP link: the station answered it in
+    /// clear and put a key in the stick's first slot (a WEP link's own
+    /// key, there). The C driver handled EAPOL on WPA links alone.
+    #[test]
+    fn message_1_on_an_open_or_wep_link_is_ignored() {
+        let wep = Security::Wep {
+            key: [7; 13],
+            long: false,
+        };
+        for security in [Security::Open, wep] {
+            let mut s = running(security);
+            let mut air = Air::default();
+            let f = eapol_key(&s, 0x008A, 1, &[0x77; 32], &[]);
+            assert_eq!(input(&mut s, &mut air, &f, false), None);
+            assert!(air.sent.is_empty(), "answered");
+            assert!(air.keys.is_empty(), "keyed");
+        }
+    }
+
+    /// The setup network (master mode) handed EAPOL frames from its
+    /// stations to the bytecode; the C driver keeps them, in any mode.
+    #[test]
+    fn eapol_never_reaches_the_bytecode_in_master_mode() {
+        const PHONE: Mac = [2, 0, 0, 0, 0, 0xB2];
+        let mut s = running(Security::Open);
+        s.mode = Mode::Master;
+        s.bssid = OWN;
+        s.peers[0] = Peer {
+            state: State::Run,
+            timer: STA_MAX_IDLE,
+            mac: PHONE,
+        };
+        let mut air = Air::default();
+        let mut f = std::vec![0x08, 0x01, 0, 0];
+        f.extend_from_slice(&OWN);
+        f.extend_from_slice(&PHONE);
+        f.extend_from_slice(&OWN);
+        f.extend_from_slice(&[0, 0]);
+        f.extend_from_slice(&LLC_EAPOL);
+        f.extend_from_slice(&[2, 1, 0, 0]);
+        let before = input(&mut s, &mut air, &f, false);
+        f[24..32].copy_from_slice(&[0xAA, 0xAA, 3, 0, 0, 0, 0x08, 0x00]);
+        assert_eq!(before, None);
+        assert!(input(&mut s, &mut air, &f, false).is_some(), "IP goes up");
     }
 
     /// WPA3: an association refused for now, "come back in" fifty days
