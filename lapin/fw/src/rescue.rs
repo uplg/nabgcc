@@ -79,6 +79,14 @@ unsafe impl Sync for Upload {}
 #[unsafe(link_section = ".xram.upload")]
 static UPLOAD: Upload = Upload(core::cell::UnsafeCell::new([0; 128 * 1024]));
 
+/// The unpacker's probabilities (`install_packed`), too many for the
+/// stack.
+struct Probs(core::cell::UnsafeCell<lapin_core::pack::Probs>);
+// SAFETY: `install_packed` alone touches it, from the main loop.
+unsafe impl Sync for Probs {}
+#[unsafe(link_section = ".xram.probs")]
+static PROBS: Probs = Probs(core::cell::UnsafeCell::new([0; lapin_core::pack::CONTEXTS]));
+
 /// The first start after the C firmware wrote `lapin-first.bin`: the
 /// packed application (`boot::packed_app`) unpacked into the upload
 /// buffer, behind a copy of this core (the history it was packed
@@ -91,6 +99,9 @@ static UPLOAD: Upload = Upload(core::cell::UnsafeCell::new([0; 128 * 1024]));
 /// it (a cut there leaves neither: the rescue network). The sectors
 /// already right are left alone, so the second time round the first
 /// step is skipped.
+///
+/// Out of line: inlined into `main`, the core took 48 bytes more.
+#[inline(never)]
 pub fn install_packed() {
     let Some((stream, len, crc)) = boot::packed_app() else {
         return;
@@ -99,7 +110,9 @@ pub fn install_packed() {
     // rescue network is up; an application fits in it behind the core.
     let buf = unsafe { &mut (&mut *UPLOAD.0.get())[..RESCUE_SIZE + len] };
     buf[..RESCUE_SIZE].copy_from_slice(boot::installed_rescue());
-    if !lapin_core::pack::unpack(stream, buf, RESCUE_SIZE, watchdog::feed) {
+    // SAFETY: nothing else uses it.
+    let probs = unsafe { &mut *PROBS.0.get() };
+    if !lapin_core::pack::unpack(stream, buf, RESCUE_SIZE, probs, watchdog::feed) {
         return;
     }
     let app = &mut buf[RESCUE_SIZE..];

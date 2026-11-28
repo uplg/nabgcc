@@ -29,7 +29,13 @@ fn main() {
     // What the rescue core will do with it, checked here.
     let mut buf = full.clone();
     buf[RESCUE_SIZE..].fill(0);
-    assert!(pack::unpack(&stream, &mut buf, RESCUE_SIZE, || {}));
+    assert!(pack::unpack(
+        &stream,
+        &mut buf,
+        RESCUE_SIZE,
+        &mut [0; pack::CONTEXTS],
+        || {}
+    ));
     pack::thumb_calls(&mut buf[RESCUE_SIZE..], true);
     assert!(
         buf == full,

@@ -47,27 +47,29 @@ const DISTANCE: usize = LITERAL + TREES * 256;
 const LENGTH: usize = DISTANCE + 2 * GAMMA_BITS;
 /// A repeat's length.
 const REPEAT_LENGTH: usize = LENGTH + 2 * GAMMA_BITS;
-const CONTEXTS: usize = REPEAT_LENGTH + 2 * GAMMA_BITS;
+pub const CONTEXTS: usize = REPEAT_LENGTH + 2 * GAMMA_BITS;
 
-/// A context's two probabilities, at first even.
-const EVEN: [u16; 2] = [(ONE / 2) as u16; 2];
+/// A context's two probabilities, the fast one in the low half-word,
+/// at first even.
+const EVEN: u32 = (ONE / 2) * 0x1_0001;
 
 /// A context's two probabilities moved toward the bit it saw.
-fn adapt(p: &mut [u16; 2], one: bool) {
-    let (fast, slow) = (p[0] as u32, p[1] as u32);
+fn adapt(p: &mut u32, one: bool) {
+    let (mut fast, mut slow) = (*p & (ONE - 1), *p >> 16);
     if one {
-        p[0] = (fast + ((ONE - fast) >> FAST)) as u16;
-        p[1] = (slow + ((ONE - slow) >> SLOW)) as u16;
+        fast += (ONE - fast) >> FAST;
+        slow += (ONE - slow) >> SLOW;
     } else {
-        p[0] = (fast - (fast >> FAST)) as u16;
-        p[1] = (slow - (slow >> SLOW)) as u16;
+        fast -= fast >> FAST;
+        slow -= slow >> SLOW;
     }
+    *p = fast | slow << 16;
 }
 
-/// The probability of a 1 a context's bit is coded with (within
-/// [127, `ONE` - 127]: never 0, never all).
-fn mean(p: &[u16; 2]) -> u32 {
-    (p[0] as u32 + p[1] as u32) >> 1
+/// The probability of a 1 a context's bit is coded with (the fast one
+/// stays 7 from either end, the slow one 127: never 0, never all).
+fn mean(p: u32) -> u32 {
+    ((p & (ONE - 1)) + (p >> 16)) >> 1
 }
 
 /// "LAPP", little-endian: the packed application's header. Its words:
@@ -99,8 +101,11 @@ struct Decoder<'a> {
     input: &'a [u8],
     at: usize,
     state: u32,
-    probs: [[u16; 2]; CONTEXTS],
+    probs: &'a mut Probs,
 }
+
+/// The unpacker's probabilities, two for each context.
+pub type Probs = [u32; CONTEXTS];
 
 impl Decoder<'_> {
     fn bit(&mut self, ctx: usize) -> usize {
@@ -110,7 +115,7 @@ impl Decoder<'_> {
             self.state = self.state << 8 | byte as u32;
         }
         let p = &mut self.probs[ctx];
-        let prob = mean(p);
+        let prob = mean(*p);
         let slot = self.state & (ONE - 1);
         let high = self.state >> BITS;
         let one = slot < prob;
@@ -137,13 +142,22 @@ impl Decoder<'_> {
 /// Unpack `packed` into `buf` from `start` to its end; what is before
 /// `start` is the history copies may reach into. `tick` is called at
 /// every item (the watchdog). False if the stream reaches outside the
-/// buffer.
-pub fn unpack(packed: &[u8], buf: &mut [u8], start: usize, mut tick: impl FnMut()) -> bool {
+/// buffer. `probs` is the room for the coder's probabilities, 4.5 KB:
+/// the caller's (the rescue core's is in the external RAM, its stack
+/// has not that much to spare).
+pub fn unpack(
+    packed: &[u8],
+    buf: &mut [u8],
+    start: usize,
+    probs: &mut Probs,
+    mut tick: impl FnMut(),
+) -> bool {
+    probs.fill(EVEN);
     let mut d = Decoder {
         input: packed,
         at: 0,
         state: 0,
-        probs: [EVEN; CONTEXTS],
+        probs,
     };
     let (mut n, mut distance, mut after_copy) = (start, 0, 0);
     while n < buf.len() {
@@ -309,7 +323,7 @@ mod packer {
     /// The model's bits as the coder will take them, recorded with their
     /// probability at that point.
     struct Model {
-        probs: Vec<[u16; 2]>,
+        probs: Vec<u32>,
         bits: Vec<(bool, u32)>,
         /// How often each context saw a 1 and a 0, for the next parse.
         seen: Vec<[u32; 2]>,
@@ -328,7 +342,7 @@ mod packer {
     impl Bits for Model {
         fn bit(&mut self, ctx: usize, one: bool) {
             let p = &mut self.probs[ctx];
-            self.bits.push((one, mean(p)));
+            self.bits.push((one, mean(*p)));
             self.seen[ctx][one as usize] += 1;
             adapt(p, one);
         }
@@ -602,7 +616,13 @@ mod tests {
         let mut buf = dict.to_vec();
         buf.resize(dict.len() + data.len(), 0xA5);
         let mut ticks = 0;
-        assert!(unpack(&packed, &mut buf, dict.len(), || ticks += 1));
+        assert!(unpack(
+            &packed,
+            &mut buf,
+            dict.len(),
+            &mut [0; CONTEXTS],
+            || ticks += 1
+        ));
         assert_eq!(&buf[dict.len()..], data);
         assert!(ticks > 0 || data.is_empty());
         packed.len()
@@ -678,11 +698,11 @@ mod tests {
             bad[i] ^= 0x5A;
             let mut buf = std::vec![0; d.len()];
             // Whatever comes out, nothing is read or written outside.
-            let _ = unpack(&bad, &mut buf, 0, || {});
+            let _ = unpack(&bad, &mut buf, 0, &mut [0; CONTEXTS], || {});
         }
         // A stream of ones: a copy first, from before the buffer.
         let mut buf = std::vec![0; 100];
-        assert!(!unpack(&[0xFF; 64], &mut buf, 0, || {}));
+        assert!(!unpack(&[0xFF; 64], &mut buf, 0, &mut [0; CONTEXTS], || {}));
     }
 
     #[test]
